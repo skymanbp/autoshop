@@ -161,29 +161,37 @@ fn analyze_cmd(raw: &Path, out: Option<PathBuf>) -> Result<()> {
         .context("encode preview JPEG for advisor")?;
     let preview = Preview { jpeg };
 
-    // Proposer: GPT vision when a key is set, else the heuristic baseline so the
-    // chain still runs and produces something reviewable today.
+    // Proposer: GPT vision when a key is set, else the heuristic baseline. If
+    // the GPT call fails (e.g. no billing quota, network), warn loudly and fall
+    // back to the heuristic so the tool still produces a recipe rather than
+    // dying — disclosure, not silent masking.
     let openai = OpenAiProvider::new(&cfg);
     let heuristic = HeuristicProposer;
-    let use_gpt = cfg.openai_api_key.is_some();
-    let proposer: &dyn Advisor = if use_gpt { &openai } else { &heuristic };
-    if use_gpt {
+    let (mut recipe, can_revise) = if cfg.openai_api_key.is_some() {
         println!("proposer : OpenAI ({})", cfg.openai_model);
+        match openai.propose(&preview, &decoded.meta, &decoded.histogram, None) {
+            Ok(r) => (r, true),
+            Err(e) => {
+                eprintln!("⚠ GPT proposer failed ({e})\n  → falling back to the heuristic baseline.");
+                (heuristic.propose(&preview, &decoded.meta, &decoded.histogram, None)?, false)
+            }
+        }
     } else {
         println!("proposer : heuristic baseline (set OPENAI_API_KEY to use GPT vision)");
-    }
-    let mut recipe = proposer.propose(&preview, &decoded.meta, &decoded.histogram, None)?;
+        (heuristic.propose(&preview, &decoded.meta, &decoded.histogram, None)?, false)
+    };
 
     // Verify with Claude (live, free via Claude Code OAuth).
     let claude = ClaudeProvider::new(&cfg);
     println!("verifier : Claude ({})", cfg.claude_model);
     let mut verdict = claude.verify(&recipe, &decoded.meta, &decoded.histogram)?;
 
-    // One revision round — only if the proposer can act on the verifier's hint.
-    if verdict.decision != Decision::Accept && proposer.supports_revision() {
+    // One revision round — only if GPT actually produced the recipe (the
+    // heuristic ignores hints, so revising it would just repeat the same recipe).
+    if verdict.decision != Decision::Accept && can_revise {
         if let Some(hint) = verdict.revised_hint.clone() {
             println!("verdict was {:?} → one revision round (hint: {hint})", verdict.decision);
-            recipe = proposer.propose(&preview, &decoded.meta, &decoded.histogram, Some(&hint))?;
+            recipe = openai.propose(&preview, &decoded.meta, &decoded.histogram, Some(&hint))?;
             verdict = claude.verify(&recipe, &decoded.meta, &decoded.histogram)?;
         }
     }

@@ -90,11 +90,6 @@ pub trait Advisor {
         Err(AdvisorError::Unsupported(self.name()))
     }
 
-    /// Whether this provider can act on a revision `hint` (gates the revise loop).
-    fn supports_revision(&self) -> bool {
-        false
-    }
-
     /// Analyst role: data-only acceptance check of a proposed recipe.
     fn verify(
         &self,
@@ -150,16 +145,18 @@ pub(crate) fn strip_code_fence(s: &str) -> &str {
     }
 }
 
-/// Extract the first balanced top-level JSON object/array from text that may
-/// have prose around it (LLMs intermittently preface or wrap their JSON, so a
-/// bare `from_str` can flake). String contents and escapes are respected so
-/// braces inside strings don't throw off the depth count. `None` if no opener.
-pub(crate) fn extract_json_value(s: &str) -> Option<&str> {
+/// Return every balanced top-level JSON **object** (`{...}`) in `s`, in order.
+///
+/// LLMs intermittently wrap their JSON in prose or reasoning that itself
+/// contains `[...]` ranges and `{...}` examples, so picking "the first bracket"
+/// is wrong. The caller tries these candidates (typically last-first) and keeps
+/// the one that deserialises to the target type. String contents and escapes
+/// are respected so braces inside strings don't break the depth count.
+pub(crate) fn balanced_objects(s: &str) -> Vec<&str> {
     let bytes = s.as_bytes();
-    let start = bytes.iter().position(|&b| b == b'{' || b == b'[')?;
-    let (open, close) = if bytes[start] == b'{' { (b'{', b'}') } else { (b'[', b']') };
-    let (mut depth, mut in_str, mut esc) = (0i32, false, false);
-    for (i, &b) in bytes.iter().enumerate().skip(start) {
+    let mut out = Vec::new();
+    let (mut depth, mut start, mut in_str, mut esc) = (0i32, None, false, false);
+    for (i, &b) in bytes.iter().enumerate() {
         if in_str {
             if esc {
                 esc = false;
@@ -170,16 +167,21 @@ pub(crate) fn extract_json_value(s: &str) -> Option<&str> {
             }
         } else if b == b'"' {
             in_str = true;
-        } else if b == open {
+        } else if b == b'{' {
+            if depth == 0 {
+                start = Some(i);
+            }
             depth += 1;
-        } else if b == close {
+        } else if b == b'}' && depth > 0 {
             depth -= 1;
             if depth == 0 {
-                return Some(&s[start..=i]);
+                if let Some(st) = start.take() {
+                    out.push(&s[st..=i]);
+                }
             }
         }
     }
-    None
+    out
 }
 
 #[cfg(test)]
@@ -187,16 +189,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_json_handles_prose_and_fences() {
-        let bare = r#"{"decision":"accept","reasons":[]}"#;
-        assert_eq!(extract_json_value(bare), Some(bare));
+    fn balanced_objects_finds_real_json_amid_prose() {
+        // bare object
         assert_eq!(
-            extract_json_value("Here is my verdict:\n```json\n{\"a\":1}\n```\nDone."),
-            Some(r#"{"a":1}"#)
+            balanced_objects(r#"{"decision":"accept"}"#),
+            vec![r#"{"decision":"accept"}"#]
         );
+        // prose with a [-5,5] range then the real object — must NOT grab the array
+        let chatty = "Range checks: exposure ∈ [-5, 5] ✓\nHere is the verdict:\n```json\n{\"decision\":\"revise\"}\n```";
+        assert_eq!(balanced_objects(chatty), vec![r#"{"decision":"revise"}"#]);
         // braces inside a string must not end the object early
         let tricky = r#"prefix {"reasons":["has } brace","ok"]} suffix"#;
-        assert_eq!(extract_json_value(tricky), Some(r#"{"reasons":["has } brace","ok"]}"#));
-        assert_eq!(extract_json_value("no json here"), None);
+        assert_eq!(balanced_objects(tricky), vec![r#"{"reasons":["has } brace","ok"]}"#]);
+        // multiple objects: caller picks the last that parses
+        let two = r#"example {"a":1} then answer {"decision":"accept"}"#;
+        assert_eq!(balanced_objects(two), vec![r#"{"a":1}"#, r#"{"decision":"accept"}"#]);
+        assert!(balanced_objects("no json here").is_empty());
     }
 }

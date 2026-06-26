@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::decode::{Histogram, Meta};
 use crate::recipe::EditRecipe;
 
-use super::{extract_json_value, hist_summary, strip_code_fence, Advisor, AdvisorError, Verdict};
+use super::{balanced_objects, hist_summary, strip_code_fence, Advisor, AdvisorError, Verdict};
 
 pub struct ClaudeProvider {
     bin: String,
@@ -79,16 +79,22 @@ impl Advisor for ClaudeProvider {
         }
 
         // `result` is the model's text — instructed to be exactly the Verdict
-        // JSON, but LLMs intermittently add a fence or prose. Try the bare
-        // (fence-stripped) text first, then fall back to extracting the first
-        // balanced JSON object, so an occasional wrapper doesn't fail the run.
+        // JSON, but LLMs intermittently add a fence or a reasoning preamble. Try
+        // the bare (fence-stripped) text first; otherwise scan every balanced
+        // {...} object and keep the LAST one that parses as a Verdict (the
+        // model's final answer, past any example/prose objects).
         let cleaned = strip_code_fence(&env.result);
-        let verdict: Verdict = match serde_json::from_str(cleaned) {
+        let verdict: Verdict = match serde_json::from_str::<Verdict>(cleaned) {
             Ok(v) => v,
-            Err(_) => {
-                let extracted = extract_json_value(&env.result).unwrap_or(cleaned);
-                serde_json::from_str(extracted).map_err(|source| AdvisorError::BadVerdict {
-                    source,
+            Err(first_err) => {
+                let mut found = None;
+                for cand in balanced_objects(&env.result) {
+                    if let Ok(v) = serde_json::from_str::<Verdict>(cand) {
+                        found = Some(v);
+                    }
+                }
+                found.ok_or_else(|| AdvisorError::BadVerdict {
+                    source: first_err,
                     got: env.result.chars().take(400).collect(),
                 })?
             }
@@ -113,7 +119,7 @@ Decide whether this proposed RAW develop recipe is safe to apply. Check, concret
 METADATA: {meta_json}\n\
 HISTOGRAM: {hist}\n\
 PROPOSED RECIPE:\n{recipe_json}\n\n\
-Reply with EXACTLY one JSON object and nothing else (no markdown fence), matching this shape:\n\
+Output ONLY the JSON object: no reasoning, no preamble, no markdown fence. Your entire reply must start with '{{' and end with '}}'. Shape:\n\
 {{\"decision\":\"accept\"|\"revise\"|\"reject\",\"reasons\":[\"short reason\", ...],\"revised_hint\":\"a short instruction for the next attempt if revise/reject, else null\"}}",
         meta_json = meta_json,
         hist = hist_summary(hist),

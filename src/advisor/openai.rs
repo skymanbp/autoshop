@@ -40,10 +40,6 @@ impl Advisor for OpenAiProvider {
         "openai"
     }
 
-    fn supports_revision(&self) -> bool {
-        true
-    }
-
     fn propose(
         &self,
         img: &Preview,

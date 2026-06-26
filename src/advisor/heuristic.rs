@@ -36,10 +36,16 @@ impl Advisor for HeuristicProposer {
 
         let mut r = EditRecipe::default();
 
-        // Nudge exposure toward a midtone target of ~118/255, capped to ±1.5 EV
-        // so a single heuristic can't wreck a shot.
-        let ev = (118.0_f32 / mean).log2().clamp(-1.5, 1.5);
-        r.exposure_ev = (ev * 10.0).round() / 10.0;
+        // Nudge exposure toward a midtone target of ~118/255, capped to ±1.5 EV.
+        // Deadband: leave exposure untouched for sub-0.15-stop corrections — a
+        // near-neutral frame doesn't need a trivial (and visually pointless)
+        // nudge whose sign looks arbitrary.
+        let ev_raw = (118.0_f32 / mean).log2().clamp(-1.5, 1.5);
+        r.exposure_ev = if ev_raw.abs() < 0.15 {
+            0.0
+        } else {
+            (ev_raw * 10.0).round() / 10.0
+        };
 
         // Recover blown highlights / lifted-but-clipped blacks proportionally.
         if hist.clip_white_pct > 0.5 {
