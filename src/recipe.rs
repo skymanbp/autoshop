@@ -71,6 +71,12 @@ pub struct EditRecipe {
     /// 0..=255. Empty = identity curve.
     pub tone_curve: Vec<CurvePoint>,
 
+    // --- Local (masked) adjustments -----------------------------------------
+    /// Local adjustments applied through gradient masks. Empty = global-only
+    /// (v1-compatible). Emitted as `crs:MaskGroupBasedCorrections` in the XMP
+    /// and composited by the render engine.
+    pub masks: Vec<LocalAdjustment>,
+
     // --- Provenance (the AI explains itself) --------------------------------
     /// One or two sentences: why these adjustments, for the user to sanity-check.
     pub rationale: String,
@@ -99,6 +105,7 @@ impl Default for EditRecipe {
             straighten_deg: 0.0,
             crop: None,
             tone_curve: Vec::new(),
+            masks: Vec::new(),
             rationale: String::new(),
             confidence: 0.0,
         }
@@ -124,9 +131,81 @@ pub struct CurvePoint {
     pub output: u8,
 }
 
-// `clamp` and `is_noop` are consumed by the render engine + auto-apply gate
-// (Milestones M2/M3), which are not wired up in this scaffold yet. Allow them
-// to exist warning-free until those call sites land.
+/// A local (masked) adjustment: *where* it applies (`mask`) plus the slider
+/// deltas to apply inside that mask. Sliders use the SAME UI scale as the global
+/// [`EditRecipe`] fields; the XMP writer converts to ACR's local scale (exposure
+/// stops/4, other sliders /100). `temperature` here is a *relative* shift, not
+/// Kelvin (maps to `crs:LocalTemperature`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocalAdjustment {
+    pub mask: MaskGeometry,
+    /// Human label → `crs:CorrectionName` / `crs:MaskName`.
+    pub name: String,
+    /// Master opacity 0.0..=1.0 → `crs:CorrectionAmount` + `crs:MaskValue`.
+    pub amount: f32,
+    /// Invert the mask region → `crs:MaskInverted`.
+    pub inverted: bool,
+    pub exposure_ev: f32,
+    pub contrast: f32,
+    pub highlights: f32,
+    pub shadows: f32,
+    pub whites: f32,
+    pub blacks: f32,
+    pub clarity: f32,
+    pub dehaze: f32,
+    pub texture: f32,
+    pub saturation: f32,
+    /// Relative warm/cool shift (NOT Kelvin) → `crs:LocalTemperature`.
+    pub temperature: f32,
+    pub tint: f32,
+}
+
+impl Default for LocalAdjustment {
+    fn default() -> Self {
+        Self {
+            mask: MaskGeometry::Linear { zero_x: 0.5, zero_y: 0.0, full_x: 0.5, full_y: 0.5 },
+            name: String::new(),
+            amount: 1.0,
+            inverted: false,
+            exposure_ev: 0.0,
+            contrast: 0.0,
+            highlights: 0.0,
+            shadows: 0.0,
+            whites: 0.0,
+            blacks: 0.0,
+            clarity: 0.0,
+            dehaze: 0.0,
+            texture: 0.0,
+            saturation: 0.0,
+            temperature: 0.0,
+            tint: 0.0,
+        }
+    }
+}
+
+/// Where a local adjustment applies. Coordinates are normalised to the frame and
+/// MAY fall outside [0,1] for gradients (matching ACR's geometry).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MaskGeometry {
+    /// Linear gradient — the zero→full vector sets direction + falloff width.
+    /// Maps to ACR `What="Mask/Gradient"`.
+    Linear { zero_x: f32, zero_y: f32, full_x: f32, full_y: f32 },
+    /// Radial/elliptical gradient. Maps to ACR `What="Mask/CircularGradient"`.
+    Radial {
+        top: f32,
+        left: f32,
+        bottom: f32,
+        right: f32,
+        feather: f32,
+        roundness: f32,
+        flipped: bool,
+    },
+}
+
+// `clamp` is used by the render engine + advisors; `is_noop` is not yet wired to
+// a call site (auto-apply gate), so allow it to exist warning-free.
 #[allow(dead_code)]
 impl EditRecipe {
     /// Clamp every slider into its documented legal range. The AI is
@@ -152,6 +231,18 @@ impl EditRecipe {
         if let Some(k) = self.temperature_k {
             self.temperature_k = Some(c(k, 2000.0, 50000.0));
         }
+        // Clamp each local adjustment to the same UI ranges as the globals.
+        for m in self.masks.iter_mut() {
+            m.amount = m.amount.clamp(0.0, 1.0);
+            m.exposure_ev = m.exposure_ev.clamp(-5.0, 5.0);
+            for v in [
+                &mut m.contrast, &mut m.highlights, &mut m.shadows, &mut m.whites,
+                &mut m.blacks, &mut m.clarity, &mut m.dehaze, &mut m.texture,
+                &mut m.saturation, &mut m.temperature, &mut m.tint,
+            ] {
+                *v = (*v).clamp(-100.0, 100.0);
+            }
+        }
     }
 
     /// Returns true if the recipe leaves the image essentially untouched —
@@ -170,6 +261,45 @@ impl EditRecipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn masks_round_trip_and_v1_compatible() {
+        // Default has no masks (v1-compatible).
+        assert!(EditRecipe::default().masks.is_empty());
+
+        let mut recipe = EditRecipe {
+            masks: vec![
+                LocalAdjustment {
+                    mask: MaskGeometry::Linear { zero_x: 0.5, zero_y: 0.35, full_x: 0.5, full_y: 0.0 },
+                    name: "sky".into(),
+                    exposure_ev: -0.4,
+                    highlights: -200.0, // out of range → clamp pulls to -100
+                    ..Default::default()
+                },
+                LocalAdjustment {
+                    mask: MaskGeometry::Radial {
+                        top: 0.3, left: 0.35, bottom: 0.7, right: 0.65,
+                        feather: 0.5, roundness: 0.0, flipped: false,
+                    },
+                    name: "subject".into(),
+                    shadows: 15.0,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        recipe.clamp();
+        assert_eq!(recipe.masks[0].highlights, -100.0); // clamped
+
+        let json = serde_json::to_string_pretty(&recipe).unwrap();
+        let back: EditRecipe = serde_json::from_str(&json).unwrap();
+        assert_eq!(recipe, back);
+        assert!(!recipe.is_noop()); // masks present ⇒ not a no-op
+
+        // A v1 recipe JSON (no "masks" key) still deserializes, masks default empty.
+        let v1 = r#"{ "exposure_ev": 0.5, "rationale": "x", "confidence": 0.9 }"#;
+        assert!(serde_json::from_str::<EditRecipe>(v1).unwrap().masks.is_empty());
+    }
 
     #[test]
     fn round_trips_through_json() {
