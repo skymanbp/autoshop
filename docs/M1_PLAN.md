@@ -380,3 +380,38 @@ Ground truth = the user's **finished edits**. Two cases ([ARCHITECTURE.md:129-13
 | 14 | `temperature_k` ↔ `Temperature` absolute-Kelvin validity (RAW + Custom WB only) | exiftool read of WhiteBalance + Temperature on a real edit |
 
 Toolchain gaps that block verification of #6–#10, #13–#14: **`exiftool` is not on PATH** and **`rawpy`/`cv2`/`skimage`/`colour` are not installed** [verified this session]. Installing `exiftool` is the single highest-leverage step — it closes nearly every remaining XMP/eval `[unverified]` at once.
+
+---
+
+## 9. Verified against the real library `D:\Photography` (read-only)
+
+Direct inspection of the user's library on 2026-06-26 resolves the pending inputs and
+**supersedes several of the research guesses above with real values.** Evidence is the
+user's own files; no `exiftool` was needed (a sidecar was read directly).
+
+### 9.1 Dataset shape [verified: PowerShell census this session]
+- Layout: `D:\Photography\Raw\<year 2022–2026>\<shoot>\*.ARW` (+ `成片\` finished JPEGs, `相册\` album JPEGs, `To-Be-Sync'd\`).
+- **3655 `.ARW`** originals (~400 GB). **153** of them have a matching basename `.xmp` sidecar → **eval Case A** (recipe-vs-recipe).
+- **成片\ = 190 finished `.jpg`**; **87 exact-basename-match an `.ARW`** → **eval Case B** (render-vs-export). The rest are renamed/variant edits (`_DSC2065~4-edit`, `DSC01634_1`, `(1)`) or non-ARW phone/WeChat shots (`mmexport…`, `Weixin Image…`) — exclude the phone shots from the RAW-developer eval; recover renamed A7R edits via EXIF `DateTimeOriginal`+model matching, not filename alone.
+- **The user confirmed both paths are wanted:** XMP when present, else analyse from the 成片 JPEG. Both are already in the eval design (§6).
+
+### 9.2 Camera — single family → one decode target [verified: tiff:Model in 156 sidecars]
+- **Sony A7R IV / A7R IVA only** — `ILCE-7RM4A` (146) + `ILCE-7RM4` (10). 61 MP, same sensor/ARW concerns.
+- Both are 2019/2021 bodies → **outside `rawloader`'s frozen DB → `rawler` is confirmed required** (§1 decision validated against real bodies, not a guess).
+- [unverified] actual `rawler` 0.7.2 decode of an `ILCE-7RM4A` `.ARW` — still the M1 task-1/2 acceptance check; not yet run.
+
+### 9.3 Real `crs:` values — corrects §5/§8 guesses [verified: `D:\Photography\Raw\2023\23-06-Cornwall-Raw\DSC08724.xmp`]
+Use these, **not** the guessed constants in §5's template / §8's table:
+- `crs:ProcessVersion="15.4"` (NOT `"11.0"` — closes §8 #10), `crs:Version="15.5.1"`, `crs:CompatibleVersion="234881024"`.
+- Sliders are **signed integers with an explicit `+`**: `Contrast2012="+22"`, `Highlights2012="+7"`, `Shadows2012="-6"`, `Tint="+13"`, `Dehaze="+18"`, `Vibrance="+5"`, `Saturation="+13"`. `Exposure2012="0.00"` is decimal EV. `Sharpness="40"` plain 0..100 int; `LuminanceSmoothing="0"` present. → §5's signed-int / 0..100 conversions are right; the writer must emit the leading `+` for positives.
+- `Temperature="5650"` is written **even when `WhiteBalance="As Shot"`** → refines §8 #14: `Temperature` is emitted as an absolute Kelvin regardless of WB mode in this corpus.
+- Crop: `HasCrop="False"`, `CropTop/Left="0"`, `CropBottom/Right="1"`, `CropAngle="0"` → confirms 0..1 fractions + `HasCrop` gate (closes §8 #8). `CropAngle` sign still [unverified] (no tilted sample in this file).
+- **Tone curve correction:** real `ToneCurvePV2012` = `"0, 0"`,`"67, 61"`,`"189, 210"`,`"224, 255"` — the **last point need NOT be `"255, 255"`** (§5's template wrongly mandates it). Endpoints can be interior; only "starts at x=0, monotonic in x" holds.
+
+### 9.4 Scope reality — user's edits exceed our global-only `EditRecipe` [verified: same file]
+The real sidecar also carries keys we do **not** model: `Texture`, per-channel `ToneCurvePV2012Red/Green/Blue`, an Adobe `Look`/camera profile, lens-correction profile, and — most significantly — **`MaskGroupBasedCorrections`** (3 graduated-filter **local masks** with their own `LocalExposure2012`/`LocalTexture`/etc.).
+- **Implication for eval Case A:** compare **only the global `crs:` keys** that map to `EditRecipe`; treat local masks / per-channel curves / profile as **out-of-scope for M1**, not as "AI error". Scoring unmodelled keys as misses would punish the AI for things it was never asked to produce.
+- **Roadmap:** a future `EditRecipe` v2 could add a `masks: Vec<LocalAdjustment>` to chase the user's actual style; flagged, not silently dropped.
+
+### 9.5 What this turn did NOT close (still needs a real API/decode test)
+`rawler` decode of an `ILCE-7RM4A` file (§9.2); `CropAngle` sign (need a tilted edit); exact upper slider bounds (only in-range values seen); OpenAI structured-output schema limits + current prices (§8 #3–5). `exiftool` still not installed — not blocking now (sidecars are plain XML, readable directly), but needed to batch-read 153 sidecars efficiently for the Case-A scorer.
