@@ -19,9 +19,7 @@ pub struct Config {
     /// Path/name of the `claude` executable (reused for the verifier via OAuth).
     pub claude_bin: String,
     pub claude_model: String,
-    /// Image model for generative retouch/reimagine (V2_PLAN §5). Consumed by
-    /// the generative module landing next; allow it to exist until then.
-    #[allow(dead_code)]
+    /// Image model for generative retouch/reimagine (V2_PLAN §5).
     pub openai_image_model: String,
 }
 

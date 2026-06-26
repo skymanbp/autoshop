@@ -10,6 +10,7 @@ mod advisor;
 mod config;
 mod decode;
 mod eval;
+mod generative;
 mod pipeline;
 mod recipe;
 mod render;
@@ -112,6 +113,36 @@ enum Command {
         /// Folder to scan recursively for RAW + .xmp pairs (your edits).
         dir: PathBuf,
     },
+    /// EXPERIMENTAL: full-frame generative restyle via OpenAI Images (low-res,
+    /// lossy re-render — NOT a master; the XMP/render path is the real workflow).
+    Reimagine {
+        /// Path to the RAW file.
+        raw: PathBuf,
+        /// What to do (e.g. "moody cinematic, deepen shadows, warm highlights").
+        #[arg(long)]
+        prompt: String,
+        /// "high" keeps it recognizably the same photo; "low" = free rein.
+        #[arg(long, default_value = "high")]
+        fidelity: String,
+        /// Output PNG (default: ./out/<stem>.reimagine.png).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+    /// EXPERIMENTAL: generative object removal via OpenAI Images. The mask is an
+    /// RGBA PNG; transparent pixels mark the region to regenerate.
+    Retouch {
+        /// Path to the RAW file.
+        raw: PathBuf,
+        /// RGBA PNG mask (transparent = region to edit).
+        #[arg(long)]
+        mask: PathBuf,
+        /// What to do (e.g. "remove the trash can, fill with pavement").
+        #[arg(long)]
+        prompt: String,
+        /// Output PNG (default: ./out/<stem>.retouch.png).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
     /// Start the local web UI (open the printed URL in a browser).
     Serve {
         /// Photo library folder to browse (scanned recursively for .ARW).
@@ -134,6 +165,16 @@ fn main() -> Result<()> {
         Command::Batch { dir, beside, render, limit } => batch_cmd(&dir, beside, render, limit),
         Command::Eval { dir, limit } => eval::run(&dir, limit),
         Command::StyleIndex { dir } => style_index_cmd(&dir),
+        Command::Reimagine { raw, prompt, fidelity, out } => {
+            let cfg = Config::load();
+            let out = out.unwrap_or_else(|| default_out(&raw, "reimagine", "png"));
+            generative::reimagine(&cfg, &raw, &prompt, &fidelity, &out)
+        }
+        Command::Retouch { raw, mask, prompt, out } => {
+            let cfg = Config::load();
+            let out = out.unwrap_or_else(|| default_out(&raw, "retouch", "png"));
+            generative::retouch(&cfg, &raw, &mask, &prompt, &out)
+        }
         Command::Serve { dir, port } => serve::serve(&dir, port),
         Command::RecipeSchema => {
             let template = EditRecipe::default();
