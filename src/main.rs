@@ -4,11 +4,14 @@
 //! and emits an [`recipe::EditRecipe`]; a deterministic render engine applies
 //! that recipe. See `docs/ARCHITECTURE.md` for the full design.
 //!
-//! Milestone status: M0 (data model + CLI) done. M1 decode half (`decode`) is
-//! live — it really decodes a RAW, extracts the embedded preview + EXIF +
-//! histogram. The advise → render pipeline (`analyze`/`apply`/`auto`) is still
-//! stubbed and bails explicitly so nothing lies about being done.
+//! Milestone status: M0 (data model + CLI) done. M1 is live: `decode` really
+//! decodes a RAW (preview + EXIF + histogram); `analyze` runs the advise chain
+//! (propose → Claude verify) — GPT vision is used when `OPENAI_API_KEY` is set,
+//! otherwise a heuristic baseline proposer stands in. `apply`/`auto` (render)
+//! are still stubbed and bail explicitly so nothing lies about being done.
 
+mod advisor;
+mod config;
 mod decode;
 mod recipe;
 
@@ -18,6 +21,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use image::GenericImageView;
 
+use advisor::{Advisor, ClaudeProvider, Decision, HeuristicProposer, OpenAiProvider, Preview};
+use config::Config;
 use recipe::EditRecipe;
 
 #[derive(Parser)]
@@ -43,12 +48,12 @@ enum Command {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
-    /// Decode a RAW file, extract a preview + metadata, ask the AI advisor,
-    /// and write the resulting EditRecipe as JSON (no pixels rendered).
+    /// Decode a RAW, ask the AI advisor to propose an edit, have Claude verify
+    /// it, and write the resulting EditRecipe as JSON (no pixels rendered).
     Analyze {
         /// Path to the RAW file.
         raw: PathBuf,
-        /// Where to write the recipe JSON (default: <raw>.recipe.json).
+        /// Where to write the recipe JSON (default: ./out/<stem>.recipe.json).
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
@@ -78,16 +83,13 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Decode { raw, out } => decode_cmd(&raw, out),
+        Command::Analyze { raw, out } => analyze_cmd(&raw, out),
         Command::RecipeSchema => {
             // Genuinely useful today: this is the schema we hand the AI as the
             // required output format.
             let template = EditRecipe::default();
             println!("{}", serde_json::to_string_pretty(&template)?);
             Ok(())
-        }
-        Command::Analyze { raw, out } => {
-            let _ = (raw, out);
-            bail!("`analyze` is not yet implemented — see docs/ARCHITECTURE.md, Milestone M1 (advise half)");
         }
         Command::Apply { raw, recipe, out } => {
             let _ = (raw, recipe, out);
@@ -105,16 +107,8 @@ fn decode_cmd(raw: &Path, out: Option<PathBuf>) -> Result<()> {
 
     // Default output goes to ./out, NEVER next to the source RAW (the library is
     // read-only).
-    let out = out.unwrap_or_else(|| {
-        let stem = raw.file_stem().and_then(|s| s.to_str()).unwrap_or("preview");
-        PathBuf::from("out").join(format!("{stem}.preview.jpg"))
-    });
-    if let Some(parent) = out.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create output dir {}", parent.display()))?;
-        }
-    }
+    let out = out.unwrap_or_else(|| default_out(raw, "preview", "jpg"));
+    ensure_parent(&out)?;
     let preview = decoded.preview_resized(1536);
     preview
         .save(&out)
@@ -152,6 +146,77 @@ fn decode_cmd(raw: &Path, out: Option<PathBuf>) -> Result<()> {
         if decoded.embedded_xmp.is_some() { "embedded packet present" } else { "none" },
     );
     println!("  preview -> {} ({} x {})", out.display(), pw, ph);
+    Ok(())
+}
+
+fn analyze_cmd(raw: &Path, out: Option<PathBuf>) -> Result<()> {
+    let cfg = Config::load();
+    let decoded = decode::decode_raw(raw)?;
+
+    // Encode the (downscaled) preview to JPEG bytes for the vision advisor.
+    let preview_img = decoded.preview_resized(1568);
+    let mut jpeg = Vec::new();
+    preview_img
+        .write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
+        .context("encode preview JPEG for advisor")?;
+    let preview = Preview { jpeg };
+
+    // Proposer: GPT vision when a key is set, else the heuristic baseline so the
+    // chain still runs and produces something reviewable today.
+    let openai = OpenAiProvider::new(&cfg);
+    let heuristic = HeuristicProposer;
+    let use_gpt = cfg.openai_api_key.is_some();
+    let proposer: &dyn Advisor = if use_gpt { &openai } else { &heuristic };
+    if use_gpt {
+        println!("proposer : OpenAI ({})", cfg.openai_model);
+    } else {
+        println!("proposer : heuristic baseline (set OPENAI_API_KEY to use GPT vision)");
+    }
+    let mut recipe = proposer.propose(&preview, &decoded.meta, &decoded.histogram, None)?;
+
+    // Verify with Claude (live, free via Claude Code OAuth).
+    let claude = ClaudeProvider::new(&cfg);
+    println!("verifier : Claude ({})", cfg.claude_model);
+    let mut verdict = claude.verify(&recipe, &decoded.meta, &decoded.histogram)?;
+
+    // One revision round — only if the proposer can act on the verifier's hint.
+    if verdict.decision != Decision::Accept && proposer.supports_revision() {
+        if let Some(hint) = verdict.revised_hint.clone() {
+            println!("verdict was {:?} → one revision round (hint: {hint})", verdict.decision);
+            recipe = proposer.propose(&preview, &decoded.meta, &decoded.histogram, Some(&hint))?;
+            verdict = claude.verify(&recipe, &decoded.meta, &decoded.histogram)?;
+        }
+    }
+
+    // Persist the recipe (to ./out, never beside the read-only source).
+    let out = out.unwrap_or_else(|| default_out(raw, "recipe", "json"));
+    ensure_parent(&out)?;
+    std::fs::write(&out, serde_json::to_string_pretty(&recipe)?)
+        .with_context(|| format!("write recipe {}", out.display()))?;
+
+    println!("\n--- proposed recipe ---");
+    println!("{}", serde_json::to_string_pretty(&recipe)?);
+    println!("\n--- verdict: {:?} ---", verdict.decision);
+    for reason in &verdict.reasons {
+        println!("  - {reason}");
+    }
+    println!("\nrecipe -> {}", out.display());
+    Ok(())
+}
+
+/// `./out/<stem>.<kind>.<ext>` — outputs never go beside the source RAW.
+fn default_out(raw: &Path, kind: &str, ext: &str) -> PathBuf {
+    let stem = raw.file_stem().and_then(|s| s.to_str()).unwrap_or(kind);
+    PathBuf::from("out").join(format!("{stem}.{kind}.{ext}"))
+}
+
+fn ensure_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create output dir {}", parent.display()))?;
+        }
+    }
     Ok(())
 }
 
