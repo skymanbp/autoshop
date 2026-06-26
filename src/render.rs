@@ -24,7 +24,7 @@ use rawler::imgop::develop::{Intermediate, RawDevelop};
 use rawler::rawsource::RawSource;
 use rawler::Orientation;
 
-use crate::recipe::EditRecipe;
+use crate::recipe::{EditRecipe, MaskGeometry};
 
 const LUT_N: usize = 4096;
 
@@ -153,10 +153,84 @@ fn apply_develop(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
     if r.sharpening > 0.0 {
         unsharp_luma(data, w, h, 1, r.sharpening / 100.0, false);
     }
+    // 6) local masked adjustments (linear/radial gradients).
+    if !r.masks.is_empty() {
+        apply_masks(data, w, h, r);
+    }
 }
 
 fn luma601(p: &[f32; 3]) -> f32 {
     0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]
+}
+
+/// Apply each local masked adjustment: blend the masked region toward a locally
+/// re-toned version, weighted by the gradient mask × amount. v1 applies local
+/// tone (exposure/contrast/highlights/shadows/whites/blacks) + saturation; local
+/// clarity/dehaze/texture/temp/tint are deferred (the XMP→Lightroom path renders
+/// those). Mask coords are normalised so this works at any resolution.
+fn apply_masks(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
+    for m in &r.masks {
+        let local = EditRecipe {
+            exposure_ev: m.exposure_ev,
+            contrast: m.contrast,
+            highlights: m.highlights,
+            shadows: m.shadows,
+            whites: m.whites,
+            blacks: m.blacks,
+            ..EditRecipe::default()
+        };
+        let lut = build_tone_lut(&local);
+        let sat = m.saturation / 100.0;
+        let amount = m.amount.clamp(0.0, 1.0);
+        for y in 0..h {
+            for x in 0..w {
+                let mut wgt = mask_weight(&m.mask, x as f32 / w as f32, y as f32 / h as f32);
+                if m.inverted {
+                    wgt = 1.0 - wgt;
+                }
+                wgt *= amount;
+                if wgt <= 0.001 {
+                    continue;
+                }
+                let i = y * w + x;
+                let p = data[i];
+                let t = [sample_lut(&lut, p[0]), sample_lut(&lut, p[1]), sample_lut(&lut, p[2])];
+                let t = apply_sat_vibrance(t[0], t[1], t[2], sat, 0.0);
+                for c in 0..3 {
+                    data[i][c] = p[c] * (1.0 - wgt) + t[c] * wgt;
+                }
+            }
+        }
+    }
+}
+
+/// Mask coverage [0,1] at normalised frame coordinate (nx, ny).
+fn mask_weight(g: &MaskGeometry, nx: f32, ny: f32) -> f32 {
+    match g {
+        MaskGeometry::Linear { zero_x, zero_y, full_x, full_y } => {
+            let (vx, vy) = (full_x - zero_x, full_y - zero_y);
+            let len2 = vx * vx + vy * vy;
+            if len2 < 1e-9 {
+                return 1.0;
+            }
+            (((nx - zero_x) * vx + (ny - zero_y) * vy) / len2).clamp(0.0, 1.0)
+        }
+        // Roundness is ignored in v1 (pure ellipse).
+        MaskGeometry::Radial { top, left, bottom, right, feather, roundness: _, flipped } => {
+            let cx = (left + right) / 2.0;
+            let cy = (top + bottom) / 2.0;
+            let rx = ((right - left) / 2.0).abs().max(1e-4);
+            let ry = ((bottom - top) / 2.0).abs().max(1e-4);
+            let d = (((nx - cx) / rx).powi(2) + ((ny - cy) / ry).powi(2)).sqrt();
+            let f = feather.clamp(0.0, 1.0);
+            let wgt = 1.0 - smoothstep(1.0 - f, 1.0, d);
+            if *flipped {
+                1.0 - wgt
+            } else {
+                wgt
+            }
+        }
+    }
 }
 
 /// Scale a pixel's chroma so its luma moves `l_old`→`l_new` while preserving hue.
@@ -444,7 +518,26 @@ fn to_u8(v: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recipe::EditRecipe;
+    use crate::recipe::{EditRecipe, LocalAdjustment};
+
+    #[test]
+    fn linear_mask_affects_only_the_full_end() {
+        // Linear mask: zero at top (ny=0), full at bottom (ny=1) + strong darken.
+        let r = EditRecipe {
+            masks: vec![LocalAdjustment {
+                mask: MaskGeometry::Linear { zero_x: 0.5, zero_y: 0.0, full_x: 0.5, full_y: 1.0 },
+                amount: 1.0,
+                exposure_ev: -4.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (w, h) = (1usize, 4usize);
+        let mut data = vec![[0.6_f32, 0.6, 0.6]; w * h];
+        apply_develop(&mut data, w, h, &r);
+        assert!((data[0][0] - 0.6).abs() < 0.03, "top should be ~unchanged: {}", data[0][0]);
+        assert!(data[3][0] < 0.5, "bottom should darken: {}", data[3][0]);
+    }
 
     #[test]
     fn kelvin_to_rgb_warm_is_redder_than_cool() {
