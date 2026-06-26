@@ -1,39 +1,150 @@
+<div align="center">
+<img src="assets/icon.png" width="104" alt="Autoshop icon" />
+
 # Autoshop
 
-AI-assisted **automatic development of RAW photographs**. Point it at a RAW file;
-an AI advisor decides the develop adjustments (exposure, white balance, tone,
-colour, crop…) and a deterministic Rust engine applies them — or writes an XMP
+**AI-assisted automatic development of RAW photographs.**
+
+Point it at a RAW (or an exported PNG/TIFF); an AI advisor decides the develop
+adjustments and a deterministic Rust engine applies them — or writes an XMP
 sidecar so the edit opens as adjustable sliders in Lightroom.
+</div>
 
-The AI never touches pixels. It only emits an
-[`EditRecipe`](src/recipe.rs) (a small, bounded, Lightroom-style JSON); the
-engine renders from the original RAW. That keeps results reproducible,
-non-destructive, auditable, and free of hallucinated detail.
+---
 
-See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full design.
+## The idea
 
-## Status
-
-Initial scaffold (Milestone **M0**): data model + CLI compile and test clean.
-The decode → advise → render pipeline (M1–M3) is designed and stubbed.
+The judgement-heavy part of developing a photo is *deciding what to change*
+(this sky is blown, those shadows are crushed, the white balance is too cool).
+The mechanical part is *applying* it. Autoshop splits exactly there:
 
 ```
-cargo build            # builds the autoshop binary
-cargo test             # 3 passing tests on the EditRecipe schema
-cargo run -- recipe-schema   # print the JSON shape the AI must emit
+ RAW ─► decode + features ─► [GPT vision advisor] ─► EditRecipe ─► [Claude verify] ─► Rust render engine
+  .ARW    preview+EXIF+hist        looks at photo        JSON          QA / accept           │
+                                                                                             ▼
+                                                                    XMP sidecar  +  16-bit master
 ```
 
-## Planned CLI
+**The AI never touches a pixel** in the main path. The vision model only emits an
+[`EditRecipe`](src/recipe.rs) — a small, bounded, Lightroom/ACR-style JSON of
+slider values — and a deterministic engine renders from the original RAW. That
+keeps results reproducible, non-destructive, auditable, and free of hallucinated
+detail. (Two *opt-in*, clearly-labelled exceptions touch pixels: AI **denoise**
+and **generative** retouch — see below.)
+
+## Features
+
+- **One-shot develop** — `auto` decodes a RAW, asks GPT for an `EditRecipe`, has
+  Claude acceptance-verify it, then renders a **16-bit TIFF** master.
+- **XMP sidecar** — the same recipe serialises to an ACR/Lightroom `.xmp`
+  (global sliders + local linear/radial masks), so the AI's edit opens as
+  fully-adjustable sliders in your catalog.
+- **AI Denoise (SCUNet, GPU)** — ACR/LR-style denoise for high-ISO / astro
+  frames. Off by default, triggered by a flag, a CLI command, or a UI button.
+- **PNG/TIFF source mode** — feed an already-processed image (e.g. denoised in
+  Lightroom/Photoshop) and Autoshop grades it directly. Auto-detected by file
+  type; no RAW required.
+- **Web UI** — `serve` opens a local gallery: pick a photo, Analyze, tweak 12
+  sliders with live before/after, give a text direction, export.
+- **Style retrieval** — learns from *similar* past edits you've made (k-NN over
+  EXIF + histogram) and offers them to the advisor as soft reference.
+- **Generative (experimental)** — `reimagine` / `retouch` via OpenAI Images.
+- **Batch** the whole library, **eval** the AI against your own edits.
+- **Your library stays read-only** — outputs only ever go to `./out`; the engine
+  refuses to write into a source RAW's folder.
+
+<div align="center"><img src="assets/denoise-demo.png" width="520" alt="AI denoise before/after" /></div>
+
+## Quick start
+
+```bash
+cargo build --release            # builds target/release/autoshop(.exe)
+cargo test                       # 16 passing tests
+```
+
+Then either:
+
+- **Web UI (easiest):** double-click `Autoshop-UI.bat` (Windows) — it serves your
+  library and opens the browser. Or: `autoshop serve "D:\path\to\photos" --port 8080`.
+- **CLI:**
+  ```bash
+  autoshop auto "photo.ARW" --guidance "warm golden-hour, lift shadows"
+  ```
+
+## Commands
 
 ```
-autoshop analyze <raw> [-o recipe.json]      # decode + ask AI → recipe (no render)
-autoshop apply   <raw> <recipe.json> -o out  # render from a recipe
-autoshop auto    <raw> [-o out]              # analyze + apply end-to-end
-autoshop recipe-schema                       # print the EditRecipe template (works today)
+autoshop decode  <src>                       # preview + EXIF + histogram
+autoshop analyze <src> [--guidance "..."]    # AI → recipe.json + .xmp (no render)
+autoshop apply   <src> <recipe.json> -o out  # render a recipe to an image
+autoshop auto    <src> [--denoise] [--guidance "..."]   # analyze + render, end-to-end
+autoshop denoise <src> [--strength 0..1] [--model ...]  # AI denoise → clean 16-bit master
+autoshop batch   <dir> [--render] [--limit N]           # process a whole folder
+autoshop eval    <dir> [--limit N]           # compare AI edits vs your own .xmp
+autoshop style-index <dir>                   # build the "your taste" reference index
+autoshop serve   <dir> [--port 8080]         # local web UI
+autoshop reimagine <raw> --prompt "..."      # experimental generative restyle
+autoshop retouch   <raw> --mask m.png --prompt "..."    # experimental object removal
+autoshop recipe-schema                       # print the EditRecipe JSON shape
 ```
+
+`<src>` is a RAW (`.arw/.dng/...`) **or** a baked image (`.png/.tif/.jpg`) — the
+develop pipeline runs on either. RAWs also get an `.xmp`; baked sources get
+`recipe.json` only (XMP is meaningful only for RAW in Lightroom).
+
+## AI setup
+
+| Provider | What | Needs |
+|----------|------|-------|
+| **Claude** (verifier) | acceptance-verifies each recipe | the `claude` CLI on PATH, signed in (reuses Claude Code OAuth — **no API key**) |
+| **GPT** (vision advisor) | looks at the photo → `EditRecipe` | `OPENAI_API_KEY` in a gitignored `.env`. Without it, a histogram heuristic is used. |
+
+`.env` example (never committed):
+
+```
+OPENAI_API_KEY=sk-...
+```
+
+## AI Denoise setup
+
+The denoiser is a small Python sidecar ([`python/denoise.py`](python/denoise.py))
+running **SCUNet** on the GPU. It needs Python with:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu128   # CUDA build
+pip install opencv-python numpy einops requests
+```
+
+On first use it downloads the model weights (~69 MB/model) into `python/weights/`
+(gitignored). Trigger it via `autoshop auto --denoise`, `autoshop denoise <src>`,
+or the **AI Denoise** checkbox in the web UI. Models: `color_real_psnr` (default,
+blind, best for real high-ISO/astro), `color_real_gan`, `color_15/25/50`.
+
+## Configuration (env vars)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `OPENAI_API_KEY` | — | GPT vision advisor + generative |
+| `AUTOSHOP_OPENAI_MODEL` | `gpt-5.5` | vision model id |
+| `AUTOSHOP_CLAUDE_MODEL` | `claude-sonnet-4-6` | verifier model |
+| `AUTOSHOP_PYTHON` | `python` | interpreter for the denoise sidecar |
+| `AUTOSHOP_DENOISE_MODEL` | `color_real_psnr` | default SCUNet weights |
+
+## Honest scope
+
+- Render ops are tasteful **approximations** of Lightroom, not bit-exact. The
+  XMP→Lightroom path renders them faithfully in the meantime.
+- AI denoise runs on the demosaiced RGB (not the raw Bayer mosaic like Adobe
+  Denoise), and ~3 min for a 60 MP frame on an RTX 4060 Ti. Excellent, not
+  identical to Adobe.
+- Kelvin white balance is a no-op on baked PNG/TIFF sources (no raw WB
+  coefficients); relative tweaks still apply.
+- Generative `reimagine`/`retouch` are low-res, lossy experiments — not masters.
 
 ## Tech
 
-Rust (rustc/cargo 1.94). The AI advisor shells out to the local `claude` CLI
-(`-p --output-format json`), reusing your Claude Code OAuth — no API key needed.
-An optional parallel GPT advisor can be wired in later for cross-checking.
+Rust (rustc/cargo 1.94) · `rawler` (Sony ARW decode) · `image` · `clap` ·
+`serde` · `ureq` · `tiny_http` (web UI) · Python + PyTorch + SCUNet (denoise) ·
+Claude CLI (verifier) · OpenAI Responses + Images (advisor + generative).
+
+See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full design.

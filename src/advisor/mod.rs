@@ -140,7 +140,7 @@ pub(crate) fn strip_code_fence(s: &str) -> &str {
     let t = s.trim();
     if let Some(rest) = t.strip_prefix("```") {
         // Drop an optional language tag on the first line, and the trailing ```.
-        let rest = rest.splitn(2, '\n').nth(1).unwrap_or(rest);
+        let rest = rest.split_once('\n').map(|x| x.1).unwrap_or(rest);
         rest.trim().strip_suffix("```").unwrap_or(rest).trim()
     } else {
         t
@@ -176,11 +176,10 @@ pub(crate) fn balanced_objects(s: &str) -> Vec<&str> {
             depth += 1;
         } else if b == b'}' && depth > 0 {
             depth -= 1;
-            if depth == 0 {
-                if let Some(st) = start.take() {
+            if depth == 0
+                && let Some(st) = start.take() {
                     out.push(&s[st..=i]);
                 }
-            }
         }
     }
     out

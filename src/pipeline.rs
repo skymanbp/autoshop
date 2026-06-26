@@ -27,7 +27,8 @@ pub fn produce_recipe(
     verbose: bool,
     guidance: Option<&str>,
 ) -> Result<(EditRecipe, Verdict)> {
-    let decoded = decode::decode_raw(raw)?;
+    // decode_any: a camera RAW, or an already-baked PNG/TIFF/JPEG (PNG-source mode).
+    let decoded = decode::decode_any(raw)?;
 
     let preview_img = decoded.preview_resized(1568);
     let mut jpeg = Vec::new();
@@ -48,11 +49,10 @@ pub fn produce_recipe(
     if verbose && ref_str.is_some() {
         println!("style    : using reference from your edits on similar shots");
     }
-    if verbose {
-        if let Some(g) = guidance {
+    if verbose
+        && let Some(g) = guidance {
             println!("direction: {g}");
         }
-    }
 
     let (meta, hist) = (&decoded.meta, &decoded.histogram);
 
@@ -85,15 +85,14 @@ pub fn produce_recipe(
     let mut verdict = claude.verify(&recipe, meta, hist)?;
 
     // One revision round — only if GPT actually produced the recipe.
-    if verdict.decision != Decision::Accept && can_revise {
-        if let Some(hint) = verdict.revised_hint.clone() {
+    if verdict.decision != Decision::Accept && can_revise
+        && let Some(hint) = verdict.revised_hint.clone() {
             if verbose {
                 println!("verdict was {:?} → one revision round (hint: {hint})", verdict.decision);
             }
             recipe = openai.propose(&preview, meta, hist, ref_str, guidance, Some(&hint))?;
             verdict = claude.verify(&recipe, meta, hist)?;
         }
-    }
     Ok((recipe, verdict))
 }
 
@@ -125,15 +124,14 @@ pub fn guard_readonly(out: &Path, raw: &Path) -> Result<()> {
     let (Ok(out_abs), Ok(raw_abs)) = (absolute(out), absolute(raw)) else {
         return Ok(());
     };
-    if let Some(raw_dir) = raw_abs.parent() {
-        if out_abs.starts_with(raw_dir) {
+    if let Some(raw_dir) = raw_abs.parent()
+        && out_abs.starts_with(raw_dir) {
             anyhow::bail!(
                 "refusing to write into the source RAW's folder ({}) — the photo library is \
                  read-only. Write outputs to ./out (the default) instead.",
                 raw_dir.display()
             );
         }
-    }
     Ok(())
 }
 
@@ -143,12 +141,11 @@ pub fn default_out(raw: &Path, kind: &str, ext: &str) -> PathBuf {
 }
 
 pub fn ensure_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create output dir {}", parent.display()))?;
         }
-    }
     Ok(())
 }
 
@@ -168,6 +165,32 @@ pub fn find_raws(dir: &Path) -> Result<Vec<PathBuf>> {
                 .and_then(|x| x.to_str())
                 .is_some_and(|x| x.eq_ignore_ascii_case("arw"))
             {
+                out.push(p);
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(dir, &mut out).with_context(|| format!("scan {}", dir.display()))?;
+    out.sort();
+    Ok(out)
+}
+
+/// Like [`find_raws`] but also includes already-baked images (PNG/TIFF/JPEG), so
+/// the web UI can browse and edit LR/PS-denoised exports alongside RAWs. Sorted.
+pub fn find_sources(dir: &Path) -> Result<Vec<PathBuf>> {
+    fn is_source(p: &Path) -> bool {
+        crate::decode::is_raw(p)
+            || p.extension().and_then(|x| x.to_str()).is_some_and(|x| {
+                matches!(x.to_ascii_lowercase().as_str(), "png" | "tif" | "tiff" | "jpg" | "jpeg")
+            })
+    }
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let p = entry?.path();
+            if p.is_dir() {
+                walk(&p, out)?;
+            } else if is_source(&p) {
                 out.push(p);
             }
         }

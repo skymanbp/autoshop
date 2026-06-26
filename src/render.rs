@@ -28,8 +28,14 @@ use crate::recipe::{EditRecipe, MaskGeometry};
 
 const LUT_N: usize = 4096;
 
-/// Develop `raw_path` and apply `recipe`, returning the finished image.
-pub fn render_to_image(raw_path: &Path, recipe: &EditRecipe) -> Result<DynamicImage> {
+/// Develop `raw_path` and apply `recipe`, returning the finished image. When
+/// `denoise` is set, the demosaiced buffer is AI-denoised (via the Python
+/// sidecar) before any tonal/colour work — i.e. denoise-before-sharpen.
+pub fn render_to_image(
+    raw_path: &Path,
+    recipe: &EditRecipe,
+    denoise: Option<&crate::denoise::DenoiseOpts>,
+) -> Result<DynamicImage> {
     let src = RawSource::new(raw_path)
         .with_context(|| format!("open RAW {}", raw_path.display()))?;
     let decoder =
@@ -52,6 +58,12 @@ pub fn render_to_image(raw_path: &Path, recipe: &EditRecipe) -> Result<DynamicIm
     };
     let (w, h) = (rgb.width, rgb.height);
     let mut data: Vec<[f32; 3]> = rgb.data; // sRGB-gamma, ~[0,1]; owned (no copy)
+
+    // --- AI denoise (opt-in) on the clean demosaiced pixels, before tone/sharpen
+    if let Some(opts) = denoise {
+        println!("AI denoise ({}) on {}x{} ...", opts.model, w, h);
+        crate::denoise::denoise_buffer(opts, &mut data, w, h).context("AI denoise")?;
+    }
 
     // --- white balance (target Kelvin/tint) in linear light -------------------
     // The buffer is already at as-shot WB. We anchor as-shot at 5500 K (daylight)
@@ -91,11 +103,70 @@ pub fn render_to_image(raw_path: &Path, recipe: &EditRecipe) -> Result<DynamicIm
     Ok(dynimg)
 }
 
+/// Develop an already-baked image (the "PNG source" mode: edit an LR/PS-denoised
+/// export). Runs the SAME tonal/colour pipeline as the RAW engine on the loaded
+/// pixels — but no demosaic and no Kelvin white balance, since a baked sRGB image
+/// carries no raw WB coefficients (temperature_k is a no-op here; relative tweaks
+/// still apply). Optional AI denoise runs first; output is 16-bit.
+pub fn render_baked_to_image(
+    img: &DynamicImage,
+    recipe: &EditRecipe,
+    denoise: Option<&crate::denoise::DenoiseOpts>,
+) -> Result<DynamicImage> {
+    let rgb = img.to_rgb16();
+    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+    let mut data: Vec<[f32; 3]> = rgb
+        .pixels()
+        .map(|p| [p[0] as f32 / 65535.0, p[1] as f32 / 65535.0, p[2] as f32 / 65535.0])
+        .collect();
+
+    if let Some(opts) = denoise {
+        println!("AI denoise ({}) on {}x{} ...", opts.model, w, h);
+        crate::denoise::denoise_buffer(opts, &mut data, w, h).context("AI denoise")?;
+    }
+
+    apply_develop(&mut data, w, h, recipe);
+
+    let mut buf: Vec<u16> = Vec::with_capacity(w * h * 3);
+    for px in &data {
+        buf.push(to_u16(px[0]));
+        buf.push(to_u16(px[1]));
+        buf.push(to_u16(px[2]));
+    }
+    let out: ImageBuffer<Rgb<u16>, _> = ImageBuffer::from_raw(w as u32, h as u32, buf)
+        .ok_or_else(|| anyhow!("baked pixel buffer size mismatch"))?;
+    let mut dynimg = DynamicImage::ImageRgb16(out);
+
+    // Crop (normalised [0,1]) — orientation is already baked into the source.
+    if let Some(c) = &recipe.crop {
+        let (iw, ih) = (dynimg.width() as f32, dynimg.height() as f32);
+        let x = (c.left.clamp(0.0, 1.0) * iw).round() as u32;
+        let y = (c.top.clamp(0.0, 1.0) * ih).round() as u32;
+        let cw = (((c.right - c.left).clamp(0.0, 1.0)) * iw).round() as u32;
+        let ch = (((c.bottom - c.top).clamp(0.0, 1.0)) * ih).round() as u32;
+        if cw > 0 && ch > 0 {
+            dynimg = dynimg.crop_imm(x, y, cw, ch);
+        }
+    }
+    Ok(dynimg)
+}
+
 /// Render and save to `out` at the highest fidelity the format allows:
 /// `.tif`/`.png` keep the full **16-bit** depth; `.jpg` downconverts to 8-bit at
-/// quality 95. Extension picks the format.
-pub fn render_to_file(raw_path: &Path, recipe: &EditRecipe, out: &Path) -> Result<(u32, u32)> {
-    let img = render_to_image(raw_path, recipe)?;
+/// quality 95. Extension picks the format. Dispatches RAW (demosaic engine) vs
+/// baked image (the PNG-source engine) automatically.
+pub fn render_to_file(
+    src_path: &Path,
+    recipe: &EditRecipe,
+    out: &Path,
+    denoise: Option<&crate::denoise::DenoiseOpts>,
+) -> Result<(u32, u32)> {
+    let img = if crate::decode::is_raw(src_path) {
+        render_to_image(src_path, recipe, denoise)?
+    } else {
+        let src = crate::decode::load_image(src_path)?;
+        render_baked_to_image(&src, recipe, denoise)?
+    };
     let (w, h) = (img.width(), img.height());
     let ext = out
         .extension()
@@ -363,19 +434,19 @@ fn kelvin_to_rgb(k: f32) -> [f32; 3] {
     let red = if t <= 66.0 {
         255.0
     } else {
-        (329.698727446 * (t - 60.0).powf(-0.1332047592)).clamp(0.0, 255.0)
+        (329.698_73 * (t - 60.0).powf(-0.133_204_76)).clamp(0.0, 255.0)
     };
     let green = if t <= 66.0 {
-        (99.4708025861 * t.ln() - 161.1195681661).clamp(0.0, 255.0)
+        (99.470_8 * t.ln() - 161.119_57).clamp(0.0, 255.0)
     } else {
-        (288.1221695283 * (t - 60.0).powf(-0.0755148492)).clamp(0.0, 255.0)
+        (288.122_16 * (t - 60.0).powf(-0.075_514_846)).clamp(0.0, 255.0)
     };
     let blue = if t >= 66.0 {
         255.0
     } else if t <= 19.0 {
         0.0
     } else {
-        (138.5177312231 * (t - 10.0).ln() - 305.0447927307).clamp(0.0, 255.0)
+        (138.517_73 * (t - 10.0).ln() - 305.044_8).clamp(0.0, 255.0)
     };
     [red / 255.0, green / 255.0, blue / 255.0]
 }

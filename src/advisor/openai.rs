@@ -195,11 +195,10 @@ fn extract_output_text(v: &Value) -> Option<String> {
     for item in v.get("output")?.as_array()? {
         if let Some(content) = item.get("content").and_then(Value::as_array) {
             for c in content {
-                if c.get("type").and_then(Value::as_str) == Some("output_text") {
-                    if let Some(s) = c.get("text").and_then(Value::as_str) {
+                if c.get("type").and_then(Value::as_str) == Some("output_text")
+                    && let Some(s) = c.get("text").and_then(Value::as_str) {
                         return Some(s.to_string());
                     }
-                }
             }
         }
     }

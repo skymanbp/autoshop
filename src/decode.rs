@@ -87,6 +87,64 @@ fn fmt_shutter(r: &Rational) -> String {
     }
 }
 
+/// Does this path look like a camera RAW (vs an already-baked raster like a
+/// LR/PS-exported PNG/TIFF/JPEG)? Drives the raw-vs-baked dispatch.
+pub fn is_raw(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        matches!(
+            e.to_ascii_lowercase().as_str(),
+            "arw" | "dng" | "raw" | "raf" | "nef" | "cr2" | "cr3" | "orf" | "rw2"
+        )
+    })
+}
+
+/// Load a baked raster (PNG/TIFF/JPEG) with the decoder memory limit lifted —
+/// a 60 MP export would otherwise trip the image crate's default allocation cap.
+pub fn load_image(path: &Path) -> Result<DynamicImage> {
+    let mut reader = image::ImageReader::open(path)
+        .with_context(|| format!("open image {}", path.display()))?;
+    reader.limits(image::Limits::no_limits());
+    reader
+        .with_guessed_format()
+        .with_context(|| format!("probe image {}", path.display()))?
+        .decode()
+        .with_context(|| format!("decode image {}", path.display()))
+}
+
+/// Decode any supported source — a camera RAW or an already-baked image. The
+/// baked path (the "PNG source" mode: edit an LR/PS-denoised export) has no
+/// sensor metadata, so [`Meta`] is filled with neutral defaults and the
+/// histogram is computed from the pixels.
+pub fn decode_any(path: &Path) -> Result<Decoded> {
+    if is_raw(path) {
+        decode_raw(path)
+    } else {
+        decode_baked(path)
+    }
+}
+
+fn decode_baked(path: &Path) -> Result<Decoded> {
+    let preview = load_image(path)?;
+    let (w, h) = preview.dimensions();
+    let meta = Meta {
+        make: String::new(),
+        model: "imported image".to_string(),
+        lens: None,
+        iso: None,
+        shutter: None,
+        aperture: None,
+        focal_length_mm: None,
+        exposure_bias_ev: None,
+        date_time: None,
+        width: w as usize,
+        height: h as usize,
+        as_shot_wb_coeffs: [1.0, 1.0, 1.0, 1.0],
+    };
+    let small = preview.resize(1024, 1024, image::imageops::FilterType::Triangle);
+    let histogram = compute_histogram(&small);
+    Ok(Decoded { preview, meta, histogram, embedded_xmp: None })
+}
+
 /// Decode a RAW file: embedded preview + metadata + histogram. Reads the file
 /// only; never writes near the source.
 pub fn decode_raw(path: &Path) -> Result<Decoded> {
@@ -174,6 +232,9 @@ pub fn decode_raw(path: &Path) -> Result<Decoded> {
 /// Just the embedded preview, skipping metadata/histogram — for the UI grid and
 /// before/after, where only the image is needed.
 pub fn preview_only(path: &Path) -> Result<DynamicImage> {
+    if !is_raw(path) {
+        return load_image(path);
+    }
     let src = RawSource::new(path).with_context(|| format!("open RAW {}", path.display()))?;
     let decoder =
         get_decoder(&src).map_err(|e| anyhow!("no decoder for {}: {e}", path.display()))?;

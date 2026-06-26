@@ -9,6 +9,7 @@
 mod advisor;
 mod config;
 mod decode;
+mod denoise;
 mod eval;
 mod generative;
 mod pipeline;
@@ -86,6 +87,31 @@ enum Command {
         /// Optional direction for the AI (e.g. "warmer and moodier").
         #[arg(long)]
         guidance: Option<String>,
+        /// Run AI denoise (SCUNet, GPU) before developing — for high-ISO/astro.
+        #[arg(long)]
+        denoise: bool,
+        /// Denoise strength 0..1 (blend with original); default 1.0.
+        #[arg(long)]
+        denoise_strength: Option<f32>,
+        /// SCUNet model: color_real_psnr (default) / color_real_gan / color_15|25|50.
+        #[arg(long)]
+        denoise_model: Option<String>,
+    },
+    /// AI-denoise a RAW or an already-baked image (PNG/TIFF/JPEG) into a clean
+    /// 16-bit master in ./out. Manual, GPU-accelerated (SCUNet sidecar). Default
+    /// off everywhere else — this is the explicit "denoise now" command.
+    Denoise {
+        /// RAW (.arw/.dng/...) or image (.png/.tif/.jpg) to denoise.
+        input: PathBuf,
+        /// Output path (default: ./out/<stem>.denoised.tif).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Strength 0..1 (blend with original); default 1.0.
+        #[arg(long)]
+        strength: Option<f32>,
+        /// SCUNet model tier (see `auto --denoise-model`).
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Batch-process every RAW under a folder (resumes by skipping done .xmp).
     /// Outputs go to ./out — the photo library stays read-only.
@@ -162,7 +188,10 @@ fn main() -> Result<()> {
         Command::Decode { raw, out } => decode_cmd(&raw, out),
         Command::Analyze { raw, out, guidance } => analyze_cmd(&raw, out, guidance),
         Command::Apply { raw, recipe, out } => apply_cmd(&raw, &recipe, &out),
-        Command::Auto { raw, out, guidance } => auto_cmd(&raw, out, guidance),
+        Command::Auto { raw, out, guidance, denoise, denoise_strength, denoise_model } => {
+            auto_cmd(&raw, out, guidance, denoise, denoise_strength, denoise_model)
+        }
+        Command::Denoise { input, out, strength, model } => denoise_cmd(&input, out, strength, model),
         Command::Batch { dir, render, limit } => batch_cmd(&dir, render, limit),
         Command::Eval { dir, limit } => eval::run(&dir, limit),
         Command::StyleIndex { dir } => style_index_cmd(&dir),
@@ -198,7 +227,7 @@ fn style_index_cmd(dir: &Path) -> Result<()> {
 }
 
 fn decode_cmd(raw: &Path, out: Option<PathBuf>) -> Result<()> {
-    let decoded = decode::decode_raw(raw)?;
+    let decoded = decode::decode_any(raw)?;
 
     let out = out.unwrap_or_else(|| default_out(raw, "preview", "jpg"));
     pipeline::guard_readonly(&out, raw)?;
@@ -250,7 +279,6 @@ fn analyze_cmd(raw: &Path, out: Option<PathBuf>, guidance: Option<String>) -> Re
     }
     let (recipe, verdict) = produce_recipe(raw, &cfg, true, guidance.as_deref())?;
     let recipe_path = write_recipe(raw, &recipe, out)?;
-    let xmp_path = write_xmp(raw, &recipe)?;
 
     println!("\n--- proposed recipe ---");
     println!("{}", serde_json::to_string_pretty(&recipe)?);
@@ -259,9 +287,15 @@ fn analyze_cmd(raw: &Path, out: Option<PathBuf>, guidance: Option<String>) -> Re
         println!("  - {reason}");
     }
     println!("\nrecipe -> {}", recipe_path.display());
-    println!("xmp    -> {}", xmp_path.display());
-    let s = stem(raw);
-    println!("  (the library is read-only — copy {s}.xmp next to {s}.ARW to open it in Lightroom)");
+    // XMP only for a RAW; a baked source (PNG/TIFF) gets the recipe JSON only.
+    if decode::is_raw(raw) {
+        let xmp_path = write_xmp(raw, &recipe)?;
+        println!("xmp    -> {}", xmp_path.display());
+        let s = stem(raw);
+        println!("  (the library is read-only — copy {s}.xmp next to {s}.ARW to open it in Lightroom)");
+    } else {
+        println!("  (baked source — recipe JSON only; XMP applies to RAW in Lightroom)");
+    }
     Ok(())
 }
 
@@ -273,26 +307,71 @@ fn apply_cmd(raw: &Path, recipe_path: &Path, out: &Path) -> Result<()> {
     pipeline::guard_readonly(out, raw)?;
     ensure_parent(out)?;
     println!("rendering {} with {} ...", raw.display(), recipe_path.display());
-    let (w, h) = render::render_to_file(raw, &recipe, out)?;
+    let (w, h) = render::render_to_file(raw, &recipe, out, None)?;
     println!("render -> {} ({} x {})", out.display(), w, h);
     Ok(())
 }
 
-fn auto_cmd(raw: &Path, out: Option<PathBuf>, guidance: Option<String>) -> Result<()> {
+fn auto_cmd(
+    raw: &Path,
+    out: Option<PathBuf>,
+    guidance: Option<String>,
+    denoise: bool,
+    denoise_strength: Option<f32>,
+    denoise_model: Option<String>,
+) -> Result<()> {
     let cfg = Config::load();
     let (recipe, verdict) = produce_recipe(raw, &cfg, true, guidance.as_deref())?;
     write_recipe(raw, &recipe, None)?;
-    let xmp_path = write_xmp(raw, &recipe)?;
 
     // Default to a 16-bit TIFF master (highest fidelity); pass -o foo.jpg for a
     // smaller 8-bit file.
     let out = out.unwrap_or_else(|| default_out(raw, "developed", "tif"));
     pipeline::guard_readonly(&out, raw)?;
     ensure_parent(&out)?;
-    println!("verdict: {:?}; rendering full-resolution (16-bit) ...", verdict.decision);
-    let (w, h) = render::render_to_file(raw, &recipe, &out)?;
+    // Opt-in AI denoise runs inside the render, before tone/sharpen.
+    let dn = denoise
+        .then(|| denoise::DenoiseOpts::from_config(&cfg, denoise_model, denoise_strength.unwrap_or(1.0)));
+    println!(
+        "verdict: {:?}; rendering full-resolution (16-bit){} ...",
+        verdict.decision,
+        if denoise { " with AI denoise" } else { "" }
+    );
+    let (w, h) = render::render_to_file(raw, &recipe, &out, dn.as_ref())?;
     println!("render -> {} ({} x {})", out.display(), w, h);
-    println!("xmp    -> {}", xmp_path.display());
+    // XMP only for a RAW (Lightroom reads it beside the RAW); a baked source
+    // (PNG/TIFF) gets the recipe JSON only.
+    if decode::is_raw(raw) {
+        let xmp_path = write_xmp(raw, &recipe)?;
+        println!("xmp    -> {}", xmp_path.display());
+    } else {
+        println!("(baked source — recipe.json only, no XMP)");
+    }
+    Ok(())
+}
+
+/// Standalone AI denoise: RAW → neutral-developed denoised master, or a baked
+/// PNG/TIFF/JPEG → denoised copy. Always writes to ./out (library read-only).
+fn denoise_cmd(
+    input: &Path,
+    out: Option<PathBuf>,
+    strength: Option<f32>,
+    model: Option<String>,
+) -> Result<()> {
+    let cfg = Config::load();
+    let out = out.unwrap_or_else(|| default_out(input, "denoised", "tif"));
+    pipeline::guard_readonly(&out, input)?;
+    ensure_parent(&out)?;
+    let opts = denoise::DenoiseOpts::from_config(&cfg, model, strength.unwrap_or(1.0));
+    if decode::is_raw(input) {
+        println!("denoising RAW {} (neutral develop) ...", input.display());
+        let (w, h) = render::render_to_file(input, &EditRecipe::default(), &out, Some(&opts))?;
+        println!("denoised -> {} ({} x {})", out.display(), w, h);
+    } else {
+        println!("denoising image {} ...", input.display());
+        denoise::denoise_file(&opts, input, &out)?;
+        println!("denoised -> {}", out.display());
+    }
     Ok(())
 }
 
@@ -336,7 +415,7 @@ fn process_one(raw: &Path, cfg: &Config, render_master: bool) -> Result<Verdict>
     if render_master {
         let out = default_out(raw, "developed", "tif"); // 16-bit master
         ensure_parent(&out)?;
-        render::render_to_file(raw, &recipe, &out)?;
+        render::render_to_file(raw, &recipe, &out, None)?;
     }
     Ok(verdict)
 }

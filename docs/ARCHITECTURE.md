@@ -1,14 +1,20 @@
 # Autoshop — Architecture
 
-> Status: **initial scaffold (M0 done)**. The data model + CLI surface compile
-> and test clean; the decode → advise → render pipeline is designed here and
-> stubbed in code. Items marked **[verify]** are assumptions to validate during
-> implementation, not established facts.
+> Status: **implemented**. The full decode → advise → verify → render pipeline
+> ships, plus the web UI, AI denoise (SCUNet sidecar), the PNG/TIFF baked-source
+> mode, style retrieval, XMP sidecars (global + local masks), and experimental
+> generative edits. 16 unit tests pass. This document describes the design; a few
+> historical **[verify]** notes are left in place for provenance.
 >
 > Confirmed by the user (2026-06-25): Sony `.ARW`; output = XMP sidecar **and**
 > rendered file (XMP-first); two AI roles behind one unified provider framework —
 > **vision model (GPT) does image processing**, **Claude does non-image analysis
 > + acceptance verification**.
+>
+> Since shipped, two *opt-in* pixel-level features were added alongside the
+> parametric core: **AI denoise** (a Python/SCUNet GPU sidecar, run before
+> tone/sharpen) and a **baked-source mode** (edit an already-exported PNG/TIFF,
+> e.g. one denoised in Lightroom — auto-detected by file type).
 
 ## 1. The core idea
 
@@ -77,25 +83,28 @@ the OpenAI vision path needs an `OPENAI_API_KEY`.
 
 ## 4. Components & milestones
 
-| ID | Component | Crate/tool (candidate) | Status |
-|----|-----------|------------------------|--------|
+| ID | Component | Crate/tool (actual) | Status |
+|----|-----------|---------------------|--------|
 | M0 | Data model + CLI scaffold | `clap`, `serde`, `serde_json`, `anyhow`, `thiserror` | **done** |
-| M1 | RAW decode + features (Sony ARW) | `rawloader` + `imagepipe` (pure Rust) **[verify ARW]**, fallback `libraw` FFI | planned |
-| M1 | Unified provider framework + GPT image advisor + Claude verifier | `reqwest` (HTTP) + `claude` CLI; `tokio` if async | planned |
-| M2 | Deterministic render engine | `image`, custom tone/colour ops | planned |
-| M2 | XMP sidecar writer (ACR `crs:`) | hand-rolled XML | planned |
-| M3 | `auto` end-to-end + batch | `rayon` for parallel batch | planned |
-| M4 | Style/eval harness (use finished edits as ground truth) | perceptual metrics / XMP diff | planned |
-| M5 | UI / Photoshop plugin | TBD (egui? Tauri? PS UXP?) | later |
+| M1 | RAW decode + features (Sony ARW) | **`rawler` 0.7.2** (preview + EXIF + WB) | **done** |
+| M1 | Unified provider framework + GPT advisor + Claude verifier | `ureq` (HTTP) + `claude` CLI | **done** |
+| M2 | Deterministic render engine | `image`, custom tone/colour/WB/clarity/NR/sharpen ops | **done** |
+| M2 | XMP sidecar writer (ACR `crs:`, global + local masks) | hand-rolled XML | **done** |
+| M3 | `auto` end-to-end + batch | sequential batch (resumes by skipping done `.xmp`) | **done** |
+| M4 | Style retrieval + eval harness (your edits as ground truth) | k-NN over EXIF+histogram; per-field MAE/bias | **done** |
+| M5 | Local web UI | `tiny_http` + vanilla JS (gallery, live before/after) | **done** |
+| V2 | AI denoise (high-ISO/astro) | Python sidecar → **SCUNet** on GPU, called from Rust | **done** |
+| V2 | Baked-source mode (edit exported PNG/TIFF) | extension dispatch; develop runs on loaded pixels | **done** |
+| V2 | Generative reimagine / retouch | OpenAI Images (`gpt-image-*`) | **done (experimental)** |
 
 ### 4.1 RAW decode (M1)
 
-Primary candidate: **`rawloader`** (sensor data) + **`imagepipe`** (demosaic +
-pipeline), pure-Rust — no C toolchain on Windows. **[verify]** Sony `.ARW`
-coverage and embedded-preview extraction; fall back to **`libraw`** (FFI) if
-gaps. Also extract: embedded JPEG preview (for the vision advisor), a downscaled
-linear render (histogram/clipping), and EXIF (camera/lens/ISO/shutter/aperture/
-as-shot WB) via e.g. `kamadak-exif`.
+Backed by **`rawler` 0.7.2** (chosen over the now-frozen `rawloader` for current
+Sony body coverage + embedded preview + full EXIF; see [`src/decode.rs`](../src/decode.rs)).
+It extracts the embedded JPEG preview (for the vision advisor + UI), a downscaled
+histogram with clipping stats, and EXIF (camera/lens/ISO/shutter/aperture/
+as-shot WB). Baked sources (PNG/TIFF/JPEG) skip this and load directly via the
+`image` crate with neutral metadata.
 
 ### 4.2 Vision advisor — image processing (M1)
 

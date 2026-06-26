@@ -32,7 +32,8 @@ struct AppState {
 }
 
 pub fn serve(dir: &Path, port: u16) -> Result<()> {
-    let raws = pipeline::find_raws(dir)?;
+    // Sources = RAWs + already-baked PNG/TIFF/JPEG (the PNG-source edit mode).
+    let raws = pipeline::find_sources(dir)?;
     let state = Arc::new(AppState {
         dir: dir.to_path_buf(),
         raws,
@@ -130,6 +131,11 @@ struct AnalyzeReq {
 struct DevelopReq {
     id: usize,
     recipe: EditRecipe,
+    /// Export-only: run AI denoise before developing (ignored by live preview).
+    #[serde(default)]
+    denoise: bool,
+    #[serde(default)]
+    denoise_strength: Option<f32>,
 }
 #[derive(Deserialize)]
 struct XmpReq {
@@ -162,7 +168,10 @@ fn api_export(mut request: Request, state: &AppState) -> Result<()> {
     // 16-bit TIFF master (highest fidelity); always to ./out (library read-only).
     let out = pipeline::default_out(&raw, "developed", "tif");
     pipeline::ensure_parent(&out)?;
-    render::render_to_file(&raw, &req.recipe, &out)?;
+    let dn = req
+        .denoise
+        .then(|| crate::denoise::DenoiseOpts::from_config(&state.cfg, None, req.denoise_strength.unwrap_or(1.0)));
+    render::render_to_file(&raw, &req.recipe, &out, dn.as_ref())?;
     respond_text(request, &out.display().to_string())
 }
 

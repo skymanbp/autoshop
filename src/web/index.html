@@ -70,6 +70,9 @@
     <button class="analyze">✨ Analyze with AI</button>
     <button class="secondary reset">Reset</button>
     <button class="secondary savexmp">Save XMP → ./out</button>
+    <label class="dn" title="SCUNet AI denoise before developing — for high-ISO / astro (slow, GPU)">
+      <input type="checkbox" class="denoise-toggle" /> AI Denoise
+    </label>
     <button class="secondary export">Export 16-bit TIFF</button>
   </div>
   <div class="controls">
@@ -222,11 +225,12 @@ async function saveXmp() {
   setStatus(r.ok ? ("xmp saved → " + await r.text()) : "save failed");
 }
 async function exportFull() {
-  setStatus("rendering full-resolution… (slow)");
+  const dn = document.querySelector(".denoise-toggle")?.checked || false;
+  setStatus(dn ? "rendering + AI denoise… (GPU, can take minutes)" : "rendering full-resolution… (slow)");
   const btn = $(".export"); btn.disabled = true;
   try {
     const r = await fetch("/api/export", {method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({id: state.id, recipe: state.recipe})});
+      body: JSON.stringify({id: state.id, recipe: state.recipe, denoise: dn})});
     setStatus(r.ok ? ("exported → " + await r.text()) : "export failed");
   } finally { btn.disabled = false; }
 }

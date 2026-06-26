@@ -148,13 +148,12 @@ pub fn run(dir: &Path, limit: usize) -> Result<()> {
     println!("\n=== AI vs your edits ({evaluated} photo(s)) ===");
     println!("{:<16} {:>4} {:>12} {:>14}", "field", "n", "mean|Δ|", "bias(AI−you)");
     for name in order {
-        if let Some(a) = acc.get(name) {
-            if a.n > 0 {
+        if let Some(a) = acc.get(name)
+            && a.n > 0 {
                 let mae = a.sum_abs / a.n as f64;
                 let bias = a.sum_signed / a.n as f64;
                 println!("{:<16} {:>4} {:>12.2} {:>+14.2}", name, a.n, mae, bias);
             }
-        }
     }
     println!(
         "\nInterpretation: positive bias = AI sets this higher than you do. Large mean|Δ| = AI \

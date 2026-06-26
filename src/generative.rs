@@ -4,6 +4,7 @@
 //!   * low resolution (≈1 MP here vs the 61 MP RAW),
 //!   * a lossy generative re-render (not pixel-faithful),
 //!   * non-deterministic.
+//!
 //! Strictly a low-res experiment / preview — NOT a deliverable master. The
 //! XMP-first parametric path remains the real workflow.
 //!

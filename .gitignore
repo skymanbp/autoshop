@@ -11,6 +11,11 @@
 /output/
 *.tmp
 
+# AI-denoise sidecar: downloaded model weights (~137 MB) + Python caches.
+# The code (python/denoise.py) is versioned; the weights are fetched on first run.
+/python/weights/
+**/__pycache__/
+
 # Local config that may hold secrets (e.g. OpenAI key for the optional GPT path)
 .env
 autoshop.local.toml
