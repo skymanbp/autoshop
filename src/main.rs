@@ -14,6 +14,7 @@ mod advisor;
 mod config;
 mod decode;
 mod recipe;
+mod xmp;
 
 use std::path::{Path, PathBuf};
 
@@ -56,6 +57,10 @@ enum Command {
         /// Where to write the recipe JSON (default: ./out/<stem>.recipe.json).
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Also write the .xmp sidecar next to the source RAW so Lightroom picks
+        /// it up directly. WRITES INTO THE LIBRARY; default writes only to ./out.
+        #[arg(long)]
+        beside: bool,
     },
     /// Apply an existing EditRecipe to a RAW file and render an output image.
     Apply {
@@ -83,7 +88,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Decode { raw, out } => decode_cmd(&raw, out),
-        Command::Analyze { raw, out } => analyze_cmd(&raw, out),
+        Command::Analyze { raw, out, beside } => analyze_cmd(&raw, out, beside),
         Command::RecipeSchema => {
             // Genuinely useful today: this is the schema we hand the AI as the
             // required output format.
@@ -149,7 +154,7 @@ fn decode_cmd(raw: &Path, out: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn analyze_cmd(raw: &Path, out: Option<PathBuf>) -> Result<()> {
+fn analyze_cmd(raw: &Path, out: Option<PathBuf>, beside: bool) -> Result<()> {
     let cfg = Config::load();
     let decoded = decode::decode_raw(raw)?;
 
@@ -196,11 +201,23 @@ fn analyze_cmd(raw: &Path, out: Option<PathBuf>) -> Result<()> {
         }
     }
 
-    // Persist the recipe (to ./out, never beside the read-only source).
+    // Persist the recipe JSON (to ./out, never beside the read-only source).
     let out = out.unwrap_or_else(|| default_out(raw, "recipe", "json"));
     ensure_parent(&out)?;
     std::fs::write(&out, serde_json::to_string_pretty(&recipe)?)
         .with_context(|| format!("write recipe {}", out.display()))?;
+
+    // Emit the Lightroom/ACR XMP sidecar — the primary deliverable. By default
+    // it goes to ./out; `--beside` writes it next to the RAW (into the library).
+    let stem = raw.file_stem().and_then(|s| s.to_str()).unwrap_or("recipe");
+    let xmp_out = if beside {
+        raw.with_extension("xmp")
+    } else {
+        PathBuf::from("out").join(format!("{stem}.xmp"))
+    };
+    ensure_parent(&xmp_out)?;
+    std::fs::write(&xmp_out, xmp::recipe_to_xmp(&recipe))
+        .with_context(|| format!("write xmp {}", xmp_out.display()))?;
 
     println!("\n--- proposed recipe ---");
     println!("{}", serde_json::to_string_pretty(&recipe)?);
@@ -209,6 +226,10 @@ fn analyze_cmd(raw: &Path, out: Option<PathBuf>) -> Result<()> {
         println!("  - {reason}");
     }
     println!("\nrecipe -> {}", out.display());
+    println!("xmp    -> {}", xmp_out.display());
+    if !beside {
+        println!("  (copy {stem}.xmp next to {stem}.ARW, or rerun with --beside, to open in Lightroom)");
+    }
     Ok(())
 }
 
