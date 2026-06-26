@@ -53,6 +53,15 @@ pub fn render_to_image(raw_path: &Path, recipe: &EditRecipe) -> Result<DynamicIm
     let (w, h) = (rgb.width, rgb.height);
     let mut data: Vec<[f32; 3]> = rgb.data; // sRGB-gamma, ~[0,1]; owned (no copy)
 
+    // --- white balance (target Kelvin/tint) in linear light -------------------
+    // The buffer is already at as-shot WB. We anchor as-shot at 5500 K (daylight)
+    // and shift toward the target — a direction-correct approximation. A precise
+    // as-shot-K estimate needs the camera colour matrix (raw→XYZ), not a naive
+    // blackbody match; that's the future upgrade. develop_preview skips WB.
+    if let Some(target_k) = recipe.temperature_k {
+        apply_wb(&mut data, 5500.0, target_k, recipe.tint);
+    }
+
     // --- tone + clarity + sat/vibrance + NR + sharpen (shared pipeline) -------
     apply_develop(&mut data, w, h, recipe);
 
@@ -250,6 +259,59 @@ fn box_blur_v(src: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> {
 
 // ---------------------------------------------------------------------------
 
+/// Blackbody colour at temperature `k` Kelvin as RGB in [0,1].
+/// Tanner-Helland piecewise fit [verified: tannerhelland.com/2012/09/18,
+/// R²>0.987]. Valid 1000–40000 K.
+fn kelvin_to_rgb(k: f32) -> [f32; 3] {
+    let t = k.clamp(1000.0, 40000.0) / 100.0;
+    let red = if t <= 66.0 {
+        255.0
+    } else {
+        (329.698727446 * (t - 60.0).powf(-0.1332047592)).clamp(0.0, 255.0)
+    };
+    let green = if t <= 66.0 {
+        (99.4708025861 * t.ln() - 161.1195681661).clamp(0.0, 255.0)
+    } else {
+        (288.1221695283 * (t - 60.0).powf(-0.0755148492)).clamp(0.0, 255.0)
+    };
+    let blue = if t >= 66.0 {
+        255.0
+    } else if t <= 19.0 {
+        0.0
+    } else {
+        (138.5177312231 * (t - 10.0).ln() - 305.0447927307).clamp(0.0, 255.0)
+    };
+    [red / 255.0, green / 255.0, blue / 255.0]
+}
+
+/// Per-channel gains to move WB from `as_shot_k` to `target_k` (+ tint), green
+/// normalised to 1.0 (WB changes colour, not brightness). Lightroom convention:
+/// higher target K = warmer result (boosts red, cuts blue).
+fn wb_gains(as_shot_k: f32, target_k: f32, tint: f32) -> [f32; 3] {
+    let a = kelvin_to_rgb(as_shot_k);
+    let t = kelvin_to_rgb(target_k);
+    let g1 = a[1] / t[1].max(1e-4);
+    let gr = (a[0] / t[0].max(1e-4)) / g1;
+    let gb = (a[2] / t[2].max(1e-4)) / g1;
+    // Tint: positive = magenta (less green), negative = green.
+    let gg = 1.0 - 0.20 * (tint / 100.0);
+    [gr, gg, gb]
+}
+
+/// Apply white-balance gains in linear light. No-op when gains are ~neutral.
+fn apply_wb(data: &mut [[f32; 3]], as_shot_k: f32, target_k: f32, tint: f32) {
+    let g = wb_gains(as_shot_k, target_k, tint);
+    if (g[0] - 1.0).abs() < 1e-3 && (g[1] - 1.0).abs() < 1e-3 && (g[2] - 1.0).abs() < 1e-3 {
+        return;
+    }
+    for px in data.iter_mut() {
+        for c in 0..3 {
+            let lin = srgb_to_linear(px[c]) * g[c];
+            px[c] = linear_to_srgb(lin.clamp(0.0, 1.0));
+        }
+    }
+}
+
 fn srgb_to_linear(c: f32) -> f32 {
     if c <= 0.04045 {
         c / 12.92
@@ -383,6 +445,25 @@ fn to_u8(v: f32) -> u8 {
 mod tests {
     use super::*;
     use crate::recipe::EditRecipe;
+
+    #[test]
+    fn kelvin_to_rgb_warm_is_redder_than_cool() {
+        let warm = kelvin_to_rgb(3000.0);
+        let cool = kelvin_to_rgb(9000.0);
+        assert!(warm[0] >= cool[0], "warm red {} >= cool red {}", warm[0], cool[0]);
+        assert!(warm[2] <= cool[2], "warm blue {} <= cool blue {}", warm[2], cool[2]);
+    }
+
+    #[test]
+    fn wb_warmer_target_boosts_red_cuts_blue() {
+        // Target warmer (higher K) than as-shot ⇒ Lightroom warms: red gain > 1, blue < 1.
+        let g = wb_gains(5000.0, 7000.0, 0.0);
+        assert!(g[0] > 1.0, "red gain {}", g[0]);
+        assert!(g[2] < 1.0, "blue gain {}", g[2]);
+        // Neutral (same K, no tint) ⇒ all gains ~1.
+        let n = wb_gains(5500.0, 5500.0, 0.0);
+        assert!((n[0] - 1.0).abs() < 1e-3 && (n[2] - 1.0).abs() < 1e-3);
+    }
 
     #[test]
     fn box_blur_preserves_uniform_plane() {
