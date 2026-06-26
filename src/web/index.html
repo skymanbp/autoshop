@@ -61,6 +61,7 @@
   .verdict ul { margin:8px 0 0; padding-left:18px; color:var(--muted); }
   .rationale { color:var(--muted); font-size:12px; margin-top:8px; font-style:italic; }
   .hint { color:#6b7177; font-size:11px; margin-top:6px; }
+  body.dragging::after { content:"⤵  Drop photos to open"; position:fixed; inset:0; z-index:50; display:flex; align-items:center; justify-content:center; font-size:24px; font-weight:700; color:#cfe0ff; background:rgba(18,28,52,.85); border:3px dashed var(--accent); pointer-events:none; }
 </style>
 </head>
 <body>
@@ -69,6 +70,8 @@
   <div class="toolbar">
     <input class="path" id="import-path" placeholder="Import: paste a RAW/PNG/TIFF file or a folder path…" />
     <button id="import-btn">＋ Import</button>
+    <button class="secondary" id="open-files" title="Pick files (or just drag photos onto the window)">Open files…</button>
+    <input type="file" id="file-input" multiple accept=".arw,.dng,.raf,.nef,.cr2,.cr3,.png,.tif,.tiff,.jpg,.jpeg" style="display:none" />
     <span class="sep"></span>
     <button class="secondary" id="undo" disabled title="Undo (Ctrl+Z)">↶ Undo</button>
     <button class="secondary" id="redo" disabled title="Redo (Ctrl+Y)">↷ Redo</button>
@@ -204,18 +207,59 @@ async function loadList() {
   }
 }
 
+// After import/upload, refresh the gallery and jump to the first new item so it's
+// obvious it worked (new items append at the end, which may be below the fold).
+async function revealNew(firstId) {
+  await loadList();
+  if (firstId == null) return;
+  const el = document.querySelector(`.thumb[data-id="${firstId}"]`);
+  if (el) { el.scrollIntoView({block:"center"}); el.click(); }
+}
+
 $("#import-btn").onclick = async () => {
-  const path = $("#import-path").value.trim();
-  if (!path) { setStatus("type a file or folder path to import"); return; }
+  // Strip surrounding quotes (Windows "Copy as path" wraps in ") + whitespace.
+  const path = $("#import-path").value.trim().replace(/^"+|"+$/g, "").trim();
+  if (!path) { setStatus("type or paste a file/folder path to import"); return; }
   setStatus("importing…");
   const r = await fetch("/api/import", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({path})});
   if (!r.ok) { setStatus("import failed: " + await r.text()); return; }
   const d = await r.json();
   $("#import-path").value = "";
-  setStatus(`imported ${d.added} new (total ${d.total})`);
-  loadList();
+  if (d.added > 0) { setStatus(`imported ${d.added} (total ${d.total})`); revealNew(d.total - d.added); }
+  else setStatus(`already in the gallery (total ${d.total})`);
 };
 $("#import-path").addEventListener("keydown", e => { if (e.key === "Enter") $("#import-btn").click(); });
+
+// Drag-drop + file picker. Browsers can't give a local server a dropped file's
+// disk PATH (security), so we upload the bytes (saved under ./out/imported).
+async function uploadFiles(files) {
+  let firstId = null, ok = 0;
+  for (const f of files) {
+    setStatus(`uploading ${f.name}…`);
+    try {
+      const buf = await f.arrayBuffer();
+      const r = await fetch("/api/upload", {method:"POST", headers:{"X-Filename": f.name}, body: buf});
+      if (!r.ok) { setStatus("upload failed: " + await r.text()); continue; }
+      const d = await r.json();
+      if (firstId == null) firstId = d.id;
+      ok++;
+    } catch (e) { setStatus("upload error: " + e); }
+  }
+  if (ok) { setStatus(`opened ${ok} file${ok>1?"s":""}`); revealNew(firstId); }
+}
+
+$("#open-files").onclick = () => $("#file-input").click();
+$("#file-input").onchange = e => { if (e.target.files.length) uploadFiles([...e.target.files]); e.target.value = ""; };
+
+let dragDepth = 0;
+window.addEventListener("dragenter", e => { e.preventDefault(); if (dragDepth++ === 0) document.body.classList.add("dragging"); });
+window.addEventListener("dragover", e => { e.preventDefault(); });
+window.addEventListener("dragleave", e => { e.preventDefault(); if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove("dragging"); } });
+window.addEventListener("drop", e => {
+  e.preventDefault(); dragDepth = 0; document.body.classList.remove("dragging");
+  const files = [...((e.dataTransfer && e.dataTransfer.files) || [])];
+  if (files.length) uploadFiles(files);
+});
 
 // --- sliders + live preview ------------------------------------------------
 function buildSliders(container) {

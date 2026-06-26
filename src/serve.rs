@@ -86,6 +86,7 @@ fn handle(request: Request, state: &AppState) -> Result<()> {
         (false, "/api/preview") => api_image(request, state, 1200),
         (false, "/api/recipe") => api_recipe(request, state),
         (true, "/api/import") => api_import(request, state),
+        (true, "/api/upload") => api_upload(request, state),
         (true, "/api/analyze") => api_analyze(request, state),
         (true, "/api/develop") => api_develop(request, state),
         (true, "/api/export") => api_export(request, state),
@@ -132,13 +133,15 @@ struct ImportReq {
 /// Add a file or (recursively) a folder of sources to the gallery at runtime.
 fn api_import(mut request: Request, state: &AppState) -> Result<()> {
     let req: ImportReq = read_json(&mut request)?;
-    let p = PathBuf::from(req.path.trim());
+    // Tolerate Windows "Copy as path" (wraps the path in quotes) + stray spaces.
+    let cleaned = req.path.trim().trim_matches('"').trim();
+    let p = PathBuf::from(cleaned);
     let found: Vec<PathBuf> = if p.is_dir() {
         pipeline::find_sources(&p)?
     } else if p.is_file() && (decode::is_raw(&p) || is_baked_ext(&p)) {
         vec![p.clone()]
     } else {
-        return respond_status(request, 400, "not a supported file or folder");
+        return respond_status(request, 400, &format!("not a file/folder I can read: {cleaned}"));
     };
 
     let mut added = 0usize;
@@ -152,6 +155,52 @@ fn api_import(mut request: Request, state: &AppState) -> Result<()> {
         }
     }
     respond_json(request, &json!({ "added": added, "total": state.count() }))
+}
+
+/// Accept dropped/picked file BYTES, save under ./out/imported, and add it to the
+/// gallery. Browsers can't hand a local server the original disk path, so
+/// drag-drop uploads the bytes (path-based Import stays for your on-disk library).
+/// Filename comes from the `X-Filename` header.
+fn api_upload(mut request: Request, state: &AppState) -> Result<()> {
+    let name = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("X-Filename"))
+        .map(|h| h.value.as_str().to_string())
+        .unwrap_or_default();
+    // basename only — never let an upload name escape ./out/imported.
+    let safe = Path::new(&name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    let as_path = PathBuf::from(&safe);
+    if safe.is_empty() || !(decode::is_raw(&as_path) || is_baked_ext(&as_path)) {
+        return respond_status(request, 400, "unsupported or unnamed file");
+    }
+
+    let mut bytes = Vec::new();
+    request.as_reader().read_to_end(&mut bytes).context("read upload body")?;
+
+    let dir = PathBuf::from("out").join("imported");
+    std::fs::create_dir_all(&dir).context("create out/imported")?;
+    let dest = dir.join(&safe);
+    std::fs::write(&dest, &bytes).with_context(|| format!("write {}", dest.display()))?;
+
+    let id = {
+        let mut raws = state.raws.write().map_err(|_| anyhow!("lock poisoned"))?;
+        match raws.iter().position(|p| p == &dest) {
+            Some(i) => i,
+            None => {
+                raws.push(dest.clone());
+                raws.len() - 1
+            }
+        }
+    };
+    respond_json(
+        request,
+        &json!({ "id": id, "total": state.count(), "stem": pipeline::stem(&dest) }),
+    )
 }
 
 fn api_image(request: Request, state: &AppState, max_edge: u32) -> Result<()> {
