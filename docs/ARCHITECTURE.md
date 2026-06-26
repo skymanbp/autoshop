@@ -1,9 +1,14 @@
 # Autoshop — Architecture
 
-> Status: **initial scaffold**. The data model + CLI surface compile and test
-> clean; the decode → advise → render pipeline is designed here and stubbed in
-> code. Items marked **[verify]** are assumptions to validate during
+> Status: **initial scaffold (M0 done)**. The data model + CLI surface compile
+> and test clean; the decode → advise → render pipeline is designed here and
+> stubbed in code. Items marked **[verify]** are assumptions to validate during
 > implementation, not established facts.
+>
+> Confirmed by the user (2026-06-25): Sony `.ARW`; output = XMP sidecar **and**
+> rendered file (XMP-first); two AI roles behind one unified provider framework —
+> **vision model (GPT) does image processing**, **Claude does non-image analysis
+> + acceptance verification**.
 
 ## 1. The core idea
 
@@ -13,116 +18,134 @@ to change* (this sky is blown, those shadows are crushed, the white balance is
 decisions. So we split exactly there:
 
 ```
-  RAW file ──► decode + feature extraction ──► AI advisor ──► EditRecipe (JSON)
-                                                                   │
-                                       deterministic render engine ◄┘
-                                                   │
-                                  output image  +  XMP sidecar (for Lightroom)
+  RAW ─► decode + features ─► [vision advisor] ─► EditRecipe ─► [Claude verify] ─► render engine
+   .ARW    preview+EXIF+hist     GPT (image)        JSON          QA / accept       │
+                                                                                    ▼
+                                                            XMP sidecar  +  rendered image
 ```
 
-**The AI never touches a single pixel.** It receives a small preview image plus
-metadata (histogram, EXIF, clipping stats) and returns an
-[`EditRecipe`](../src/recipe.rs) — a bounded set of Lightroom/ACR-style develop
-controls. A deterministic Rust engine renders from the original RAW using that
-recipe. This is the key design decision because it gives us:
+**The AI never touches a single pixel.** The vision advisor receives a small
+preview image + metadata and returns an [`EditRecipe`](../src/recipe.rs) — a
+bounded set of Lightroom/ACR-style develop controls. A deterministic Rust engine
+renders from the original RAW using that recipe. Key benefits:
 
 - **Reproducibility** — same recipe + same RAW ⇒ byte-identical output.
 - **Non-destructiveness** — the recipe is a tiny JSON; originals are never modified.
-- **Auditability** — every recipe carries a `rationale` and a `confidence`; you
-  can see *why* and gate auto-apply on confidence.
-- **Lightroom interop** — the same recipe serialises to an XMP sidecar, so the
-  AI's decisions show up as adjustable sliders in your existing catalog.
-- **No hallucinated pixels** — the AI can't invent detail; it can only turn the
-  same knobs a human would.
+- **Auditability** — every recipe carries a `rationale` + `confidence`.
+- **Lightroom interop** — the recipe serialises to an XMP sidecar, so the edit
+  shows up as adjustable sliders in your catalog.
+- **No hallucinated pixels** — the AI can only turn the same knobs a human would.
 
 ## 2. The `EditRecipe` contract
 
 Defined and unit-tested in [`src/recipe.rs`](../src/recipe.rs). Adobe-convention
 ranges (sliders −100..=100, exposure in stops, temperature in Kelvin). Every
-field is `#[serde(default)]`, so the AI emits only the controls it wants to move
-and omits the rest. `EditRecipe::clamp()` defends the render engine against
-out-of-range values; `confidence` gates auto-apply.
+field is `#[serde(default)]`, so an advisor emits only the controls it moves.
+`EditRecipe::clamp()` defends the render engine; `confidence` gates auto-apply.
 
 Run `cargo run -- recipe-schema` to print the exact JSON shape — this same text
-is handed to the AI as its required output format.
+is the advisor's required output format.
 
-## 3. Components & milestones
+## 3. The unified AI provider framework (统一 API 框架)
+
+A single Rust trait abstracts *all* AI calls so providers are interchangeable and
+transport-agnostic (HTTP API, or shelling out to the `claude` CLI). Two roles:
+
+| Role | Who (default) | Sees pixels? | Job |
+|------|---------------|--------------|-----|
+| **Image advisor** | GPT (vision model) | **yes** (preview) | Look at the photo → emit an `EditRecipe`. |
+| **Analyst / verifier** | Claude | **no** (data only) | Reason over EXIF/histogram; **acceptance-verify** the recipe before it's applied (ranges sane? consistent with metadata & stated intent? confidence adequate?) and flag/veto bad recipes. |
+
+> Interpretation of "收货验证" (to confirm): Claude verifies at the **data level**
+> — recipe + histogram/clipping stats + the advisor's rationale — *without*
+> re-doing vision. The trait leaves room to optionally hand Claude a thumbnail
+> later if pixel-level QA proves necessary.
+
+Sketch (final shape pinned in M1):
+
+```rust
+trait Advisor {                      // one trait, many providers
+    fn propose(&self, img: &Preview, meta: &Meta) -> Result<EditRecipe>;   // image role
+    fn verify(&self, recipe: &EditRecipe, meta: &Meta) -> Result<Verdict>; // analyst role
+}
+// impls: OpenAiProvider (HTTP, vision)  |  ClaudeProvider (claude CLI -p, OAuth, or Anthropic API)
+```
+
+Provider selection + keys live in `autoshop.local.toml` / `.env` (gitignored).
+Claude via the `claude` CLI reuses Claude Code OAuth — **no Anthropic key needed**;
+the OpenAI vision path needs an `OPENAI_API_KEY`.
+
+## 4. Components & milestones
 
 | ID | Component | Crate/tool (candidate) | Status |
 |----|-----------|------------------------|--------|
 | M0 | Data model + CLI scaffold | `clap`, `serde`, `serde_json`, `anyhow`, `thiserror` | **done** |
-| M1 | RAW decode + feature extraction | `rawloader` + `imagepipe` (pure Rust) **[verify]**, fallback `libraw` via FFI | planned |
-| M1 | AI advisor (Claude) | shell out to `claude -p --output-format json` | planned |
+| M1 | RAW decode + features (Sony ARW) | `rawloader` + `imagepipe` (pure Rust) **[verify ARW]**, fallback `libraw` FFI | planned |
+| M1 | Unified provider framework + GPT image advisor + Claude verifier | `reqwest` (HTTP) + `claude` CLI; `tokio` if async | planned |
 | M2 | Deterministic render engine | `image`, custom tone/colour ops | planned |
-| M2 | XMP sidecar writer | hand-rolled XML (ACR `crs:` namespace) | planned |
-| M3 | `auto` end-to-end + batch | rayon for parallel batch | planned |
-| M4 | Optional parallel GPT advisor | OpenAI HTTP API (needs key) | optional |
+| M2 | XMP sidecar writer (ACR `crs:`) | hand-rolled XML | planned |
+| M3 | `auto` end-to-end + batch | `rayon` for parallel batch | planned |
+| M4 | Style/eval harness (use finished edits as ground truth) | perceptual metrics / XMP diff | planned |
 | M5 | UI / Photoshop plugin | TBD (egui? Tauri? PS UXP?) | later |
 
-### 3.1 RAW decode (M1)
+### 4.1 RAW decode (M1)
 
-Primary candidate: **`rawloader`** (decodes sensor data for a wide camera range)
-+ **`imagepipe`** (demosaic + basic pipeline), both pure-Rust by the same author
-— no C toolchain needed on Windows. **[verify]** that the user's specific camera
-bodies/formats are supported; if not, fall back to **`libraw`** (C, gold-standard
-coverage) through FFI. We also extract:
+Primary candidate: **`rawloader`** (sensor data) + **`imagepipe`** (demosaic +
+pipeline), pure-Rust — no C toolchain on Windows. **[verify]** Sony `.ARW`
+coverage and embedded-preview extraction; fall back to **`libraw`** (FFI) if
+gaps. Also extract: embedded JPEG preview (for the vision advisor), a downscaled
+linear render (histogram/clipping), and EXIF (camera/lens/ISO/shutter/aperture/
+as-shot WB) via e.g. `kamadak-exif`.
 
-- the embedded JPEG preview (fast, already white-balanced) to send to the AI,
-- a downscaled linear render for histogram/clipping analysis,
-- EXIF (camera, lens, ISO, shutter, aperture, as-shot WB) via e.g. `kamadak-exif`.
+### 4.2 Vision advisor — image processing (M1)
 
-### 3.2 AI advisor (M1) — reusing Claude Code OAuth, no API key
+A vision-capable OpenAI model receives the preview + metadata and returns an
+`EditRecipe` (JSON-schema-constrained output). Exact model id, request shape
+(base64 vs URL), and structured-output mechanism are **[verify]** in M1 and
+pinned in config — not hardcoded from memory.
 
-The Rust binary shells out to the locally-installed `claude` CLI in print mode:
+### 4.3 Claude analyst / verifier (M1)
 
-```
-claude -p --output-format json --model <opus|sonnet> --append-system-prompt <advisor-prompt> "<task + image path + metadata>"
-```
+Claude is called for non-image reasoning + acceptance verification via
+`claude -p --output-format json --model <opus|sonnet>` (flags verified present in
+CLI v2.1.158: `--print`, `--output-format`, `--model`, `--append-system-prompt`),
+reusing Claude Code OAuth — no API key. It returns a `Verdict` (accept / revise /
+reject + reasons). A rejected recipe can trigger one revision round with the
+vision advisor.
 
-Verified present in CLI v2.1.158: `--print`, `--output-format`, `--model`,
-`--append-system-prompt`. This reuses the user's existing Claude Code
-subscription/OAuth — **no separate `ANTHROPIC_API_KEY` to manage**.
+### 4.4 Render engine (M2)
 
-**[verify]** the exact mechanism for getting the *preview image* in front of the
-model in non-interactive `-p` mode (candidates: reference the preview's absolute
-path in the prompt so Claude reads it; or base64-embed). This is the single
-biggest open question for M1 and will be settled empirically against a real file
-before building on it.
+Applies the recipe deterministically: white-balance → exposure → tone → colour →
+local (clarity/dehaze) → detail → geometry. Outputs 16-bit TIFF (master) and/or
+8-bit JPEG (share).
 
-The advisor's system prompt pins the output to the `EditRecipe` JSON schema and
-forbids prose outside the JSON, so parsing is robust.
+### 4.5 XMP sidecar (M2) — primary deliverable
 
-### 3.3 Render engine (M2)
+The recipe written as an ACR/Lightroom `.xmp` sidecar (`crs:` keys like
+`Exposure2012`, `Contrast2012`, `Temperature`, `ToneCurvePV2012`). Dropped next
+to the `.ARW`, the AI's edit appears as fully-adjustable sliders in Lightroom —
+the "AI does 90%, I nudge the last 10%" workflow.
 
-Applies the recipe deterministically: white-balance → exposure → tone (high/low,
-whites/blacks, curve) → colour (vibrance/saturation/HSL) → local (clarity/dehaze)
-→ detail (sharpen/NR) → geometry (straighten/crop). Outputs 16-bit TIFF (master)
-and/or 8-bit JPEG (share), format chosen by output extension.
+### 4.6 Style / eval harness (M4)
 
-### 3.4 XMP sidecar (M2)
+The user's **finished edits** are ground truth. If they're Lightroom XMP/develop
+settings, diff the AI recipe against them; if they're exported JPEGs, compare the
+AI render perceptually. Lets us measure "does the AI match *how the user*
+develops a shot?" and tune the advisor prompt accordingly.
 
-The same recipe written as an ACR/Lightroom `.xmp` sidecar (`crs:` namespace
-keys like `Exposure2012`, `Contrast2012`, `Temperature`). Dropping this next to
-the RAW makes the AI's edit appear as fully-adjustable sliders in Lightroom —
-ideal for the "AI does 90%, I nudge the last 10%" workflow.
-
-### 3.5 Parallel GPT advisor (M4, optional)
-
-Run a second advisor (OpenAI) concurrently for cross-checking / ensembling. Two
-recipes can be diffed, averaged, or presented side-by-side. Requires an OpenAI
-key (kept in `.env` / `autoshop.local.toml`, both gitignored). Off by default.
-
-## 4. Why Rust
+## 5. Why Rust
 
 Cross-platform, no GC pauses on large-image pipelines, first-class image crates,
-trivial single-binary distribution, and easy `std::process` shell-out to the
-`claude` CLI. Toolchain in use: rustc/cargo **1.94.1** (verified locally).
+single-binary distribution, trivial `std::process` shell-out to `claude`.
+Toolchain in use: rustc/cargo **1.94.1** (verified locally).
 
-## 5. Open questions (need user input)
+## 6. Open questions
 
-1. **Image library path** — location of original RAWs + corresponding finished
-   edits. The finished edits are gold: they're a style reference / eval set so
-   we can measure "does the AI match how *you* would have developed this?".
-2. **Camera bodies / RAW formats** in use → decides decode backend (3.1).
-3. **Output target** — rendered files, XMP sidecars for Lightroom, or both.
-4. **Second (GPT) advisor** — wire in now or defer.
+| # | Question | Status |
+|---|----------|--------|
+| 1 | **Image library path** (originals + finished edits) | **OPEN — needed for M1** |
+| 2 | Camera / RAW format | resolved: Sony `.ARW` |
+| 3 | Output target | resolved: XMP sidecar **+** rendered, XMP-first |
+| 4 | AI roles | resolved: GPT=image, Claude=non-image+verify, unified framework |
+| 5 | Exact meaning of Claude's "收货验证" (data-level vs pixel-level) | assumed data-level (§3) — confirm |
+| 6 | How to feed the preview to the GPT vision API; `crs:` key set for ARW | **[verify]** in M1 (research underway) |
