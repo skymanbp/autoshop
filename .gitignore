@@ -1,0 +1,23 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# cc-memory plugin local state (not part of this project's source)
+/memory/
+
+# Render outputs / scratch (we don't version generated images)
+/out/
+/output/
+*.tmp
+
+# Local config that may hold secrets (e.g. OpenAI key for the optional GPT path)
+.env
+autoshop.local.toml
+
+# OS / editor cruft
+Thumbs.db
+.DS_Store
+desktop.ini
+.vscode/
+.idea/
