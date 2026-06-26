@@ -61,7 +61,11 @@ impl Advisor for OpenAiProvider {
         let mut instruction = format!(
             "You are a photo-edit advisor. Look at this RAW preview and its metadata/histogram and \
 return an EditRecipe (develop adjustments) that makes a tasteful, natural edit. Stay within the \
-documented slider ranges. METADATA: {meta_json}  HISTOGRAM: {hist}",
+documented slider ranges. Use the `masks` array ONLY when a global edit cannot achieve the look \
+(e.g. a too-bright sky needing local darkening, or a dim subject needing a local lift) — otherwise \
+leave it empty. Prefer a linear gradient (kind=linear; zero_* = start edge, full_* = end edge, in \
+0..1 frame coords) for skies/horizons/foregrounds; radial (kind=radial) for subjects/vignettes. \
+Local slider values use the same scale as the globals. METADATA: {meta_json}  HISTOGRAM: {hist}",
             meta_json = meta_json,
             hist = hist_summary(hist),
         );
@@ -122,28 +126,59 @@ documented slider ranges. METADATA: {meta_json}  HISTOGRAM: {hist}",
 /// in `required`, `additionalProperties:false`, optionals expressed as nullable.
 /// Mirrors `src/recipe.rs` — keep in sync if the recipe changes.
 fn edit_recipe_schema() -> Value {
-    let num = json!({"type": "number"});
+    // Closure (not a single Value) so the schema can be reused across the
+    // nested object schemas without move issues.
+    let num = || json!({"type": "number"});
+
+    // MaskGeometry tagged enum (#[serde(tag="kind")]) → anyOf of the two
+    // variants; each is strict (all props required, additionalProperties:false).
+    let mask_geometry = json!({
+        "anyOf": [
+            {"type": "object", "additionalProperties": false,
+             "required": ["kind","zero_x","zero_y","full_x","full_y"],
+             "properties": {"kind": {"type": "string", "enum": ["linear"]},
+                "zero_x": num(), "zero_y": num(), "full_x": num(), "full_y": num()}},
+            {"type": "object", "additionalProperties": false,
+             "required": ["kind","top","left","bottom","right","feather","roundness","flipped"],
+             "properties": {"kind": {"type": "string", "enum": ["radial"]},
+                "top": num(), "left": num(), "bottom": num(), "right": num(),
+                "feather": num(), "roundness": num(), "flipped": {"type": "boolean"}}}
+        ]
+    });
+    let local_adjustment = json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["mask","name","amount","inverted","exposure_ev","contrast","highlights",
+            "shadows","whites","blacks","clarity","dehaze","texture","saturation","temperature","tint"],
+        "properties": {
+            "mask": mask_geometry,
+            "name": {"type": "string"}, "amount": num(), "inverted": {"type": "boolean"},
+            "exposure_ev": num(), "contrast": num(), "highlights": num(), "shadows": num(),
+            "whites": num(), "blacks": num(), "clarity": num(), "dehaze": num(),
+            "texture": num(), "saturation": num(), "temperature": num(), "tint": num()
+        }
+    });
     json!({
         "type": "object",
         "additionalProperties": false,
         "required": ["version","exposure_ev","contrast","highlights","shadows","whites","blacks",
             "temperature_k","tint","vibrance","saturation","clarity","dehaze","sharpening",
-            "noise_reduction","straighten_deg","crop","tone_curve","rationale","confidence"],
+            "noise_reduction","straighten_deg","crop","tone_curve","masks","rationale","confidence"],
         "properties": {
             "version": {"type": "integer"},
-            "exposure_ev": num, "contrast": num, "highlights": num, "shadows": num,
-            "whites": num, "blacks": num,
-            "temperature_k": {"type": ["number","null"]}, "tint": num,
-            "vibrance": num, "saturation": num, "clarity": num, "dehaze": num,
-            "sharpening": num, "noise_reduction": num, "straighten_deg": num,
+            "exposure_ev": num(), "contrast": num(), "highlights": num(), "shadows": num(),
+            "whites": num(), "blacks": num(),
+            "temperature_k": {"type": ["number","null"]}, "tint": num(),
+            "vibrance": num(), "saturation": num(), "clarity": num(), "dehaze": num(),
+            "sharpening": num(), "noise_reduction": num(), "straighten_deg": num(),
             "crop": {"type": ["object","null"], "additionalProperties": false,
                 "required": ["left","top","right","bottom"],
-                "properties": {"left": num, "top": num, "right": num, "bottom": num}},
+                "properties": {"left": num(), "top": num(), "right": num(), "bottom": num()}},
             "tone_curve": {"type": "array", "items": {"type": "object",
                 "additionalProperties": false, "required": ["input","output"],
                 "properties": {"input": {"type": "integer"}, "output": {"type": "integer"}}}},
+            "masks": {"type": "array", "items": local_adjustment},
             "rationale": {"type": "string"},
-            "confidence": num
+            "confidence": num()
         }
     })
 }
