@@ -2,17 +2,17 @@
 //!
 //! Architecture in one line: the AI advisor looks at a RAW preview + metadata
 //! and emits an [`recipe::EditRecipe`]; a deterministic render engine applies
-//! that recipe. See `docs/ARCHITECTURE.md` for the full design.
-//!
-//! Milestone status: M0 (data model + CLI) and M1 (decode + advise) done; M2
-//! live — `apply`/`auto` render the recipe to an image, `analyze`/`auto`/`batch`
-//! emit Lightroom XMP sidecars, and `batch` processes a whole folder.
+//! that recipe. See `docs/ARCHITECTURE.md` for the full design. Shared advise +
+//! output logic lives in [`pipeline`]; the CLI here and the web UI ([`serve`])
+//! both call it.
 
 mod advisor;
 mod config;
 mod decode;
+mod pipeline;
 mod recipe;
 mod render;
+mod serve;
 mod xmp;
 
 use std::path::{Path, PathBuf};
@@ -21,8 +21,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use image::GenericImageView;
 
-use advisor::{Advisor, ClaudeProvider, Decision, HeuristicProposer, OpenAiProvider, Preview, Verdict};
+use advisor::Verdict;
 use config::Config;
+use pipeline::{default_out, ensure_parent, find_raws, produce_recipe, stem, write_recipe, write_xmp, xmp_target};
 use recipe::EditRecipe;
 
 #[derive(Parser)]
@@ -56,8 +57,8 @@ enum Command {
         /// Where to write the recipe JSON (default: ./out/<stem>.recipe.json).
         #[arg(short, long)]
         out: Option<PathBuf>,
-        /// Also write the .xmp next to the source RAW so Lightroom picks it up
-        /// directly. WRITES INTO THE LIBRARY; default writes only to ./out.
+        /// Also write the .xmp next to the source RAW. WRITES INTO THE LIBRARY;
+        /// default writes only to ./out.
         #[arg(long)]
         beside: bool,
     },
@@ -79,8 +80,7 @@ enum Command {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
-    /// Batch-process every RAW under a folder: analyze → xmp (resumes by
-    /// skipping RAWs whose .xmp already exists).
+    /// Batch-process every RAW under a folder (resumes by skipping done .xmp).
     Batch {
         /// Folder to scan recursively for .ARW files.
         dir: PathBuf,
@@ -94,6 +94,14 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
+    /// Start the local web UI (open the printed URL in a browser).
+    Serve {
+        /// Photo library folder to browse (scanned recursively for .ARW).
+        dir: PathBuf,
+        /// Port to listen on.
+        #[arg(short, long, default_value_t = 8080)]
+        port: u16,
+    },
     /// Print the default EditRecipe as JSON — the exact shape the AI must emit.
     RecipeSchema,
 }
@@ -106,6 +114,7 @@ fn main() -> Result<()> {
         Command::Apply { raw, recipe, out } => apply_cmd(&raw, &recipe, &out),
         Command::Auto { raw, out } => auto_cmd(&raw, out),
         Command::Batch { dir, beside, render, limit } => batch_cmd(&dir, beside, render, limit),
+        Command::Serve { dir, port } => serve::serve(&dir, port),
         Command::RecipeSchema => {
             let template = EditRecipe::default();
             println!("{}", serde_json::to_string_pretty(&template)?);
@@ -117,7 +126,6 @@ fn main() -> Result<()> {
 fn decode_cmd(raw: &Path, out: Option<PathBuf>) -> Result<()> {
     let decoded = decode::decode_raw(raw)?;
 
-    // Default output goes to ./out, NEVER next to the source RAW (read-only lib).
     let out = out.unwrap_or_else(|| default_out(raw, "preview", "jpg"));
     ensure_parent(&out)?;
     let preview = decoded.preview_resized(1536);
@@ -158,60 +166,6 @@ fn decode_cmd(raw: &Path, out: Option<PathBuf>) -> Result<()> {
     );
     println!("  preview -> {} ({} x {})", out.display(), pw, ph);
     Ok(())
-}
-
-/// Run the full advise chain for one RAW: decode → propose (GPT or heuristic
-/// fallback) → Claude verify → optional one revision round. Returns the recipe
-/// and the (final) verdict. `verbose` prints the proposer/verifier lines.
-fn produce_recipe(raw: &Path, cfg: &Config, verbose: bool) -> Result<(EditRecipe, Verdict)> {
-    let decoded = decode::decode_raw(raw)?;
-
-    let preview_img = decoded.preview_resized(1568);
-    let mut jpeg = Vec::new();
-    preview_img
-        .write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
-        .context("encode preview JPEG for advisor")?;
-    let preview = Preview { jpeg };
-
-    // GPT vision when a key is set; on failure (quota/network) warn and fall back
-    // to the heuristic so we still produce a recipe (disclosure, not masking).
-    let openai = OpenAiProvider::new(cfg);
-    let heuristic = HeuristicProposer;
-    let (mut recipe, can_revise) = if cfg.openai_api_key.is_some() {
-        if verbose {
-            println!("proposer : OpenAI ({})", cfg.openai_model);
-        }
-        match openai.propose(&preview, &decoded.meta, &decoded.histogram, None) {
-            Ok(r) => (r, true),
-            Err(e) => {
-                eprintln!("⚠ GPT proposer failed ({e})\n  → falling back to the heuristic baseline.");
-                (heuristic.propose(&preview, &decoded.meta, &decoded.histogram, None)?, false)
-            }
-        }
-    } else {
-        if verbose {
-            println!("proposer : heuristic baseline (set OPENAI_API_KEY to use GPT vision)");
-        }
-        (heuristic.propose(&preview, &decoded.meta, &decoded.histogram, None)?, false)
-    };
-
-    let claude = ClaudeProvider::new(cfg);
-    if verbose {
-        println!("verifier : Claude ({})", cfg.claude_model);
-    }
-    let mut verdict = claude.verify(&recipe, &decoded.meta, &decoded.histogram)?;
-
-    // One revision round — only if GPT actually produced the recipe.
-    if verdict.decision != Decision::Accept && can_revise {
-        if let Some(hint) = verdict.revised_hint.clone() {
-            if verbose {
-                println!("verdict was {:?} → one revision round (hint: {hint})", verdict.decision);
-            }
-            recipe = openai.propose(&preview, &decoded.meta, &decoded.histogram, Some(&hint))?;
-            verdict = claude.verify(&recipe, &decoded.meta, &decoded.histogram)?;
-        }
-    }
-    Ok((recipe, verdict))
 }
 
 fn analyze_cmd(raw: &Path, out: Option<PathBuf>, beside: bool) -> Result<()> {
@@ -267,11 +221,7 @@ fn batch_cmd(dir: &Path, beside: bool, render: bool, limit: usize) -> Result<()>
     let raws = find_raws(dir)?;
     println!("found {} RAW(s) under {}", raws.len(), dir.display());
 
-    // Resume: skip RAWs whose target .xmp already exists.
-    let pending: Vec<&PathBuf> = raws
-        .iter()
-        .filter(|r| !xmp_target(r, beside).exists())
-        .collect();
+    let pending: Vec<&PathBuf> = raws.iter().filter(|r| !xmp_target(r, beside).exists()).collect();
     let todo = pending.len();
     let n = todo.min(limit);
     println!("{todo} pending; processing {n} this run (--limit {limit}).");
@@ -295,10 +245,7 @@ fn batch_cmd(dir: &Path, beside: bool, render: bool, limit: usize) -> Result<()>
             }
         }
     }
-    println!(
-        "\nbatch done: {ok} ok, {fail} failed, {} still pending.",
-        todo.saturating_sub(n)
-    );
+    println!("\nbatch done: {ok} ok, {fail} failed, {} still pending.", todo.saturating_sub(n));
     Ok(())
 }
 
@@ -312,74 +259,6 @@ fn process_one(raw: &Path, cfg: &Config, beside: bool, render_jpeg: bool) -> Res
         render::render_to_file(raw, &recipe, &out)?;
     }
     Ok(verdict)
-}
-
-// --- output helpers --------------------------------------------------------
-
-fn write_recipe(raw: &Path, recipe: &EditRecipe, out: Option<PathBuf>) -> Result<PathBuf> {
-    let out = out.unwrap_or_else(|| default_out(raw, "recipe", "json"));
-    ensure_parent(&out)?;
-    std::fs::write(&out, serde_json::to_string_pretty(recipe)?)
-        .with_context(|| format!("write recipe {}", out.display()))?;
-    Ok(out)
-}
-
-fn write_xmp(raw: &Path, recipe: &EditRecipe, beside: bool) -> Result<PathBuf> {
-    let out = xmp_target(raw, beside);
-    ensure_parent(&out)?;
-    std::fs::write(&out, xmp::recipe_to_xmp(recipe))
-        .with_context(|| format!("write xmp {}", out.display()))?;
-    Ok(out)
-}
-
-/// Where the .xmp for `raw` goes: next to the RAW (`--beside`) or ./out/<stem>.xmp.
-fn xmp_target(raw: &Path, beside: bool) -> PathBuf {
-    if beside {
-        raw.with_extension("xmp")
-    } else {
-        PathBuf::from("out").join(format!("{}.xmp", stem(raw)))
-    }
-}
-
-fn find_raws(dir: &Path) -> Result<Vec<PathBuf>> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let p = entry?.path();
-            if p.is_dir() {
-                walk(&p, out)?;
-            } else if p
-                .extension()
-                .and_then(|x| x.to_str())
-                .is_some_and(|x| x.eq_ignore_ascii_case("arw"))
-            {
-                out.push(p);
-            }
-        }
-        Ok(())
-    }
-    let mut out = Vec::new();
-    walk(dir, &mut out).with_context(|| format!("scan {}", dir.display()))?;
-    out.sort();
-    Ok(out)
-}
-
-fn stem(p: &Path) -> &str {
-    p.file_stem().and_then(|s| s.to_str()).unwrap_or("out")
-}
-
-/// `./out/<stem>.<kind>.<ext>` — outputs never go beside the source RAW.
-fn default_out(raw: &Path, kind: &str, ext: &str) -> PathBuf {
-    PathBuf::from("out").join(format!("{}.{kind}.{ext}", stem(raw)))
-}
-
-fn ensure_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create output dir {}", parent.display()))?;
-        }
-    }
-    Ok(())
 }
 
 /// Render a 256-bin histogram as a compact Unicode block sparkline.

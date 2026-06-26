@@ -171,6 +171,33 @@ pub fn decode_raw(path: &Path) -> Result<Decoded> {
     Ok(Decoded { preview, meta, histogram, embedded_xmp })
 }
 
+/// Just the embedded preview, skipping metadata/histogram — for the UI grid and
+/// before/after, where only the image is needed.
+pub fn preview_only(path: &Path) -> Result<DynamicImage> {
+    let src = RawSource::new(path).with_context(|| format!("open RAW {}", path.display()))?;
+    let decoder =
+        get_decoder(&src).map_err(|e| anyhow!("no decoder for {}: {e}", path.display()))?;
+    let params = RawDecodeParams { image_index: 0 };
+    // Same 3-level fallback as decode_raw: embedded preview → thumbnail → a full
+    // raw render (some ARWs lack both embedded images).
+    if let Some(p) = decoder
+        .preview_image(&src, &params)
+        .map_err(|e| anyhow!("preview_image: {e}"))?
+    {
+        return Ok(p);
+    }
+    if let Some(t) = decoder
+        .thumbnail_image(&src, &params)
+        .map_err(|e| anyhow!("thumbnail_image: {e}"))?
+    {
+        return Ok(t);
+    }
+    decoder
+        .full_image(&src, &params)
+        .map_err(|e| anyhow!("full_image: {e}"))?
+        .ok_or_else(|| anyhow!("no preview/thumbnail/full image in {}", path.display()))
+}
+
 fn compute_histogram(img: &DynamicImage) -> Histogram {
     let rgb = img.to_rgb8();
     let (mut r, mut g, mut b, mut luma) = (vec![0u32; 256], vec![0u32; 256], vec![0u32; 256], vec![0u32; 256]);

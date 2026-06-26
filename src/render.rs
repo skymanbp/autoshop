@@ -98,6 +98,29 @@ pub fn render_to_file(raw_path: &Path, recipe: &EditRecipe, out: &Path) -> Resul
     Ok((img.width(), img.height()))
 }
 
+/// Fast "after" render for the UI: apply the recipe's tonal + colour ops to an
+/// already-demosaiced preview image (no full-res develop, no demosaic). Crop is
+/// intentionally NOT applied here so sliders give immediate full-frame feedback;
+/// the full-res `render_to_image` path applies crop on export.
+pub fn develop_preview(preview: &DynamicImage, recipe: &EditRecipe) -> DynamicImage {
+    let rgb = preview.to_rgb8();
+    let (w, h) = rgb.dimensions();
+    let lut = build_tone_lut(recipe);
+    let sat = recipe.saturation / 100.0;
+    let vib = recipe.vibrance / 100.0;
+    let mut buf = Vec::with_capacity((w * h * 3) as usize);
+    for px in rgb.pixels() {
+        let r = sample_lut(&lut, px[0] as f32 / 255.0);
+        let g = sample_lut(&lut, px[1] as f32 / 255.0);
+        let b = sample_lut(&lut, px[2] as f32 / 255.0);
+        let o = apply_sat_vibrance(r, g, b, sat, vib);
+        buf.push(to_u8(o[0]));
+        buf.push(to_u8(o[1]));
+        buf.push(to_u8(o[2]));
+    }
+    DynamicImage::ImageRgb8(RgbImage::from_raw(w, h, buf).expect("preview buffer size matches"))
+}
+
 // ---------------------------------------------------------------------------
 
 fn srgb_to_linear(c: f32) -> f32 {
