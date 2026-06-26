@@ -9,6 +9,7 @@
 mod advisor;
 mod config;
 mod decode;
+mod eval;
 mod pipeline;
 mod recipe;
 mod render;
@@ -94,6 +95,15 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
+    /// Evaluate AI edits against your own: for RAWs that have a sibling .xmp
+    /// (your Lightroom/ACR edit), run the AI and report per-field error + bias.
+    Eval {
+        /// Folder to scan recursively for RAW + .xmp pairs.
+        dir: PathBuf,
+        /// Max photos to evaluate (cost guard; each one runs the AI).
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
     /// Start the local web UI (open the printed URL in a browser).
     Serve {
         /// Photo library folder to browse (scanned recursively for .ARW).
@@ -114,6 +124,7 @@ fn main() -> Result<()> {
         Command::Apply { raw, recipe, out } => apply_cmd(&raw, &recipe, &out),
         Command::Auto { raw, out } => auto_cmd(&raw, out),
         Command::Batch { dir, beside, render, limit } => batch_cmd(&dir, beside, render, limit),
+        Command::Eval { dir, limit } => eval::run(&dir, limit),
         Command::Serve { dir, port } => serve::serve(&dir, port),
         Command::RecipeSchema => {
             let template = EditRecipe::default();
