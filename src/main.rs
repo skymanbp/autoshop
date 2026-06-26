@@ -14,6 +14,7 @@ mod pipeline;
 mod recipe;
 mod render;
 mod serve;
+mod style;
 mod xmp;
 
 use std::path::{Path, PathBuf};
@@ -26,6 +27,7 @@ use advisor::Verdict;
 use config::Config;
 use pipeline::{default_out, ensure_parent, find_raws, produce_recipe, stem, write_recipe, write_xmp, xmp_target};
 use recipe::EditRecipe;
+use style::StyleIndex;
 
 #[derive(Parser)]
 #[command(
@@ -103,10 +105,12 @@ enum Command {
         /// Max photos to evaluate (cost guard; each one runs the AI).
         #[arg(long, default_value_t = 10)]
         limit: usize,
-        /// Save the measured biases to out/style-profile.json so the advisor
-        /// calibrates future edits toward your taste.
-        #[arg(long)]
-        save_profile: bool,
+    },
+    /// Build the style index from your edited library (RAW+.xmp pairs) → the
+    /// advisor then references your edits on similar shots. Run once / on update.
+    StyleIndex {
+        /// Folder to scan recursively for RAW + .xmp pairs (your edits).
+        dir: PathBuf,
     },
     /// Start the local web UI (open the printed URL in a browser).
     Serve {
@@ -128,7 +132,8 @@ fn main() -> Result<()> {
         Command::Apply { raw, recipe, out } => apply_cmd(&raw, &recipe, &out),
         Command::Auto { raw, out } => auto_cmd(&raw, out),
         Command::Batch { dir, beside, render, limit } => batch_cmd(&dir, beside, render, limit),
-        Command::Eval { dir, limit, save_profile } => eval::run(&dir, limit, save_profile),
+        Command::Eval { dir, limit } => eval::run(&dir, limit),
+        Command::StyleIndex { dir } => style_index_cmd(&dir),
         Command::Serve { dir, port } => serve::serve(&dir, port),
         Command::RecipeSchema => {
             let template = EditRecipe::default();
@@ -136,6 +141,18 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn style_index_cmd(dir: &Path) -> Result<()> {
+    let index = StyleIndex::build(dir)?;
+    let out = PathBuf::from("out/style-index.json");
+    index.save(&out)?;
+    println!(
+        "style index → {} ({} exemplars). The advisor will now reference your edits on similar shots.",
+        out.display(),
+        index.exemplars.len()
+    );
+    Ok(())
 }
 
 fn decode_cmd(raw: &Path, out: Option<PathBuf>) -> Result<()> {

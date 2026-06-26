@@ -21,7 +21,7 @@ use crate::recipe::EditRecipe;
 
 /// Read a single `crs:<key>="<value>"` numeric attribute, tolerating a leading
 /// `+` (ACR writes `"+22"`). `None` if the key is absent or unparizable.
-fn crs_f32(xmp: &str, key: &str) -> Option<f32> {
+pub(crate) fn crs_f32(xmp: &str, key: &str) -> Option<f32> {
     let needle = format!("crs:{key}=\"");
     let start = xmp.find(&needle)? + needle.len();
     let rest = &xmp[start..];
@@ -86,11 +86,8 @@ struct Acc {
     n: u32,
 }
 
-pub fn run(dir: &Path, limit: usize, save_profile: bool) -> Result<()> {
+pub fn run(dir: &Path, limit: usize) -> Result<()> {
     let cfg = Config::load();
-    if cfg.style_calibration.is_some() {
-        println!("(style calibration ACTIVE — advisor is biased toward your saved profile)");
-    }
     let raws = pipeline::find_raws(dir)?;
     let pairs: Vec<_> = raws
         .iter()
@@ -164,23 +161,6 @@ pub fn run(dir: &Path, limit: usize, save_profile: bool) -> Result<()> {
          and you disagree a lot on this control. Use these to calibrate the advisor prompt."
     );
 
-    if save_profile {
-        // Persist mean signed bias per field; the advisor reads this next run.
-        let profile: BTreeMap<String, f32> = acc
-            .iter()
-            .filter(|(_, a)| a.n > 0)
-            .map(|(k, a)| (k.to_string(), (a.sum_signed / a.n as f64) as f32))
-            .collect();
-        let path = std::path::PathBuf::from("out/style-profile.json");
-        pipeline::ensure_parent(&path)?;
-        std::fs::write(&path, serde_json::to_string_pretty(&profile)?)
-            .context("write style profile")?;
-        println!(
-            "\nstyle profile saved → {} ({} fields). Future edits will calibrate toward your taste.",
-            path.display(),
-            profile.len()
-        );
-    }
     Ok(())
 }
 

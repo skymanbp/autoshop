@@ -28,6 +28,19 @@ pub fn produce_recipe(raw: &Path, cfg: &Config, verbose: bool) -> Result<(EditRe
         .context("encode preview JPEG for advisor")?;
     let preview = Preview { jpeg };
 
+    // Soft style reference: the user's edits on the most SIMILAR past shots, if a
+    // style index has been built (autoshop style-index). Reference, not a target.
+    let reference = crate::style::StyleIndex::load(std::path::Path::new("out/style-index.json"))
+        .ok()
+        .and_then(|ix| {
+            let ex = ix.retrieve(&decoded.meta, &decoded.histogram, 4, stem(raw));
+            ix.render_reference(&ex)
+        });
+    let ref_str = reference.as_deref();
+    if verbose && ref_str.is_some() {
+        println!("style    : using reference from your edits on similar shots");
+    }
+
     // GPT vision when a key is set; on failure (quota/network) warn and fall back
     // to the heuristic so we still produce a recipe (disclosure, not masking).
     let openai = OpenAiProvider::new(cfg);
@@ -36,18 +49,18 @@ pub fn produce_recipe(raw: &Path, cfg: &Config, verbose: bool) -> Result<(EditRe
         if verbose {
             println!("proposer : OpenAI ({})", cfg.openai_model);
         }
-        match openai.propose(&preview, &decoded.meta, &decoded.histogram, None) {
+        match openai.propose(&preview, &decoded.meta, &decoded.histogram, ref_str, None) {
             Ok(r) => (r, true),
             Err(e) => {
                 eprintln!("⚠ GPT proposer failed ({e})\n  → falling back to the heuristic baseline.");
-                (heuristic.propose(&preview, &decoded.meta, &decoded.histogram, None)?, false)
+                (heuristic.propose(&preview, &decoded.meta, &decoded.histogram, None, None)?, false)
             }
         }
     } else {
         if verbose {
             println!("proposer : heuristic baseline (set OPENAI_API_KEY to use GPT vision)");
         }
-        (heuristic.propose(&preview, &decoded.meta, &decoded.histogram, None)?, false)
+        (heuristic.propose(&preview, &decoded.meta, &decoded.histogram, None, None)?, false)
     };
 
     let claude = ClaudeProvider::new(cfg);
@@ -62,7 +75,7 @@ pub fn produce_recipe(raw: &Path, cfg: &Config, verbose: bool) -> Result<(EditRe
             if verbose {
                 println!("verdict was {:?} → one revision round (hint: {hint})", verdict.decision);
             }
-            recipe = openai.propose(&preview, &decoded.meta, &decoded.histogram, Some(&hint))?;
+            recipe = openai.propose(&preview, &decoded.meta, &decoded.histogram, ref_str, Some(&hint))?;
             verdict = claude.verify(&recipe, &decoded.meta, &decoded.histogram)?;
         }
     }

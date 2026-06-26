@@ -23,9 +23,6 @@ pub struct OpenAiProvider {
     api_key: Option<String>,
     model: String,
     base_url: String,
-    /// Style-calibration sentence (from the user's profile) appended to the
-    /// prompt so edits lean toward how this user actually edits.
-    calibration: Option<String>,
 }
 
 impl OpenAiProvider {
@@ -34,7 +31,6 @@ impl OpenAiProvider {
             api_key: cfg.openai_api_key.clone(),
             model: cfg.openai_model.clone(),
             base_url: cfg.openai_base_url.clone(),
-            calibration: cfg.style_calibration.clone(),
         }
     }
 }
@@ -49,6 +45,7 @@ impl Advisor for OpenAiProvider {
         img: &Preview,
         meta: &Meta,
         hist: &Histogram,
+        reference: Option<&str>,
         hint: Option<&str>,
     ) -> Result<EditRecipe, AdvisorError> {
         let key = self
@@ -69,9 +66,9 @@ Local slider values use the same scale as the globals. METADATA: {meta_json}  HI
             meta_json = meta_json,
             hist = hist_summary(hist),
         );
-        if let Some(cal) = &self.calibration {
+        if let Some(rf) = reference {
             instruction.push_str("  ");
-            instruction.push_str(cal);
+            instruction.push_str(rf);
         }
         if let Some(h) = hint {
             instruction.push_str(&format!("  REVISION NOTE from the verifier: {h}"));
