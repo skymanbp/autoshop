@@ -8,7 +8,7 @@
 //! `"x, y"` strings (see `docs/M1_PLAN.md` §5 and §9). We emit only the keys we
 //! set; Lightroom fills the rest from defaults.
 
-use crate::recipe::EditRecipe;
+use crate::recipe::{EditRecipe, MaskGeometry};
 
 /// Format an integer-valued slider the way ACR writes it: explicit `+` for
 /// positives (`"+14"`, `"-12"`, `"0"`).
@@ -30,6 +30,117 @@ fn xml_escape(s: &str) -> String {
 
 fn attr(buf: &mut String, key: &str, val: &str) {
     buf.push_str(&format!("\n    crs:{key}=\"{val}\""));
+}
+
+/// Format a LOCAL adjustment value the way ACR writes it: a bare decimal, no
+/// forced `+` (e.g. `"-0.075"`, `"0"`). Distinct from the global `signed()`.
+fn local_fmt(v: f32) -> String {
+    if v == 0.0 {
+        "0".to_string()
+    } else {
+        format!("{v}")
+    }
+}
+
+/// A stable 32-uppercase-hex GUID derived from `seed` (no external uuid dep).
+/// Deterministic so re-emitting the same recipe yields the same sidecar; the
+/// per-mask seed includes the index so masks within a file stay unique.
+fn guid(seed: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h1 = std::collections::hash_map::DefaultHasher::new();
+    seed.hash(&mut h1);
+    let a = h1.finish();
+    let mut h2 = std::collections::hash_map::DefaultHasher::new();
+    (seed, a).hash(&mut h2);
+    let b = h2.finish();
+    format!("{a:016X}{b:016X}")
+}
+
+/// `(crs:What value, extra geometry attributes)` for a mask geometry.
+/// Coordinates are written raw (unclamped) — ACR gradients legitimately use
+/// values outside [0,1].
+fn mask_geom_xml(g: &MaskGeometry) -> (&'static str, String) {
+    match g {
+        MaskGeometry::Linear { zero_x, zero_y, full_x, full_y } => (
+            "Mask/Gradient",
+            format!(
+                " crs:ZeroX=\"{zero_x}\" crs:ZeroY=\"{zero_y}\" crs:FullX=\"{full_x}\" crs:FullY=\"{full_y}\""
+            ),
+        ),
+        MaskGeometry::Radial { top, left, bottom, right, feather, roundness, flipped } => (
+            "Mask/CircularGradient",
+            format!(
+                " crs:Top=\"{top}\" crs:Left=\"{left}\" crs:Bottom=\"{bottom}\" crs:Right=\"{right}\" \
+crs:Feather=\"{feather}\" crs:Roundness=\"{roundness}\" crs:Flipped=\"{flipped}\""
+            ),
+        ),
+    }
+}
+
+/// Build the `<crs:MaskGroupBasedCorrections>` child element (empty string when
+/// there are no masks). Local sliders convert UI scale → ACR local scale:
+/// exposure stops ÷4, every other slider ÷100 (verified against the user's real
+/// sidecar; see docs/V2_PLAN.md §2a). All 26 `Local*` fields are emitted (unused
+/// = 0) as Lightroom expects the full block.
+fn masks_xml(r: &EditRecipe) -> String {
+    if r.masks.is_empty() {
+        return String::new();
+    }
+    let mut items = String::new();
+    for (i, m) in r.masks.iter().enumerate() {
+        let name = if m.name.is_empty() { format!("Autoshop {}", i + 1) } else { m.name.clone() };
+        let corr_id = guid(&format!("corr-{i}-{name}"));
+        let mask_id = guid(&format!("mask-{i}-{name}"));
+        let (what, geom) = mask_geom_xml(&m.mask);
+        items.push_str(&format!(
+            "     <rdf:li>\n\
+      <rdf:Description\n\
+       crs:What=\"Correction\" crs:CorrectionAmount=\"{amount}\" crs:CorrectionActive=\"true\"\n\
+       crs:CorrectionName=\"{name}\" crs:CorrectionSyncID=\"{corr_id}\"\n\
+       crs:LocalExposure=\"0\" crs:LocalHue=\"0\" crs:LocalSaturation=\"{sat}\"\n\
+       crs:LocalContrast=\"0\" crs:LocalClarity=\"0\" crs:LocalSharpness=\"0\"\n\
+       crs:LocalBrightness=\"0\" crs:LocalToningHue=\"0\" crs:LocalToningSaturation=\"0\"\n\
+       crs:LocalExposure2012=\"{exp}\" crs:LocalContrast2012=\"{con}\"\n\
+       crs:LocalHighlights2012=\"{hi}\" crs:LocalShadows2012=\"{sh}\"\n\
+       crs:LocalWhites2012=\"{wh}\" crs:LocalBlacks2012=\"{bl}\"\n\
+       crs:LocalClarity2012=\"{cl}\" crs:LocalDehaze=\"{dh}\" crs:LocalLuminanceNoise=\"0\"\n\
+       crs:LocalMoire=\"0\" crs:LocalDefringe=\"0\" crs:LocalTemperature=\"{temp}\"\n\
+       crs:LocalTint=\"{tint}\" crs:LocalTexture=\"{tex}\" crs:LocalGrain=\"0\"\n\
+       crs:LocalCurveRefineSaturation=\"100\">\n\
+       <crs:CorrectionMasks>\n\
+        <rdf:Seq>\n\
+         <rdf:li crs:What=\"{what}\" crs:MaskActive=\"true\" crs:MaskName=\"{mname}\"\n\
+          crs:MaskBlendMode=\"0\" crs:MaskInverted=\"{inv}\" crs:MaskSyncID=\"{mask_id}\"\n\
+          crs:MaskValue=\"1\"{geom}/>\n\
+        </rdf:Seq>\n\
+       </crs:CorrectionMasks>\n\
+      </rdf:Description>\n\
+     </rdf:li>\n",
+            amount = local_fmt(m.amount),
+            name = xml_escape(&name),
+            corr_id = corr_id,
+            sat = local_fmt(m.saturation / 100.0),
+            exp = local_fmt(m.exposure_ev / 4.0),
+            con = local_fmt(m.contrast / 100.0),
+            hi = local_fmt(m.highlights / 100.0),
+            sh = local_fmt(m.shadows / 100.0),
+            wh = local_fmt(m.whites / 100.0),
+            bl = local_fmt(m.blacks / 100.0),
+            cl = local_fmt(m.clarity / 100.0),
+            dh = local_fmt(m.dehaze / 100.0),
+            temp = local_fmt(m.temperature / 100.0),
+            tint = local_fmt(m.tint / 100.0),
+            tex = local_fmt(m.texture / 100.0),
+            what = what,
+            mname = xml_escape(&format!("{name} mask")),
+            inv = m.inverted,
+            mask_id = mask_id,
+            geom = geom,
+        ));
+    }
+    format!(
+        "\n   <crs:MaskGroupBasedCorrections>\n    <rdf:Seq>\n{items}    </rdf:Seq>\n   </crs:MaskGroupBasedCorrections>"
+    )
 }
 
 /// Render `recipe` as a complete `.xmp` sidecar document.
@@ -112,7 +223,7 @@ pub fn recipe_to_xmp(r: &EditRecipe) -> String {
  <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n\
   <rdf:Description rdf:about=\"\"\n\
     xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\"{attrs}\n\
-    crs:HasSettings=\"True\">{tone}\n\
+    crs:HasSettings=\"True\">{tone}{masks}\n\
   </rdf:Description>\n\
  </rdf:RDF>\n\
 </x:xmpmeta>\n",
@@ -120,13 +231,57 @@ pub fn recipe_to_xmp(r: &EditRecipe) -> String {
         conf = r.confidence,
         attrs = a,
         tone = tone,
+        masks = masks_xml(r),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recipe::{CurvePoint, EditRecipe};
+    use crate::recipe::{CurvePoint, EditRecipe, LocalAdjustment};
+
+    #[test]
+    fn renders_local_masks_with_correct_scale() {
+        let r = EditRecipe {
+            masks: vec![
+                LocalAdjustment {
+                    mask: MaskGeometry::Linear { zero_x: 0.5, zero_y: 0.35, full_x: 0.5, full_y: 0.0 },
+                    name: "sky".into(),
+                    exposure_ev: -0.4,  // ÷4 → -0.1
+                    highlights: -50.0,  // ÷100 → -0.5
+                    ..Default::default()
+                },
+                LocalAdjustment {
+                    mask: MaskGeometry::Radial {
+                        top: 0.3, left: 0.35, bottom: 0.7, right: 0.65,
+                        feather: 0.5, roundness: 0.0, flipped: false,
+                    },
+                    name: "subject".into(),
+                    shadows: 20.0,      // ÷100 → 0.2
+                    inverted: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let xmp = recipe_to_xmp(&r);
+        // Write it out so well-formedness can be validated by an XML parser
+        // (out/ is gitignored). Verification aid, not a behavioural assertion.
+        std::fs::create_dir_all("out").ok();
+        std::fs::write("out/_masks_test.xmp", &xmp).ok();
+        assert!(xmp.contains("<crs:MaskGroupBasedCorrections>"));
+        assert!(xmp.contains(r#"crs:What="Mask/Gradient""#));
+        assert!(xmp.contains(r#"crs:What="Mask/CircularGradient""#));
+        // local scale conversions
+        assert!(xmp.contains(r#"crs:LocalExposure2012="-0.1""#)); // -0.4 / 4
+        assert!(xmp.contains(r#"crs:LocalHighlights2012="-0.5""#)); // -50 / 100
+        assert!(xmp.contains(r#"crs:LocalShadows2012="0.2""#)); // 20 / 100
+        assert!(xmp.contains(r#"crs:MaskInverted="true""#));
+        assert!(xmp.contains(r#"crs:ZeroX="0.5""#));
+        assert!(xmp.contains(r#"crs:Feather="0.5""#));
+        // unset masks ⇒ no mask block (v1-compatible)
+        assert!(!recipe_to_xmp(&EditRecipe::default()).contains("MaskGroupBasedCorrections"));
+    }
 
     #[test]
     fn renders_expected_crs_keys() {
