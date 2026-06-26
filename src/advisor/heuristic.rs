@@ -24,6 +24,7 @@ impl Advisor for HeuristicProposer {
         _meta: &Meta,
         hist: &Histogram,
         _reference: Option<&str>,
+        _guidance: Option<&str>,
         _hint: Option<&str>,
     ) -> Result<EditRecipe, AdvisorError> {
         let total: u64 = hist.luma.iter().map(|&v| v as u64).sum::<u64>().max(1);

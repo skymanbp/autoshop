@@ -86,8 +86,7 @@ fn api_list(request: Request, state: &AppState) -> Result<()> {
         .enumerate()
         .map(|(id, raw)| {
             let analyzed = pipeline::default_out(raw, "recipe", "json").exists()
-                || pipeline::xmp_target(raw, false).exists()
-                || pipeline::xmp_target(raw, true).exists();
+                || pipeline::xmp_target(raw).exists();
             json!({ "id": id, "stem": pipeline::stem(raw), "analyzed": analyzed })
         })
         .collect();
@@ -121,8 +120,11 @@ fn api_recipe(request: Request, state: &AppState) -> Result<()> {
 }
 
 #[derive(Deserialize)]
-struct IdReq {
+struct AnalyzeReq {
     id: usize,
+    /// Optional user direction woven into the AI prompt.
+    #[serde(default)]
+    guidance: Option<String>,
 }
 #[derive(Deserialize)]
 struct DevelopReq {
@@ -133,15 +135,15 @@ struct DevelopReq {
 struct XmpReq {
     id: usize,
     recipe: EditRecipe,
-    beside: bool,
 }
 
 fn api_analyze(mut request: Request, state: &AppState) -> Result<()> {
-    let req: IdReq = read_json(&mut request)?;
+    let req: AnalyzeReq = read_json(&mut request)?;
     let raw = state.raws.get(req.id).ok_or_else(|| anyhow!("bad id"))?.clone();
-    let (recipe, verdict) = pipeline::produce_recipe(&raw, &state.cfg, false)?;
+    let (recipe, verdict) =
+        pipeline::produce_recipe(&raw, &state.cfg, false, req.guidance.as_deref())?;
     pipeline::write_recipe(&raw, &recipe, None)?;
-    pipeline::write_xmp(&raw, &recipe, false)?;
+    pipeline::write_xmp(&raw, &recipe)?;
     respond_json(request, &json!({ "recipe": recipe, "verdict": verdict }))
 }
 
@@ -157,7 +159,8 @@ fn api_develop(mut request: Request, state: &AppState) -> Result<()> {
 fn api_export(mut request: Request, state: &AppState) -> Result<()> {
     let req: DevelopReq = read_json(&mut request)?;
     let raw = state.raws.get(req.id).ok_or_else(|| anyhow!("bad id"))?.clone();
-    let out = pipeline::default_out(&raw, "developed", "jpg");
+    // 16-bit TIFF master (highest fidelity); always to ./out (library read-only).
+    let out = pipeline::default_out(&raw, "developed", "tif");
     pipeline::ensure_parent(&out)?;
     render::render_to_file(&raw, &req.recipe, &out)?;
     respond_text(request, &out.display().to_string())
@@ -166,7 +169,7 @@ fn api_export(mut request: Request, state: &AppState) -> Result<()> {
 fn api_xmp(mut request: Request, state: &AppState) -> Result<()> {
     let req: XmpReq = read_json(&mut request)?;
     let raw = state.raws.get(req.id).ok_or_else(|| anyhow!("bad id"))?.clone();
-    let path = pipeline::write_xmp(&raw, &req.recipe, req.beside)?;
+    let path = pipeline::write_xmp(&raw, &req.recipe)?;
     respond_text(request, &path.display().to_string())
 }
 

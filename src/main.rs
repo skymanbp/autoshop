@@ -61,10 +61,10 @@ enum Command {
         /// Where to write the recipe JSON (default: ./out/<stem>.recipe.json).
         #[arg(short, long)]
         out: Option<PathBuf>,
-        /// Also write the .xmp next to the source RAW. WRITES INTO THE LIBRARY;
-        /// default writes only to ./out.
+        /// Optional direction for the AI, e.g. "warmer and moodier, lift the
+        /// shadows, keep skin natural".
         #[arg(long)]
-        beside: bool,
+        guidance: Option<String>,
     },
     /// Render an existing EditRecipe onto a RAW and save the developed image.
     Apply {
@@ -80,18 +80,19 @@ enum Command {
     Auto {
         /// Path to the RAW file.
         raw: PathBuf,
-        /// Output image path (default: ./out/<stem>.developed.jpg).
+        /// Output image path (default: ./out/<stem>.developed.tif, 16-bit).
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Optional direction for the AI (e.g. "warmer and moodier").
+        #[arg(long)]
+        guidance: Option<String>,
     },
     /// Batch-process every RAW under a folder (resumes by skipping done .xmp).
+    /// Outputs go to ./out — the photo library stays read-only.
     Batch {
         /// Folder to scan recursively for .ARW files.
         dir: PathBuf,
-        /// Write each .xmp next to its RAW (into the library) instead of ./out.
-        #[arg(long)]
-        beside: bool,
-        /// Also render a developed JPEG per RAW (slower).
+        /// Also render a 16-bit developed TIFF per RAW (slower, large files).
         #[arg(long)]
         render: bool,
         /// Max RAWs to process this run (cost guard; raise to do more).
@@ -159,10 +160,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Decode { raw, out } => decode_cmd(&raw, out),
-        Command::Analyze { raw, out, beside } => analyze_cmd(&raw, out, beside),
+        Command::Analyze { raw, out, guidance } => analyze_cmd(&raw, out, guidance),
         Command::Apply { raw, recipe, out } => apply_cmd(&raw, &recipe, &out),
-        Command::Auto { raw, out } => auto_cmd(&raw, out),
-        Command::Batch { dir, beside, render, limit } => batch_cmd(&dir, beside, render, limit),
+        Command::Auto { raw, out, guidance } => auto_cmd(&raw, out, guidance),
+        Command::Batch { dir, render, limit } => batch_cmd(&dir, render, limit),
         Command::Eval { dir, limit } => eval::run(&dir, limit),
         Command::StyleIndex { dir } => style_index_cmd(&dir),
         Command::Reimagine { raw, prompt, fidelity, out } => {
@@ -200,6 +201,7 @@ fn decode_cmd(raw: &Path, out: Option<PathBuf>) -> Result<()> {
     let decoded = decode::decode_raw(raw)?;
 
     let out = out.unwrap_or_else(|| default_out(raw, "preview", "jpg"));
+    pipeline::guard_readonly(&out, raw)?;
     ensure_parent(&out)?;
     let preview = decoded.preview_resized(1536);
     preview
@@ -241,11 +243,14 @@ fn decode_cmd(raw: &Path, out: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn analyze_cmd(raw: &Path, out: Option<PathBuf>, beside: bool) -> Result<()> {
+fn analyze_cmd(raw: &Path, out: Option<PathBuf>, guidance: Option<String>) -> Result<()> {
     let cfg = Config::load();
-    let (recipe, verdict) = produce_recipe(raw, &cfg, true)?;
+    if let Some(o) = &out {
+        pipeline::guard_readonly(o, raw)?;
+    }
+    let (recipe, verdict) = produce_recipe(raw, &cfg, true, guidance.as_deref())?;
     let recipe_path = write_recipe(raw, &recipe, out)?;
-    let xmp_path = write_xmp(raw, &recipe, beside)?;
+    let xmp_path = write_xmp(raw, &recipe)?;
 
     println!("\n--- proposed recipe ---");
     println!("{}", serde_json::to_string_pretty(&recipe)?);
@@ -255,10 +260,8 @@ fn analyze_cmd(raw: &Path, out: Option<PathBuf>, beside: bool) -> Result<()> {
     }
     println!("\nrecipe -> {}", recipe_path.display());
     println!("xmp    -> {}", xmp_path.display());
-    if !beside {
-        let s = stem(raw);
-        println!("  (copy {s}.xmp next to {s}.ARW, or rerun with --beside, to open in Lightroom)");
-    }
+    let s = stem(raw);
+    println!("  (the library is read-only — copy {s}.xmp next to {s}.ARW to open it in Lightroom)");
     Ok(())
 }
 
@@ -267,6 +270,7 @@ fn apply_cmd(raw: &Path, recipe_path: &Path, out: &Path) -> Result<()> {
         .with_context(|| format!("read recipe {}", recipe_path.display()))?;
     let recipe: EditRecipe =
         serde_json::from_str(&text).with_context(|| format!("parse recipe {}", recipe_path.display()))?;
+    pipeline::guard_readonly(out, raw)?;
     ensure_parent(out)?;
     println!("rendering {} with {} ...", raw.display(), recipe_path.display());
     let (w, h) = render::render_to_file(raw, &recipe, out)?;
@@ -274,27 +278,30 @@ fn apply_cmd(raw: &Path, recipe_path: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn auto_cmd(raw: &Path, out: Option<PathBuf>) -> Result<()> {
+fn auto_cmd(raw: &Path, out: Option<PathBuf>, guidance: Option<String>) -> Result<()> {
     let cfg = Config::load();
-    let (recipe, verdict) = produce_recipe(raw, &cfg, true)?;
+    let (recipe, verdict) = produce_recipe(raw, &cfg, true, guidance.as_deref())?;
     write_recipe(raw, &recipe, None)?;
-    let xmp_path = write_xmp(raw, &recipe, false)?;
+    let xmp_path = write_xmp(raw, &recipe)?;
 
-    let out = out.unwrap_or_else(|| default_out(raw, "developed", "jpg"));
+    // Default to a 16-bit TIFF master (highest fidelity); pass -o foo.jpg for a
+    // smaller 8-bit file.
+    let out = out.unwrap_or_else(|| default_out(raw, "developed", "tif"));
+    pipeline::guard_readonly(&out, raw)?;
     ensure_parent(&out)?;
-    println!("verdict: {:?}; rendering full-resolution ...", verdict.decision);
+    println!("verdict: {:?}; rendering full-resolution (16-bit) ...", verdict.decision);
     let (w, h) = render::render_to_file(raw, &recipe, &out)?;
     println!("render -> {} ({} x {})", out.display(), w, h);
     println!("xmp    -> {}", xmp_path.display());
     Ok(())
 }
 
-fn batch_cmd(dir: &Path, beside: bool, render: bool, limit: usize) -> Result<()> {
+fn batch_cmd(dir: &Path, render: bool, limit: usize) -> Result<()> {
     let cfg = Config::load();
     let raws = find_raws(dir)?;
     println!("found {} RAW(s) under {}", raws.len(), dir.display());
 
-    let pending: Vec<&PathBuf> = raws.iter().filter(|r| !xmp_target(r, beside).exists()).collect();
+    let pending: Vec<&PathBuf> = raws.iter().filter(|r| !xmp_target(r).exists()).collect();
     let todo = pending.len();
     let n = todo.min(limit);
     println!("{todo} pending; processing {n} this run (--limit {limit}).");
@@ -307,7 +314,7 @@ fn batch_cmd(dir: &Path, beside: bool, render: bool, limit: usize) -> Result<()>
         print!("[{}/{}] {} ... ", i + 1, n, stem(raw));
         use std::io::Write;
         let _ = std::io::stdout().flush();
-        match process_one(raw, &cfg, beside, render) {
+        match process_one(raw, &cfg, render) {
             Ok(v) => {
                 println!("{:?}", v.decision);
                 ok += 1;
@@ -322,12 +329,12 @@ fn batch_cmd(dir: &Path, beside: bool, render: bool, limit: usize) -> Result<()>
     Ok(())
 }
 
-fn process_one(raw: &Path, cfg: &Config, beside: bool, render_jpeg: bool) -> Result<Verdict> {
-    let (recipe, verdict) = produce_recipe(raw, cfg, false)?;
+fn process_one(raw: &Path, cfg: &Config, render_master: bool) -> Result<Verdict> {
+    let (recipe, verdict) = produce_recipe(raw, cfg, false, None)?;
     write_recipe(raw, &recipe, None)?;
-    write_xmp(raw, &recipe, beside)?;
-    if render_jpeg {
-        let out = default_out(raw, "developed", "jpg");
+    write_xmp(raw, &recipe)?;
+    if render_master {
+        let out = default_out(raw, "developed", "tif"); // 16-bit master
         ensure_parent(&out)?;
         render::render_to_file(raw, &recipe, &out)?;
     }

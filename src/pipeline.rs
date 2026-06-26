@@ -18,7 +18,15 @@ use crate::xmp;
 /// Run the full advise chain for one RAW: decode → propose (GPT or heuristic
 /// fallback) → Claude verify → optional one revision round. `verbose` prints the
 /// proposer/verifier lines (CLI uses true, the server uses false).
-pub fn produce_recipe(raw: &Path, cfg: &Config, verbose: bool) -> Result<(EditRecipe, Verdict)> {
+/// Run the advise chain for one RAW. `guidance` is an optional user direction
+/// (a prompt steering the edit, e.g. "warmer and moodier") woven into the GPT
+/// prompt.
+pub fn produce_recipe(
+    raw: &Path,
+    cfg: &Config,
+    verbose: bool,
+    guidance: Option<&str>,
+) -> Result<(EditRecipe, Verdict)> {
     let decoded = decode::decode_raw(raw)?;
 
     let preview_img = decoded.preview_resized(1568);
@@ -40,6 +48,13 @@ pub fn produce_recipe(raw: &Path, cfg: &Config, verbose: bool) -> Result<(EditRe
     if verbose && ref_str.is_some() {
         println!("style    : using reference from your edits on similar shots");
     }
+    if verbose {
+        if let Some(g) = guidance {
+            println!("direction: {g}");
+        }
+    }
+
+    let (meta, hist) = (&decoded.meta, &decoded.histogram);
 
     // GPT vision when a key is set; on failure (quota/network) warn and fall back
     // to the heuristic so we still produce a recipe (disclosure, not masking).
@@ -49,25 +64,25 @@ pub fn produce_recipe(raw: &Path, cfg: &Config, verbose: bool) -> Result<(EditRe
         if verbose {
             println!("proposer : OpenAI ({})", cfg.openai_model);
         }
-        match openai.propose(&preview, &decoded.meta, &decoded.histogram, ref_str, None) {
+        match openai.propose(&preview, meta, hist, ref_str, guidance, None) {
             Ok(r) => (r, true),
             Err(e) => {
                 eprintln!("⚠ GPT proposer failed ({e})\n  → falling back to the heuristic baseline.");
-                (heuristic.propose(&preview, &decoded.meta, &decoded.histogram, None, None)?, false)
+                (heuristic.propose(&preview, meta, hist, None, None, None)?, false)
             }
         }
     } else {
         if verbose {
             println!("proposer : heuristic baseline (set OPENAI_API_KEY to use GPT vision)");
         }
-        (heuristic.propose(&preview, &decoded.meta, &decoded.histogram, None, None)?, false)
+        (heuristic.propose(&preview, meta, hist, None, None, None)?, false)
     };
 
     let claude = ClaudeProvider::new(cfg);
     if verbose {
         println!("verifier : Claude ({})", cfg.claude_model);
     }
-    let mut verdict = claude.verify(&recipe, &decoded.meta, &decoded.histogram)?;
+    let mut verdict = claude.verify(&recipe, meta, hist)?;
 
     // One revision round — only if GPT actually produced the recipe.
     if verdict.decision != Decision::Accept && can_revise {
@@ -75,8 +90,8 @@ pub fn produce_recipe(raw: &Path, cfg: &Config, verbose: bool) -> Result<(EditRe
             if verbose {
                 println!("verdict was {:?} → one revision round (hint: {hint})", verdict.decision);
             }
-            recipe = openai.propose(&preview, &decoded.meta, &decoded.histogram, ref_str, Some(&hint))?;
-            verdict = claude.verify(&recipe, &decoded.meta, &decoded.histogram)?;
+            recipe = openai.propose(&preview, meta, hist, ref_str, guidance, Some(&hint))?;
+            verdict = claude.verify(&recipe, meta, hist)?;
         }
     }
     Ok((recipe, verdict))
@@ -90,21 +105,36 @@ pub fn write_recipe(raw: &Path, recipe: &EditRecipe, out: Option<PathBuf>) -> Re
     Ok(out)
 }
 
-pub fn write_xmp(raw: &Path, recipe: &EditRecipe, beside: bool) -> Result<PathBuf> {
-    let out = xmp_target(raw, beside);
+pub fn write_xmp(raw: &Path, recipe: &EditRecipe) -> Result<PathBuf> {
+    let out = xmp_target(raw);
     ensure_parent(&out)?;
     std::fs::write(&out, xmp::recipe_to_xmp(recipe))
         .with_context(|| format!("write xmp {}", out.display()))?;
     Ok(out)
 }
 
-/// Where the .xmp for `raw` goes: next to the RAW (`beside`) or ./out/<stem>.xmp.
-pub fn xmp_target(raw: &Path, beside: bool) -> PathBuf {
-    if beside {
-        raw.with_extension("xmp")
-    } else {
-        PathBuf::from("out").join(format!("{}.xmp", stem(raw)))
+/// Where the .xmp for `raw` goes — always ./out (the photo library is read-only).
+pub fn xmp_target(raw: &Path) -> PathBuf {
+    PathBuf::from("out").join(format!("{}.xmp", stem(raw)))
+}
+
+/// Guarantee the read-only library: refuse to write `out` if it lands inside the
+/// source RAW's own folder (or below it). Outputs belong in ./out.
+pub fn guard_readonly(out: &Path, raw: &Path) -> Result<()> {
+    use std::path::absolute;
+    let (Ok(out_abs), Ok(raw_abs)) = (absolute(out), absolute(raw)) else {
+        return Ok(());
+    };
+    if let Some(raw_dir) = raw_abs.parent() {
+        if out_abs.starts_with(raw_dir) {
+            anyhow::bail!(
+                "refusing to write into the source RAW's folder ({}) — the photo library is \
+                 read-only. Write outputs to ./out (the default) instead.",
+                raw_dir.display()
+            );
+        }
     }
+    Ok(())
 }
 
 /// `./out/<stem>.<kind>.<ext>` — outputs never go beside the source RAW.

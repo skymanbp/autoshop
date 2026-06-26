@@ -86,6 +86,7 @@ pub trait Advisor {
         _meta: &Meta,
         _hist: &Histogram,
         _reference: Option<&str>,
+        _guidance: Option<&str>,
         _hint: Option<&str>,
     ) -> Result<EditRecipe, AdvisorError> {
         Err(AdvisorError::Unsupported(self.name()))

@@ -17,7 +17,7 @@
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
-use image::{DynamicImage, RgbImage};
+use image::{DynamicImage, ImageBuffer, ImageEncoder, Rgb, RgbImage};
 use rawler::decoders::RawDecodeParams;
 use rawler::get_decoder;
 use rawler::imgop::develop::{Intermediate, RawDevelop};
@@ -65,16 +65,16 @@ pub fn render_to_image(raw_path: &Path, recipe: &EditRecipe) -> Result<DynamicIm
     // --- tone + clarity + sat/vibrance + NR + sharpen (shared pipeline) -------
     apply_develop(&mut data, w, h, recipe);
 
-    // --- pack to 8-bit -------------------------------------------------------
-    let mut buf = Vec::with_capacity(w * h * 3);
+    // --- pack to 16-bit (highest precision; JPEG downconverts at encode) ------
+    let mut buf: Vec<u16> = Vec::with_capacity(w * h * 3);
     for px in &data {
-        buf.push(to_u8(px[0]));
-        buf.push(to_u8(px[1]));
-        buf.push(to_u8(px[2]));
+        buf.push(to_u16(px[0]));
+        buf.push(to_u16(px[1]));
+        buf.push(to_u16(px[2]));
     }
-    let img = RgbImage::from_raw(w as u32, h as u32, buf)
+    let img: ImageBuffer<Rgb<u16>, _> = ImageBuffer::from_raw(w as u32, h as u32, buf)
         .ok_or_else(|| anyhow!("pixel buffer size mismatch"))?;
-    let mut dynimg = oriented(DynamicImage::ImageRgb8(img), orientation);
+    let mut dynimg = oriented(DynamicImage::ImageRgb16(img), orientation);
 
     // --- crop (normalised [0,1] on the displayed frame) ----------------------
     if let Some(c) = &recipe.crop {
@@ -91,12 +91,34 @@ pub fn render_to_image(raw_path: &Path, recipe: &EditRecipe) -> Result<DynamicIm
     Ok(dynimg)
 }
 
-/// Render and save to `out` (format from the extension: .jpg/.png/.tif).
+/// Render and save to `out` at the highest fidelity the format allows:
+/// `.tif`/`.png` keep the full **16-bit** depth; `.jpg` downconverts to 8-bit at
+/// quality 95. Extension picks the format.
 pub fn render_to_file(raw_path: &Path, recipe: &EditRecipe, out: &Path) -> Result<(u32, u32)> {
     let img = render_to_image(raw_path, recipe)?;
-    img.save(out)
-        .with_context(|| format!("save render {}", out.display()))?;
-    Ok((img.width(), img.height()))
+    let (w, h) = (img.width(), img.height());
+    let ext = out
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => {
+            // JPEG is 8-bit only — downconvert from 16-bit and encode at q95.
+            let rgb8 = img.to_rgb8();
+            let file = std::fs::File::create(out)
+                .with_context(|| format!("create {}", out.display()))?;
+            let mut w = std::io::BufWriter::new(file);
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut w, 95)
+                .write_image(rgb8.as_raw(), rgb8.width(), rgb8.height(), image::ExtendedColorType::Rgb8)
+                .with_context(|| format!("encode jpeg {}", out.display()))?;
+        }
+        // .tif / .png (and anything else) keep the full 16-bit data.
+        _ => img
+            .save(out)
+            .with_context(|| format!("save render {}", out.display()))?,
+    }
+    Ok((w, h))
 }
 
 /// Fast "after" render for the UI: apply the recipe's tonal + colour ops to an
@@ -512,6 +534,10 @@ fn apply_sat_vibrance(r: f32, g: f32, b: f32, sat: f32, vib: f32) -> [f32; 3] {
 
 fn to_u8(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+fn to_u16(v: f32) -> u16 {
+    (v.clamp(0.0, 1.0) * 65535.0).round() as u16
 }
 
 /// Apply the RAW's stored orientation so portraits/flips display correctly.

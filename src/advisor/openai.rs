@@ -46,6 +46,7 @@ impl Advisor for OpenAiProvider {
         meta: &Meta,
         hist: &Histogram,
         reference: Option<&str>,
+        guidance: Option<&str>,
         hint: Option<&str>,
     ) -> Result<EditRecipe, AdvisorError> {
         let key = self
@@ -69,6 +70,11 @@ Local slider values use the same scale as the globals. METADATA: {meta_json}  HI
         if let Some(rf) = reference {
             instruction.push_str("  ");
             instruction.push_str(rf);
+        }
+        if let Some(g) = guidance {
+            instruction.push_str("  USER DIRECTION (a specific request from the photographer — \
+follow it closely): ");
+            instruction.push_str(g);
         }
         if let Some(h) = hint {
             instruction.push_str(&format!("  REVISION NOTE from the verifier: {h}"));

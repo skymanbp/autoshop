@@ -35,6 +35,8 @@
   button.secondary { background:#2b2e31; border:1px solid var(--line); }
   button:disabled { opacity:.5; cursor:default; }
   .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  .guidance { flex:1; min-width:260px; background:#101113; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:9px 11px; font-size:13px; }
+  .guidance::placeholder { color:#6b7177; }
   .verdict { font-size:13px; }
   .verdict .tag { display:inline-block; padding:2px 8px; border-radius:10px; font-weight:600; font-size:12px; }
   .tag.accept{background:#1e5e2f;} .tag.revise{background:#7a5a1e;} .tag.reject{background:#7a261e;}
@@ -62,11 +64,13 @@
     <figure><figcaption>After (AI edit)</figcaption><img class="after" /></figure>
   </div>
   <div class="row">
+    <input class="guidance" type="text" placeholder="Optional direction for the AI, e.g. warmer and moodier, lift the shadows" />
+  </div>
+  <div class="row">
     <button class="analyze">✨ Analyze with AI</button>
     <button class="secondary reset">Reset</button>
     <button class="secondary savexmp">Save XMP → ./out</button>
-    <button class="secondary savexmpbeside">Save XMP beside RAW</button>
-    <button class="secondary export">Export full-res JPEG</button>
+    <button class="secondary export">Export 16-bit TIFF</button>
   </div>
   <div class="controls">
     <div class="panel sliders"><h3>Develop</h3></div>
@@ -90,6 +94,8 @@ const SLIDERS = [
   ["dehaze","Dehaze",-100,100,1],
   ["vibrance","Vibrance",-100,100,1],
   ["saturation","Saturation",-100,100,1],
+  ["sharpening","Sharpening",0,150,1],
+  ["noise_reduction","Noise Reduction",0,100,1],
 ];
 const DEFAULT_RECIPE = {
   version:1, exposure_ev:0, contrast:0, highlights:0, shadows:0, whites:0, blacks:0,
@@ -176,8 +182,7 @@ async function selectPhoto(id, el) {
 
   main.querySelector(".analyze").onclick = analyze;
   main.querySelector(".reset").onclick = ()=>{ state.recipe = structuredClone(DEFAULT_RECIPE); syncSliders(); renderAfter(); };
-  main.querySelector(".savexmp").onclick = ()=>saveXmp(false);
-  main.querySelector(".savexmpbeside").onclick = ()=>saveXmp(true);
+  main.querySelector(".savexmp").onclick = ()=>saveXmp();
   main.querySelector(".export").onclick = exportFull;
 }
 
@@ -196,8 +201,11 @@ async function analyze() {
   setStatus("running GPT + Claude… (can take ~10-30s)");
   const btn = $(".analyze"); btn.disabled = true;
   try {
+    const gi = document.querySelector(".guidance");
+    const guidance = gi && gi.value.trim() ? gi.value.trim() : null;
+    if (guidance) setStatus("running GPT + Claude with your direction…");
     const r = await fetch("/api/analyze", {method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({id: state.id})});
+      body: JSON.stringify({id: state.id, guidance})});
     if (!r.ok) { setStatus("analyze failed: " + await r.text()); return; }
     const data = await r.json();
     state.recipe = data.recipe;
@@ -207,10 +215,10 @@ async function analyze() {
   } finally { btn.disabled = false; }
 }
 
-async function saveXmp(beside) {
+async function saveXmp() {
   setStatus("saving xmp…");
   const r = await fetch("/api/xmp", {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({id: state.id, recipe: state.recipe, beside})});
+    body: JSON.stringify({id: state.id, recipe: state.recipe})});
   setStatus(r.ok ? ("xmp saved → " + await r.text()) : "save failed");
 }
 async function exportFull() {
