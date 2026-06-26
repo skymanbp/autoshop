@@ -277,7 +277,9 @@ fn analyze_cmd(raw: &Path, out: Option<PathBuf>, guidance: Option<String>) -> Re
     if let Some(o) = &out {
         pipeline::guard_readonly(o, raw)?;
     }
-    let (recipe, verdict) = produce_recipe(raw, &cfg, true, guidance.as_deref())?;
+    // CLI analyze always proposes from the original (base = None); the refine /
+    // "adjust current edit" path is a web-UI affordance.
+    let (recipe, verdict) = produce_recipe(raw, &cfg, true, guidance.as_deref(), None)?;
     let recipe_path = write_recipe(raw, &recipe, out)?;
 
     println!("\n--- proposed recipe ---");
@@ -321,7 +323,7 @@ fn auto_cmd(
     denoise_model: Option<String>,
 ) -> Result<()> {
     let cfg = Config::load();
-    let (recipe, verdict) = produce_recipe(raw, &cfg, true, guidance.as_deref())?;
+    let (recipe, verdict) = produce_recipe(raw, &cfg, true, guidance.as_deref(), None)?;
     write_recipe(raw, &recipe, None)?;
 
     // Default to a 16-bit TIFF master (highest fidelity); pass -o foo.jpg for a
@@ -409,7 +411,7 @@ fn batch_cmd(dir: &Path, render: bool, limit: usize) -> Result<()> {
 }
 
 fn process_one(raw: &Path, cfg: &Config, render_master: bool) -> Result<Verdict> {
-    let (recipe, verdict) = produce_recipe(raw, cfg, false, None)?;
+    let (recipe, verdict) = produce_recipe(raw, cfg, false, None, None)?;
     write_recipe(raw, &recipe, None)?;
     write_xmp(raw, &recipe)?;
     if render_master {

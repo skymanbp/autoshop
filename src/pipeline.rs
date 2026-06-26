@@ -26,9 +26,24 @@ pub fn produce_recipe(
     cfg: &Config,
     verbose: bool,
     guidance: Option<&str>,
+    base: Option<&EditRecipe>,
 ) -> Result<(EditRecipe, Verdict)> {
     // decode_any: a camera RAW, or an already-baked PNG/TIFF/JPEG (PNG-source mode).
     let decoded = decode::decode_any(raw)?;
+
+    // Refine mode: when `base` (the user's CURRENT edit) is given, fold it into
+    // the direction so GPT adjusts that edit rather than proposing from scratch.
+    // Absent a base, behaviour is unchanged — a fresh proposal from the original.
+    let refine_owned: Option<String> = base.map(|b| {
+        let base_json = serde_json::to_string(b).unwrap_or_default();
+        format!(
+            "REFINE the photographer's CURRENT edit instead of starting over — keep its choices and \
+             change only what this direction implies. CURRENT EDIT (EditRecipe JSON): {base_json}. \
+             Direction: {}",
+            guidance.unwrap_or("make a small, tasteful improvement")
+        )
+    });
+    let guidance = refine_owned.as_deref().or(guidance);
 
     let preview_img = decoded.preview_resized(1568);
     let mut jpeg = Vec::new();

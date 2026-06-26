@@ -5,82 +5,127 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Autoshop</title>
 <style>
-  :root { --bg:#161719; --panel:#1e2023; --line:#303336; --fg:#e7e7e8; --muted:#9aa0a6; --accent:#4c8bf5; }
+  :root { --bg:#141518; --panel:#1e2023; --panel2:#26292d; --line:#33373b; --fg:#e9e9ea; --muted:#9aa0a6; --accent:#4c8bf5; --accent2:#2b5fb8; }
   * { box-sizing: border-box; }
   body { margin:0; font:14px/1.45 system-ui,Segoe UI,Arial,sans-serif; background:var(--bg); color:var(--fg); }
-  header { padding:10px 16px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:16px; }
-  header h1 { font-size:16px; margin:0; font-weight:600; }
-  header .dir { color:var(--muted); font-size:12px; }
-  .layout { display:grid; grid-template-columns:300px 1fr; height:calc(100vh - 47px); }
+
+  header { padding:8px 14px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; font-weight:700; letter-spacing:.02em; }
+  .toolbar { display:flex; align-items:center; gap:8px; flex:1; flex-wrap:wrap; }
+  .toolbar input.path { flex:1; min-width:240px; background:#101113; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:7px 10px; font-size:12px; }
+  .toolbar .sep { width:1px; align-self:stretch; background:var(--line); margin:0 4px; }
+  #status { color:var(--muted); font-size:12px; margin-left:auto; white-space:nowrap; }
+
+  button { background:var(--accent); color:#fff; border:0; padding:7px 12px; border-radius:6px; cursor:pointer; font-size:13px; }
+  button:hover { background:var(--accent2); }
+  button.secondary { background:#2b2e31; border:1px solid var(--line); }
+  button.secondary:hover { background:#373b3f; }
+  button:disabled { opacity:.4; cursor:default; }
+  select, .toolbar select { background:#101113; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; font-size:12px; }
+
+  .layout { display:grid; grid-template-columns:280px 1fr; height:calc(100vh - 46px); }
   .grid { overflow-y:auto; border-right:1px solid var(--line); padding:8px; }
+  .grid .ghead { color:var(--muted); font-size:11px; padding:4px 6px 8px; text-transform:uppercase; letter-spacing:.05em; }
   .thumb { display:flex; gap:8px; padding:6px; border-radius:6px; cursor:pointer; align-items:center; }
   .thumb:hover { background:var(--panel); }
   .thumb.sel { background:#26417a; }
-  .thumb img { width:64px; height:44px; object-fit:cover; background:#000; border-radius:3px; }
+  .thumb img { width:60px; height:42px; object-fit:cover; background:#000; border-radius:3px; flex:none; }
   .thumb .name { font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .thumb .badge { font-size:10px; color:var(--accent); }
+  .thumb .tags { font-size:10px; color:var(--muted); display:flex; gap:6px; }
+  .thumb .badge { color:var(--accent); }
+  .thumb .pill { color:#c9a14a; }
+
   .main { overflow-y:auto; padding:16px; }
   .ba { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
   .ba figure { margin:0; }
   .ba figcaption { color:var(--muted); font-size:12px; margin-bottom:4px; }
   .ba img { width:100%; border-radius:6px; background:#000; }
-  .controls { margin-top:16px; display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:10px; }
+  .guidance { flex:1; min-width:240px; background:#101113; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:9px 11px; font-size:13px; }
+  .guidance::placeholder { color:#6b7177; }
+  label.chk { display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--muted); cursor:pointer; user-select:none; }
+
+  .controls { margin-top:16px; display:grid; grid-template-columns:1fr 320px; gap:16px; align-items:start; }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px 14px; }
-  .panel h3 { margin:0 0 10px; font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
-  .slider { display:grid; grid-template-columns:90px 1fr 48px; gap:8px; align-items:center; margin:6px 0; }
+  .panel h3 { margin:0 0 10px; font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+  .slider { display:grid; grid-template-columns:92px 1fr 46px; gap:8px; align-items:center; margin:5px 0; }
   .slider label { font-size:12px; }
   .slider input[type=range] { width:100%; }
   .slider .val { font-size:12px; text-align:right; color:var(--muted); }
-  button { background:var(--accent); color:#fff; border:0; padding:8px 12px; border-radius:6px; cursor:pointer; font-size:13px; }
-  button.secondary { background:#2b2e31; border:1px solid var(--line); }
-  button:disabled { opacity:.5; cursor:default; }
-  .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
-  .guidance { flex:1; min-width:260px; background:#101113; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:9px 11px; font-size:13px; }
-  .guidance::placeholder { color:#6b7177; }
+
+  .save-panel .savegrid { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
   .verdict { font-size:13px; }
   .verdict .tag { display:inline-block; padding:2px 8px; border-radius:10px; font-weight:600; font-size:12px; }
-  .tag.accept{background:#1e5e2f;} .tag.revise{background:#7a5a1e;} .tag.reject{background:#7a261e;}
+  .tag.accept{background:#1e5e2f;} .tag.revise{background:#7a5a1e;} .tag.reject{background:#7a261e;} .tag.saved{background:#2b5fb8;}
   .verdict ul { margin:8px 0 0; padding-left:18px; color:var(--muted); }
   .rationale { color:var(--muted); font-size:12px; margin-top:8px; font-style:italic; }
-  #status { color:var(--muted); font-size:12px; margin-left:auto; }
+  .hint { color:#6b7177; font-size:11px; margin-top:6px; }
 </style>
 </head>
 <body>
 <header>
   <h1>Autoshop</h1>
-  <span class="dir" id="dir"></span>
+  <div class="toolbar">
+    <input class="path" id="import-path" placeholder="Import: paste a RAW/PNG/TIFF file or a folder path…" />
+    <button id="import-btn">＋ Import</button>
+    <span class="sep"></span>
+    <button class="secondary" id="undo" disabled title="Undo (Ctrl+Z)">↶ Undo</button>
+    <button class="secondary" id="redo" disabled title="Redo (Ctrl+Y)">↷ Redo</button>
+  </div>
   <span id="status"></span>
 </header>
+
 <div class="layout">
   <div class="grid" id="grid"></div>
   <div class="main" id="main">
-    <p style="color:var(--muted)">Select a photo on the left.</p>
+    <p style="color:var(--muted)">Select a photo on the left, or import more above.</p>
   </div>
 </div>
 
 <template id="detail-tpl">
   <div class="ba">
-    <figure><figcaption>Before (camera)</figcaption><img class="before" /></figure>
-    <figure><figcaption>After (AI edit)</figcaption><img class="after" /></figure>
+    <figure><figcaption>Before (source)</figcaption><img class="before" /></figure>
+    <figure><figcaption>After (edit)</figcaption><img class="after" /></figure>
   </div>
+
   <div class="row">
-    <input class="guidance" type="text" placeholder="Optional direction for the AI, e.g. warmer and moodier, lift the shadows" />
-  </div>
-  <div class="row">
-    <button class="analyze">✨ Analyze with AI</button>
-    <button class="secondary reset">Reset</button>
-    <button class="secondary savexmp">Save XMP → ./out</button>
-    <label class="dn" title="SCUNet AI denoise before developing — for high-ISO / astro (slow, GPU)">
-      <input type="checkbox" class="denoise-toggle" /> AI Denoise
+    <input class="guidance" type="text" placeholder="Direction for the AI, e.g. warmer and moodier, lift the shadows" />
+    <label class="chk" title="On: adjust your CURRENT sliders. Off: propose fresh from the original.">
+      <input type="checkbox" class="refine" /> Refine current edit
     </label>
-    <button class="secondary export">Export 16-bit TIFF</button>
   </div>
+  <div class="row">
+    <button class="analyze">✨ Analyze</button>
+    <button class="secondary reset">Reset</button>
+  </div>
+
   <div class="controls">
     <div class="panel sliders"><h3>Develop</h3></div>
-    <div class="panel">
-      <h3>Verdict</h3>
-      <div class="verdict">Not analyzed yet.</div>
-      <div class="rationale"></div>
+    <div>
+      <div class="panel" style="margin-bottom:14px">
+        <h3>Verdict</h3>
+        <div class="verdict">Not analyzed yet.</div>
+        <div class="rationale"></div>
+      </div>
+      <div class="panel save-panel">
+        <h3>Save</h3>
+        <div class="savegrid">
+          <select class="save-format" title="Output format">
+            <option value="tif">16-bit TIFF</option>
+            <option value="jpg">JPEG (q95)</option>
+          </select>
+          <label class="chk" title="SCUNet AI denoise before developing — high-ISO / astro (slow, GPU)">
+            <input type="checkbox" class="denoise-toggle" /> AI Denoise
+          </label>
+        </div>
+        <div class="row" style="margin-top:0">
+          <button class="export">Export → ./out</button>
+          <button class="secondary download">Download…</button>
+          <button class="secondary savexmp">Save XMP</button>
+        </div>
+        <div class="hint">Export writes to ./out; Download opens a Save-As. XMP only for RAW.</div>
+      </div>
     </div>
   </div>
 </template>
@@ -104,29 +149,75 @@ const DEFAULT_RECIPE = {
   version:1, exposure_ev:0, contrast:0, highlights:0, shadows:0, whites:0, blacks:0,
   temperature_k:null, tint:0, vibrance:0, saturation:0, clarity:0, dehaze:0,
   sharpening:0, noise_reduction:0, straighten_deg:0, crop:null, tone_curve:[],
-  rationale:"", confidence:0
+  masks:[], rationale:"", confidence:0
 };
 
-let state = { id:null, recipe:null };
+let state = { id:null, stem:null, recipe:null };
+// Undo/redo history of recipe snapshots for the selected photo.
+let history = [], hi = -1;
+
 const $ = s => document.querySelector(s);
 const setStatus = t => { $("#status").textContent = t || ""; };
 
+// --- undo / redo -----------------------------------------------------------
+function resetHistory(recipe) { history = [structuredClone(recipe)]; hi = 0; updateUndo(); }
+function pushHistory(recipe) {
+  if (hi >= 0 && JSON.stringify(history[hi]) === JSON.stringify(recipe)) return; // no-op
+  history = history.slice(0, hi + 1);
+  history.push(structuredClone(recipe));
+  hi = history.length - 1;
+  updateUndo();
+}
+function updateUndo() {
+  $("#undo").disabled = hi <= 0;
+  $("#redo").disabled = hi < 0 || hi >= history.length - 1;
+}
+function undo() { if (hi > 0) { hi--; applyHistory(); } }
+function redo() { if (hi < history.length - 1) { hi++; applyHistory(); } }
+function applyHistory() {
+  state.recipe = structuredClone(history[hi]);
+  syncSliders(); renderAfter(); updateUndo();
+  setStatus(`history ${hi + 1}/${history.length}`);
+}
+$("#undo").onclick = undo;
+$("#redo").onclick = redo;
+document.addEventListener("keydown", e => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") { e.preventDefault(); e.shiftKey ? redo() : undo(); }
+  else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") { e.preventDefault(); redo(); }
+});
+
+// --- gallery + import ------------------------------------------------------
 async function loadList() {
   const r = await fetch("/api/list");
   const data = await r.json();
-  $("#dir").textContent = data.dir + "  ·  " + data.total + " RAWs" + (data.shown < data.total ? " (showing "+data.shown+")" : "");
   const grid = $("#grid");
-  grid.innerHTML = "";
+  grid.innerHTML = `<div class="ghead">${data.total} source${data.total===1?"":"s"}${data.shown<data.total?` · showing ${data.shown}`:""}</div>`;
   for (const it of data.items) {
     const div = document.createElement("div");
     div.className = "thumb"; div.dataset.id = it.id;
     div.innerHTML = `<img loading="lazy" src="/api/thumb?id=${it.id}"/>
-      <div><div class="name">${it.stem}</div>${it.analyzed?'<div class="badge">● analyzed</div>':''}</div>`;
-    div.onclick = () => selectPhoto(it.id, div);
+      <div><div class="name">${it.stem}</div>
+        <div class="tags">${it.baked?'<span class="pill">PNG/TIFF</span>':''}${it.analyzed?'<span class="badge">● edited</span>':''}</div>
+      </div>`;
+    div.onclick = () => selectPhoto(it.id, it.stem, div);
     grid.appendChild(div);
   }
 }
 
+$("#import-btn").onclick = async () => {
+  const path = $("#import-path").value.trim();
+  if (!path) { setStatus("type a file or folder path to import"); return; }
+  setStatus("importing…");
+  const r = await fetch("/api/import", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({path})});
+  if (!r.ok) { setStatus("import failed: " + await r.text()); return; }
+  const d = await r.json();
+  $("#import-path").value = "";
+  setStatus(`imported ${d.added} new (total ${d.total})`);
+  loadList();
+};
+$("#import-path").addEventListener("keydown", e => { if (e.key === "Enter") $("#import-btn").click(); });
+
+// --- sliders + live preview ------------------------------------------------
 function buildSliders(container) {
   container.querySelectorAll(".slider").forEach(e=>e.remove());
   for (const [key,label,min,max,step] of SLIDERS) {
@@ -137,6 +228,7 @@ function buildSliders(container) {
       <span class="val"></span>`;
     const input = row.querySelector("input");
     input.oninput = () => { state.recipe[key] = parseFloat(input.value); row.querySelector(".val").textContent = input.value; scheduleAfter(); };
+    input.onchange = () => pushHistory(state.recipe); // commit to history on release
     container.appendChild(row);
   }
 }
@@ -161,32 +253,35 @@ async function renderAfter() {
   setStatus("");
 }
 
-async function selectPhoto(id, el) {
+// --- select + actions ------------------------------------------------------
+async function selectPhoto(id, stem, el) {
   document.querySelectorAll(".thumb").forEach(t=>t.classList.remove("sel"));
   if (el) el.classList.add("sel");
-  state.id = id;
+  state.id = id; state.stem = stem;
   const main = $("#main");
   main.innerHTML = "";
   main.appendChild($("#detail-tpl").content.cloneNode(true));
   buildSliders(main.querySelector(".sliders"));
   $(".before").src = `/api/preview?id=${id}`;
-  // load existing recipe if any
+
   const rr = await fetch(`/api/recipe?id=${id}`);
   if (rr.ok) {
-    state.recipe = await rr.json();
-    $(".verdict").innerHTML = '<span class="tag accept">SAVED</span> Loaded a previously-saved recipe (verdict not stored). Re-run Analyze for a live verdict.';
-    showVerdictFromRecipe();
+    state.recipe = Object.assign(structuredClone(DEFAULT_RECIPE), await rr.json());
+    $(".verdict").innerHTML = '<span class="tag saved">SAVED</span> Loaded a previously-saved recipe. Re-run Analyze for a live verdict.';
+    showRationale();
   } else {
     state.recipe = structuredClone(DEFAULT_RECIPE);
     $(".verdict").textContent = "Not analyzed yet.";
   }
   syncSliders();
+  resetHistory(state.recipe);
   renderAfter();
 
   main.querySelector(".analyze").onclick = analyze;
-  main.querySelector(".reset").onclick = ()=>{ state.recipe = structuredClone(DEFAULT_RECIPE); syncSliders(); renderAfter(); };
-  main.querySelector(".savexmp").onclick = ()=>saveXmp();
+  main.querySelector(".reset").onclick = ()=>{ state.recipe = structuredClone(DEFAULT_RECIPE); syncSliders(); pushHistory(state.recipe); renderAfter(); };
+  main.querySelector(".savexmp").onclick = saveXmp;
   main.querySelector(".export").onclick = exportFull;
+  main.querySelector(".download").onclick = downloadFull;
 }
 
 function showVerdict(v) {
@@ -195,25 +290,26 @@ function showVerdict(v) {
   const reasons = (v.reasons||[]).map(x=>`<li>${escapeHtml(x)}</li>`).join("");
   el.innerHTML = `<span class="tag ${v.decision}">${v.decision.toUpperCase()}</span><ul>${reasons}</ul>`;
 }
-function showVerdictFromRecipe() {
+function showRationale() {
   $(".rationale").textContent = state.recipe.rationale ? `“${state.recipe.rationale}” (confidence ${state.recipe.confidence})` : "";
 }
-function escapeHtml(s){return s.replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
+function escapeHtml(s){return (s||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
 
 async function analyze() {
-  setStatus("running GPT + Claude… (can take ~10-30s)");
+  const gi = document.querySelector(".guidance");
+  const guidance = gi && gi.value.trim() ? gi.value.trim() : null;
+  const refine = document.querySelector(".refine")?.checked || false;
+  setStatus(refine ? "refining your current edit with AI…" : "analyzing with GPT + Claude… (~10-30s)");
   const btn = $(".analyze"); btn.disabled = true;
   try {
-    const gi = document.querySelector(".guidance");
-    const guidance = gi && gi.value.trim() ? gi.value.trim() : null;
-    if (guidance) setStatus("running GPT + Claude with your direction…");
-    const r = await fetch("/api/analyze", {method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({id: state.id, guidance})});
+    const body = { id: state.id, guidance };
+    if (refine) body.base = state.recipe;        // adjust current edit, don't start over
+    const r = await fetch("/api/analyze", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
     if (!r.ok) { setStatus("analyze failed: " + await r.text()); return; }
     const data = await r.json();
-    state.recipe = data.recipe;
-    syncSliders(); showVerdict(data.verdict); showVerdictFromRecipe(); renderAfter();
-    const t = document.querySelector(`.thumb[data-id="${state.id}"] div div`);
+    state.recipe = Object.assign(structuredClone(DEFAULT_RECIPE), data.recipe);
+    syncSliders(); showVerdict(data.verdict); showRationale();
+    pushHistory(state.recipe); renderAfter();
     setStatus("done");
   } finally { btn.disabled = false; }
 }
@@ -224,14 +320,36 @@ async function saveXmp() {
     body: JSON.stringify({id: state.id, recipe: state.recipe})});
   setStatus(r.ok ? ("xmp saved → " + await r.text()) : "save failed");
 }
-async function exportFull() {
+
+function saveBody() {
   const dn = document.querySelector(".denoise-toggle")?.checked || false;
+  const format = document.querySelector(".save-format")?.value || "tif";
+  return { id: state.id, recipe: state.recipe, denoise: dn, format };
+}
+
+async function exportFull() {
+  const dn = document.querySelector(".denoise-toggle")?.checked;
   setStatus(dn ? "rendering + AI denoise… (GPU, can take minutes)" : "rendering full-resolution… (slow)");
   const btn = $(".export"); btn.disabled = true;
   try {
-    const r = await fetch("/api/export", {method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({id: state.id, recipe: state.recipe, denoise: dn})});
+    const r = await fetch("/api/export", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(saveBody())});
     setStatus(r.ok ? ("exported → " + await r.text()) : "export failed");
+  } finally { btn.disabled = false; }
+}
+
+async function downloadFull() {
+  const fmt = document.querySelector(".save-format")?.value || "tif";
+  setStatus("rendering for download…");
+  const btn = $(".download"); btn.disabled = true;
+  try {
+    const r = await fetch("/api/download", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(saveBody())});
+    if (!r.ok) { setStatus("download failed: " + await r.text()); return; }
+    const blob = await r.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${state.stem || "photo"}.developed.${fmt}`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setStatus("downloaded");
   } finally { btn.disabled = false; }
 }
 
