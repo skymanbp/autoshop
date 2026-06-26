@@ -103,6 +103,10 @@ enum Command {
         /// Max photos to evaluate (cost guard; each one runs the AI).
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        /// Save the measured biases to out/style-profile.json so the advisor
+        /// calibrates future edits toward your taste.
+        #[arg(long)]
+        save_profile: bool,
     },
     /// Start the local web UI (open the printed URL in a browser).
     Serve {
@@ -124,7 +128,7 @@ fn main() -> Result<()> {
         Command::Apply { raw, recipe, out } => apply_cmd(&raw, &recipe, &out),
         Command::Auto { raw, out } => auto_cmd(&raw, out),
         Command::Batch { dir, beside, render, limit } => batch_cmd(&dir, beside, render, limit),
-        Command::Eval { dir, limit } => eval::run(&dir, limit),
+        Command::Eval { dir, limit, save_profile } => eval::run(&dir, limit, save_profile),
         Command::Serve { dir, port } => serve::serve(&dir, port),
         Command::RecipeSchema => {
             let template = EditRecipe::default();

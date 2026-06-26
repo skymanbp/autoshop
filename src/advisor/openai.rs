@@ -23,6 +23,9 @@ pub struct OpenAiProvider {
     api_key: Option<String>,
     model: String,
     base_url: String,
+    /// Style-calibration sentence (from the user's profile) appended to the
+    /// prompt so edits lean toward how this user actually edits.
+    calibration: Option<String>,
 }
 
 impl OpenAiProvider {
@@ -31,6 +34,7 @@ impl OpenAiProvider {
             api_key: cfg.openai_api_key.clone(),
             model: cfg.openai_model.clone(),
             base_url: cfg.openai_base_url.clone(),
+            calibration: cfg.style_calibration.clone(),
         }
     }
 }
@@ -61,6 +65,10 @@ documented slider ranges. METADATA: {meta_json}  HISTOGRAM: {hist}",
             meta_json = meta_json,
             hist = hist_summary(hist),
         );
+        if let Some(cal) = &self.calibration {
+            instruction.push_str("  ");
+            instruction.push_str(cal);
+        }
         if let Some(h) = hint {
             instruction.push_str(&format!("  REVISION NOTE from the verifier: {h}"));
         }
