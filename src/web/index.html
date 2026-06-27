@@ -42,6 +42,9 @@
   .ba img { width:100%; border-radius:6px; background:#000; display:block; }
   .after-wrap { position:relative; cursor:crosshair; }
   .sel-box { position:absolute; border:2px dashed var(--accent); background:rgba(76,139,245,.18); pointer-events:none; border-radius:3px; }
+  .fill-canvas { position:absolute; inset:0; width:100%; height:100%; cursor:crosshair; touch-action:none; border-radius:6px; }
+  .fill-panel .row { margin-top:8px; }
+  .fill-prompt { width:100%; margin-top:8px; }
 
   .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:10px; }
   .guidance { flex:1; min-width:240px; background:#101113; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:9px 11px; font-size:13px; }
@@ -98,8 +101,8 @@
   <div class="ba">
     <figure><figcaption>Before (source)</figcaption><img class="before" /></figure>
     <figure>
-      <figcaption>After (edit) — drag a box to target a region</figcaption>
-      <div class="after-wrap"><img class="after" draggable="false" /><div class="sel-box" hidden></div></div>
+      <figcaption>After (edit) — drag a box to target a region, or paint a mask for Generative Fill</figcaption>
+      <div class="after-wrap"><img class="after" draggable="false" /><div class="sel-box" hidden></div><canvas class="fill-canvas" hidden></canvas></div>
     </figure>
   </div>
 
@@ -148,6 +151,24 @@
           <button class="secondary savexmp">Save XMP</button>
         </div>
         <div class="hint">Export writes to ./out; Download opens a Save-As. XMP only for RAW.</div>
+      </div>
+      <div class="panel fill-panel" style="margin-top:14px">
+        <h3>Generative Fill · 实验</h3>
+        <div class="row" style="margin-top:0">
+          <label class="chk" title="Paint over the area to regenerate. While on, box-select is paused."><input type="checkbox" class="fill-toggle" /> Paint mask</label>
+          <label class="chk">Brush <input type="range" class="fill-brush" min="8" max="140" step="2" value="44" style="width:90px" /></label>
+          <button class="secondary fill-clear" type="button">Clear</button>
+        </div>
+        <input class="guidance fill-prompt" type="text" placeholder="What should be there, e.g. remove the trash can, extend the sky" />
+        <div class="row">
+          <select class="fill-quality" title="Higher = more detail, higher cost">
+            <option value="high">high</option>
+            <option value="medium">medium</option>
+            <option value="low">low</option>
+          </select>
+          <button class="fill-run" type="button">Remove / Fill</button>
+        </div>
+        <div class="hint">Paint the region, write what belongs there, then Remove/Fill. Only the painted area is regenerated and composited at full resolution; saved to ./out. Needs OPENAI_API_KEY (gpt-image), ~15-40s.</div>
       </div>
     </div>
   </div>
@@ -362,6 +383,7 @@ async function selectPhoto(id, stem, el) {
   const wrap = main.querySelector(".after-wrap");
   const selBox = main.querySelector(".sel-box");
   wrap.onmousedown = e => {
+    if (!main.querySelector(".fill-canvas").hidden) return; // painting a fill mask: don't box-select
     const rect = wrap.getBoundingClientRect();
     drag = { wrap, box: selBox, x0: e.clientX - rect.left, y0: e.clientY - rect.top };
     selBox.hidden = true; e.preventDefault();
@@ -371,6 +393,64 @@ async function selectPhoto(id, stem, el) {
   main.querySelector(".savexmp").onclick = saveXmp;
   main.querySelector(".export").onclick = exportFull;
   main.querySelector(".download").onclick = downloadFull;
+
+  // Generative Fill: paint a mask over the After image; only the painted region
+  // is regenerated (gpt-image) and composited back onto the full-res original.
+  const fc = main.querySelector(".fill-canvas"), fctx = fc.getContext("2d");
+  const afterImg = main.querySelector(".after");
+  const fillToggle = main.querySelector(".fill-toggle"), brush = main.querySelector(".fill-brush");
+  let painting = false, lastPt = null;
+  const sizeFill = () => {
+    const w = afterImg.clientWidth || 600, h = afterImg.clientHeight || 400;
+    if (fc.width !== w || fc.height !== h) { fc.width = w; fc.height = h; }
+  };
+  afterImg.addEventListener("load", () => { if (!fc.hidden) sizeFill(); });
+  fillToggle.onchange = () => {
+    if (fillToggle.checked) {
+      state.region = null; selBox.hidden = true; fc.hidden = false; sizeFill();
+      setStatus("paint over the area to remove/fill, write a prompt, then Remove/Fill");
+    } else { fc.hidden = true; }
+  };
+  const fcPos = e => {
+    const r = fc.getBoundingClientRect();
+    return { x: (e.clientX - r.left) * fc.width / r.width, y: (e.clientY - r.top) * fc.height / r.height };
+  };
+  const paint = (a, b) => {
+    fctx.fillStyle = "rgba(255,64,64,.5)"; fctx.strokeStyle = "rgba(255,64,64,.5)";
+    fctx.lineWidth = +brush.value; fctx.lineCap = "round"; fctx.lineJoin = "round";
+    fctx.beginPath(); fctx.arc(b.x, b.y, brush.value / 2, 0, 7); fctx.fill();
+    if (a) { fctx.beginPath(); fctx.moveTo(a.x, a.y); fctx.lineTo(b.x, b.y); fctx.stroke(); }
+  };
+  fc.addEventListener("pointerdown", e => { painting = true; lastPt = fcPos(e); paint(null, lastPt); fc.setPointerCapture(e.pointerId); });
+  fc.addEventListener("pointermove", e => { if (!painting) return; const p = fcPos(e); paint(lastPt, p); lastPt = p; });
+  fc.addEventListener("pointerup", () => { painting = false; lastPt = null; });
+  main.querySelector(".fill-clear").onclick = () => fctx.clearRect(0, 0, fc.width, fc.height);
+  main.querySelector(".fill-run").onclick = async () => {
+    const prompt = (main.querySelector(".fill-prompt").value || "").trim();
+    if (!prompt) { setStatus("write what should fill the painted area"); return; }
+    const src = fctx.getImageData(0, 0, fc.width, fc.height).data;
+    let any = false; for (let i = 3; i < src.length; i += 4) { if (src[i] > 10) { any = true; break; } }
+    if (!any) { setStatus("paint the area to remove/fill first"); return; }
+    // Build the RGBA mask: painted → transparent (regenerate), unpainted → opaque.
+    const m = document.createElement("canvas"); m.width = fc.width; m.height = fc.height;
+    const mctx = m.getContext("2d"), md = mctx.createImageData(fc.width, fc.height);
+    for (let i = 0; i < src.length; i += 4) { md.data[i + 3] = src[i + 3] > 10 ? 0 : 255; }
+    mctx.putImageData(md, 0, 0);
+    const mask = m.toDataURL("image/png");
+    const quality = main.querySelector(".fill-quality").value || "high";
+    const btn = main.querySelector(".fill-run"); btn.disabled = true;
+    setStatus("generative fill via gpt-image… (~15-40s)");
+    try {
+      const r = await fetch("/api/retouch", {method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ id: state.id, prompt, mask, quality })});
+      if (!r.ok) { setStatus("fill failed: " + await r.text()); return; }
+      const blob = await r.blob();
+      afterImg.src = URL.createObjectURL(blob);
+      fctx.clearRect(0, 0, fc.width, fc.height);
+      const saved = r.headers.get("X-Output-Path");
+      setStatus("filled" + (saved ? " → " + saved : "") + " (saved to ./out; separate from the develop recipe)");
+    } finally { btn.disabled = false; }
+  };
 }
 
 function showVerdict(v) {

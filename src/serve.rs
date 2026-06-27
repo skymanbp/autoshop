@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, Context, Result};
+use base64::Engine as _;
 use image::{DynamicImage, ImageFormat};
 use serde::Deserialize;
 use serde_json::json;
@@ -90,6 +91,7 @@ fn handle(request: Request, state: &AppState) -> Result<()> {
         (true, "/api/upload") => api_upload(request, state),
         (true, "/api/analyze") => api_analyze(request, state),
         (true, "/api/develop") => api_develop(request, state),
+        (true, "/api/retouch") => api_retouch(request, state),
         (true, "/api/export") => api_export(request, state),
         (true, "/api/download") => api_download(request, state),
         (true, "/api/xmp") => api_xmp(request, state),
@@ -292,6 +294,18 @@ struct XmpReq {
     id: usize,
     recipe: EditRecipe,
 }
+#[derive(Deserialize)]
+struct RetouchReq {
+    id: usize,
+    /// What should fill the painted region (e.g. "remove the trash can").
+    prompt: String,
+    /// RGBA PNG mask as a data URL or bare base64 — transparent pixels = the
+    /// region to regenerate (the brush-painted area in the UI).
+    mask: String,
+    /// Output quality tier (low|medium|high|auto). Falls back to the config default.
+    #[serde(default)]
+    quality: Option<String>,
+}
 
 fn api_analyze(mut request: Request, state: &AppState) -> Result<()> {
     let req: AnalyzeReq = read_json(&mut request)?;
@@ -389,6 +403,54 @@ fn api_xmp(mut request: Request, state: &AppState) -> Result<()> {
     let raw = state.at(req.id).ok_or_else(|| anyhow!("bad id"))?;
     let path = pipeline::write_xmp(&raw, &req.recipe)?;
     respond_text(request, &path.display().to_string())
+}
+
+/// Generative fill (Phase 4 in the UI): the browser posts a painted RGBA mask
+/// (transparent = regenerate) + a prompt; we run [`generative::retouch`], which
+/// composites the regenerated region back onto the FULL-resolution source and
+/// writes the master to ./out. We return a resized JPEG of the result for inline
+/// display, with the saved master path in `X-Output-Path`. Needs OPENAI_API_KEY.
+fn api_retouch(mut request: Request, state: &AppState) -> Result<()> {
+    let req: RetouchReq = read_json(&mut request)?;
+    let raw = match state.at(req.id) {
+        Some(r) => r,
+        None => return respond_status(request, 400, "bad id"),
+    };
+    // Accept either a "data:image/png;base64,XXXX" URL or bare base64.
+    let b64 = req.mask.rsplit(',').next().unwrap_or(&req.mask).trim();
+    let mask_bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
+        Ok(b) => b,
+        Err(e) => return respond_status(request, 400, &format!("bad mask base64: {e}")),
+    };
+    // generative::retouch takes a mask FILE path, so stage the PNG in a temp file.
+    let mask_tmp = std::env::temp_dir().join(format!(
+        "autoshop_mask_{}_{}.png",
+        std::process::id(),
+        DL_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    if let Err(e) = std::fs::write(&mask_tmp, &mask_bytes) {
+        return respond_status(request, 500, &format!("stage mask: {e}"));
+    }
+    let out = pipeline::default_out(&raw, "retouch", "png");
+    let quality = req.quality.unwrap_or_else(|| state.cfg.openai_image_quality.clone());
+    let result = crate::generative::retouch(&state.cfg, &raw, &mask_tmp, &req.prompt, &quality, &out);
+    let _ = std::fs::remove_file(&mask_tmp);
+    match result {
+        Ok(()) => {
+            let img = decode::load_image(&out)?
+                .resize(1400, 1400, image::imageops::FilterType::Triangle);
+            let mut buf = Vec::new();
+            img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Jpeg)
+                .context("encode jpeg")?;
+            let ct = Header::from_bytes(&b"Content-Type"[..], &b"image/jpeg"[..]).unwrap();
+            let xp = Header::from_bytes(&b"X-Output-Path"[..], out.display().to_string().as_bytes())
+                .unwrap();
+            request
+                .respond(Response::from_data(buf).with_header(ct).with_header(xp))
+                .map_err(Into::into)
+        }
+        Err(e) => respond_status(request, 500, &format!("retouch failed: {e}")),
+    }
 }
 
 // --- helpers ---------------------------------------------------------------
