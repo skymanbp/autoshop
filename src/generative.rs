@@ -6,15 +6,18 @@
 //!   * **Aspect-correct sizing** — pick 1536×1024 / 1024×1536 / 1024×1024 by
 //!     orientation instead of squashing every photo into a 1:1 square.
 //!   * **Configurable quality tier** (`low|medium|high|auto`, default `high`).
-//!   * **`retouch` composites back at FULL resolution** — only the masked
-//!     (inpainted) region carries generative pixels; the rest of the frame keeps
-//!     the original full-res pixels, with a feathered seam.
+//!   * **`retouch` composites back onto the source's native preview** — only the
+//!     masked (inpainted) region carries generative pixels; the rest keeps the
+//!     original pixels, with a feathered seam. "Native" here is whatever
+//!     [`decode::preview_only`] yields: the camera's EMBEDDED preview for a RAW
+//!     (e.g. ~1616×1080 on a Sony A7RIV — NOT the full sensor), or the actual
+//!     full image for an already-baked PNG/TIFF.
 //!
 //! `reimagine` = full-frame restyle (no mask) → still a generative re-render at
 //! the chosen size, so it stays a low-res experiment / preview, NOT a master.
 //! `retouch` = object removal / generative fill (RGBA mask; transparent pixels =
-//! the region to regenerate) → full-res composite, suitable as a real edit for
-//! the inpainted region.
+//! the region to regenerate) → preview-resolution composite where only the
+//! masked region is generative; the rest is the untouched source preview.
 
 use std::path::Path;
 
@@ -58,8 +61,10 @@ pub fn reimagine(
 
 /// Object removal / generative fill. `mask_path` is an RGBA PNG; transparent
 /// (alpha=0) pixels mark the region to regenerate. The generative result is
-/// composited back over the FULL-resolution source so only the masked region is
-/// re-rendered and everything else stays at native resolution.
+/// composited back over [`decode::preview_only`] of the source so only the
+/// masked region is re-rendered. Note that for a RAW this base is the camera's
+/// embedded preview (e.g. ~1616×1080 on Sony), not the full sensor; for a baked
+/// PNG/TIFF it is the actual full image.
 pub fn retouch(
     cfg: &Config,
     raw_path: &Path,
