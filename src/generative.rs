@@ -61,37 +61,56 @@ pub fn reimagine(
 
 /// Object removal / generative fill. `mask_path` is an RGBA PNG; transparent
 /// (alpha=0) pixels mark the region to regenerate. The generative result is
-/// composited back over [`decode::preview_only`] of the source so only the
-/// masked region is re-rendered. Note that for a RAW this base is the camera's
-/// embedded preview (e.g. ~1616×1080 on Sony), not the full sensor; for a baked
-/// PNG/TIFF it is the actual full image.
+/// composited back over the base so only the masked region is re-rendered.
+///
+/// The base is [`decode::preview_only`] by default — for a RAW that is the
+/// camera's embedded preview (e.g. ~1616×1080 on Sony), not the full sensor.
+/// Set `full_res` to instead composite onto the full-sensor develop (e.g. 61 MP)
+/// so the untouched area keeps native resolution; this is slow and the
+/// regenerated patch is upscaled. For a baked PNG/TIFF the base is already the
+/// full image, so `full_res` changes nothing.
 pub fn retouch(
     cfg: &Config,
     raw_path: &Path,
     mask_path: &Path,
     prompt: &str,
     quality: &str,
+    full_res: bool,
     out: &Path,
 ) -> Result<()> {
-    let base = decode::preview_only(raw_path)?; // full-resolution source
+    // Base to composite onto. Default = the source preview (fast; for a RAW that
+    // is the camera's embedded preview, ~1.6 MP). `full_res` renders the full
+    // sensor through the develop engine (e.g. 61 MP) so the untouched area keeps
+    // native resolution — slow, and only the small masked patch is generative
+    // (upscaled). Baked PNG/TIFF are already full-res, so the flag is a no-op there.
+    let raw = decode::is_raw(raw_path);
+    let base = if full_res && raw {
+        crate::render::render_to_image(raw_path, &crate::recipe::EditRecipe::default(), None)?
+    } else {
+        decode::preview_only(raw_path)?
+    };
     let (bw, bh) = base.dimensions();
     let size = pick_size(bw, bh);
     let (sw, sh) = parse_size(size);
 
-    let png = encode_png(&base.resize_exact(sw, sh, FilterType::Triangle))?;
+    // API input must be 8-bit (the full-res base is 16-bit). Derive the small
+    // image from THIS base so the generated pixels match its look (no seam shift).
+    let small = DynamicImage::ImageRgb8(base.resize_exact(sw, sh, FilterType::Triangle).to_rgb8());
+    let png = encode_png(&small)?;
     let mask_img = image::open(mask_path)
         .with_context(|| format!("open mask {}", mask_path.display()))?;
     let mask_png = encode_png(&mask_img.resize_exact(sw, sh, FilterType::Nearest))?;
 
     println!(
-        "⚠ EXPERIMENTAL generative fill via {} ({size}, quality={quality}; full-res composite)",
-        cfg.openai_image_model
+        "⚠ EXPERIMENTAL generative fill via {} ({size}, quality={quality}, base={bw}x{bh} {}; composite)",
+        cfg.openai_image_model,
+        if full_res && raw { "full-res" } else { "preview" }
     );
     let result = call_images_edit(cfg, &png, Some(&mask_png), prompt, "high", size, quality)?;
 
-    // Composite the regenerated region back onto the full-res original. Upscale
-    // the generative tile to source dimensions; the user's mask (alpha=0 =
-    // regenerate) becomes the blend weight, feathered for a soft seam.
+    // Composite the regenerated region back onto the base. Upscale the generative
+    // tile to base dimensions; the user's mask (alpha=0 = regenerate) becomes the
+    // blend weight, feathered for a soft seam.
     let gen_img = image::load_from_memory(&result)
         .context("decode generative result")?
         .resize_exact(bw, bh, FilterType::Lanczos3)
@@ -105,10 +124,7 @@ pub fn retouch(
     composite
         .save(out)
         .with_context(|| format!("write {}", out.display()))?;
-    println!(
-        "generative fill -> {} ({bw}x{bh}, full-res composite)",
-        out.display()
-    );
+    println!("generative fill -> {} ({bw}x{bh}, composite)", out.display());
     Ok(())
 }
 

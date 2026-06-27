@@ -182,6 +182,11 @@ enum Command {
         /// higher cost). Defaults to AUTOSHOP_IMAGE_QUALITY (config default: high).
         #[arg(long)]
         quality: Option<String>,
+        /// Composite onto the full-sensor develop (e.g. 61 MP) instead of the
+        /// embedded preview — the untouched area keeps native resolution. Slow;
+        /// the regenerated patch is upscaled. No effect on baked PNG/TIFF sources.
+        #[arg(long)]
+        full_res: bool,
         /// Output PNG (default: ./out/<stem>.retouch.png).
         #[arg(short, long)]
         out: Option<PathBuf>,
@@ -217,11 +222,11 @@ fn main() -> Result<()> {
             let q = quality.unwrap_or_else(|| cfg.openai_image_quality.clone());
             generative::reimagine(&cfg, &raw, &prompt, &fidelity, &q, &out)
         }
-        Command::Retouch { raw, mask, prompt, quality, out } => {
+        Command::Retouch { raw, mask, prompt, quality, full_res, out } => {
             let cfg = Config::load();
             let out = out.unwrap_or_else(|| default_out(&raw, "retouch", "png"));
             let q = quality.unwrap_or_else(|| cfg.openai_image_quality.clone());
-            generative::retouch(&cfg, &raw, &mask, &prompt, &q, &out)
+            generative::retouch(&cfg, &raw, &mask, &prompt, &q, full_res, &out)
         }
         Command::Serve { dir, port } => serve::serve(&dir, port),
         Command::RecipeSchema => {

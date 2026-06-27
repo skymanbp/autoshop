@@ -144,8 +144,11 @@ blind, best for real high-ISO/astro), `color_real_gan`, `color_15/25/50`.
   composites it back onto the source's *preview* with a feathered seam, so the
   rest of the frame keeps the original pixels. That preview is the camera's
   embedded JPEG for a RAW (e.g. ~1616×1080 on a Sony A7RIV — not the 61 MP
-  sensor) or the full image for a baked PNG/TIFF. Both pick an aspect-correct
-  size (no square-squash) and default to `quality=high` (override `--quality`).
+  sensor) or the full image for a baked PNG/TIFF. Pass `--full-res` (CLI) or
+  tick **Full-res** (UI) to composite onto the full-sensor develop instead
+  (~60 MP; slow — only the small removed patch is upscaled). Both pick an
+  aspect-correct size (no square-squash) and default to `quality=high`
+  (override `--quality`).
 
 ## Tech
 

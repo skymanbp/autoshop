@@ -305,6 +305,10 @@ struct RetouchReq {
     /// Output quality tier (low|medium|high|auto). Falls back to the config default.
     #[serde(default)]
     quality: Option<String>,
+    /// Composite onto the full-sensor develop (61 MP) instead of the embedded
+    /// preview. Slow; the regenerated patch is upscaled. RAW only.
+    #[serde(default)]
+    full_res: bool,
 }
 
 fn api_analyze(mut request: Request, state: &AppState) -> Result<()> {
@@ -433,7 +437,8 @@ fn api_retouch(mut request: Request, state: &AppState) -> Result<()> {
     }
     let out = pipeline::default_out(&raw, "retouch", "png");
     let quality = req.quality.unwrap_or_else(|| state.cfg.openai_image_quality.clone());
-    let result = crate::generative::retouch(&state.cfg, &raw, &mask_tmp, &req.prompt, &quality, &out);
+    let result =
+        crate::generative::retouch(&state.cfg, &raw, &mask_tmp, &req.prompt, &quality, req.full_res, &out);
     let _ = std::fs::remove_file(&mask_tmp);
     match result {
         Ok(()) => {

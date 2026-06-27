@@ -166,9 +166,10 @@
             <option value="medium">medium</option>
             <option value="low">low</option>
           </select>
+          <label class="chk" title="Composite onto the full-sensor develop (e.g. 61MP) so the untouched area keeps native resolution. Slow (renders the full RAW); the removed patch is upscaled. RAW only."><input type="checkbox" class="fill-fullres" /> Full-res</label>
           <button class="fill-run" type="button">Remove / Fill</button>
         </div>
-        <div class="hint">Paint the region, write what belongs there, then Remove/Fill. Only the painted area is regenerated and composited at full resolution; saved to ./out. Needs OPENAI_API_KEY (gpt-image), ~15-40s.</div>
+        <div class="hint">Paint the region, write what belongs there, then Remove/Fill. Only the painted area is regenerated; the rest is kept. Default composites onto the source preview (fast); Full-res keeps the untouched area at native resolution (slow, RAW only). Saved to ./out. Needs OPENAI_API_KEY (gpt-image), ~15-40s.</div>
       </div>
     </div>
   </div>
@@ -438,11 +439,12 @@ async function selectPhoto(id, stem, el) {
     mctx.putImageData(md, 0, 0);
     const mask = m.toDataURL("image/png");
     const quality = main.querySelector(".fill-quality").value || "high";
+    const fullRes = main.querySelector(".fill-fullres").checked;
     const btn = main.querySelector(".fill-run"); btn.disabled = true;
-    setStatus("generative fill via gpt-image… (~15-40s)");
+    setStatus(fullRes ? "generative fill (full-res render)… (slow, can take minutes)" : "generative fill via gpt-image… (~15-40s)");
     try {
       const r = await fetch("/api/retouch", {method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({ id: state.id, prompt, mask, quality })});
+        body: JSON.stringify({ id: state.id, prompt, mask, quality, full_res: fullRes })});
       if (!r.ok) { setStatus("fill failed: " + await r.text()); return; }
       const blob = await r.blob();
       afterImg.src = URL.createObjectURL(blob);
