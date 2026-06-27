@@ -66,6 +66,10 @@ enum Command {
         /// shadows, keep skin natural".
         #[arg(long)]
         guidance: Option<String>,
+        /// How strongly to follow your historical edit style, 0..1 (needs a built
+        /// `style-index`). Omit to use AUTOSHOP_STYLE_STRENGTH (default 0.3).
+        #[arg(long)]
+        style: Option<f32>,
     },
     /// Render an existing EditRecipe onto a RAW and save the developed image.
     Apply {
@@ -87,6 +91,10 @@ enum Command {
         /// Optional direction for the AI (e.g. "warmer and moodier").
         #[arg(long)]
         guidance: Option<String>,
+        /// How strongly to follow your historical edit style, 0..1 (needs a built
+        /// `style-index`). Omit for AUTOSHOP_STYLE_STRENGTH (default 0.3).
+        #[arg(long)]
+        style: Option<f32>,
         /// Run AI denoise (SCUNet, GPU) before developing — for high-ISO/astro.
         #[arg(long)]
         denoise: bool,
@@ -186,10 +194,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Decode { raw, out } => decode_cmd(&raw, out),
-        Command::Analyze { raw, out, guidance } => analyze_cmd(&raw, out, guidance),
+        Command::Analyze { raw, out, guidance, style } => analyze_cmd(&raw, out, guidance, style),
         Command::Apply { raw, recipe, out } => apply_cmd(&raw, &recipe, &out),
-        Command::Auto { raw, out, guidance, denoise, denoise_strength, denoise_model } => {
-            auto_cmd(&raw, out, guidance, denoise, denoise_strength, denoise_model)
+        Command::Auto { raw, out, guidance, style, denoise, denoise_strength, denoise_model } => {
+            auto_cmd(&raw, out, guidance, style, denoise, denoise_strength, denoise_model)
         }
         Command::Denoise { input, out, strength, model } => denoise_cmd(&input, out, strength, model),
         Command::Batch { dir, render, limit } => batch_cmd(&dir, render, limit),
@@ -272,14 +280,15 @@ fn decode_cmd(raw: &Path, out: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn analyze_cmd(raw: &Path, out: Option<PathBuf>, guidance: Option<String>) -> Result<()> {
+fn analyze_cmd(raw: &Path, out: Option<PathBuf>, guidance: Option<String>, style: Option<f32>) -> Result<()> {
     let cfg = Config::load();
     if let Some(o) = &out {
         pipeline::guard_readonly(o, raw)?;
     }
     // CLI analyze always proposes from the original (base = None); the refine /
     // "adjust current edit" path is a web-UI affordance.
-    let (recipe, verdict) = produce_recipe(raw, &cfg, true, guidance.as_deref(), None)?;
+    let style = style.unwrap_or(cfg.style_strength);
+    let (recipe, verdict) = produce_recipe(raw, &cfg, true, guidance.as_deref(), None, style)?;
     let recipe_path = write_recipe(raw, &recipe, out)?;
 
     println!("\n--- proposed recipe ---");
@@ -318,12 +327,14 @@ fn auto_cmd(
     raw: &Path,
     out: Option<PathBuf>,
     guidance: Option<String>,
+    style: Option<f32>,
     denoise: bool,
     denoise_strength: Option<f32>,
     denoise_model: Option<String>,
 ) -> Result<()> {
     let cfg = Config::load();
-    let (recipe, verdict) = produce_recipe(raw, &cfg, true, guidance.as_deref(), None)?;
+    let style = style.unwrap_or(cfg.style_strength);
+    let (recipe, verdict) = produce_recipe(raw, &cfg, true, guidance.as_deref(), None, style)?;
     write_recipe(raw, &recipe, None)?;
 
     // Default to a 16-bit TIFF master (highest fidelity); pass -o foo.jpg for a
@@ -411,7 +422,8 @@ fn batch_cmd(dir: &Path, render: bool, limit: usize) -> Result<()> {
 }
 
 fn process_one(raw: &Path, cfg: &Config, render_master: bool) -> Result<Verdict> {
-    let (recipe, verdict) = produce_recipe(raw, cfg, false, None, None)?;
+    // Batch uses the configured style strength (AUTOSHOP_STYLE_STRENGTH).
+    let (recipe, verdict) = produce_recipe(raw, cfg, false, None, None, cfg.style_strength)?;
     write_recipe(raw, &recipe, None)?;
     write_xmp(raw, &recipe)?;
     if render_master {

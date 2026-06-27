@@ -103,7 +103,7 @@ fn masks_xml(r: &EditRecipe) -> String {
        crs:LocalExposure2012=\"{exp}\" crs:LocalContrast2012=\"{con}\"\n\
        crs:LocalHighlights2012=\"{hi}\" crs:LocalShadows2012=\"{sh}\"\n\
        crs:LocalWhites2012=\"{wh}\" crs:LocalBlacks2012=\"{bl}\"\n\
-       crs:LocalClarity2012=\"{cl}\" crs:LocalDehaze=\"{dh}\" crs:LocalLuminanceNoise=\"0\"\n\
+       crs:LocalClarity2012=\"{cl}\" crs:LocalDehaze=\"{dh}\" crs:LocalLuminanceNoise=\"{nr}\"\n\
        crs:LocalMoire=\"0\" crs:LocalDefringe=\"0\" crs:LocalTemperature=\"{temp}\"\n\
        crs:LocalTint=\"{tint}\" crs:LocalTexture=\"{tex}\" crs:LocalGrain=\"0\"\n\
        crs:LocalCurveRefineSaturation=\"100\">\n\
@@ -131,6 +131,7 @@ fn masks_xml(r: &EditRecipe) -> String {
             temp = local_fmt(m.temperature / 100.0),
             tint = local_fmt(m.tint / 100.0),
             tex = local_fmt(m.texture / 100.0),
+            nr = local_fmt(m.noise_reduction / 100.0),
             what = what,
             mname = xml_escape(&format!("{name} mask")),
             inv = m.inverted,

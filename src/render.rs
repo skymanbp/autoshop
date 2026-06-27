@@ -257,10 +257,12 @@ fn luma601(p: &[f32; 3]) -> f32 {
 }
 
 /// Apply each local masked adjustment: blend the masked region toward a locally
-/// re-toned version, weighted by the gradient mask × amount. v1 applies local
-/// tone (exposure/contrast/highlights/shadows/whites/blacks) + saturation; local
-/// clarity/dehaze/texture/temp/tint are deferred (the XMP→Lightroom path renders
-/// those). Mask coords are normalised so this works at any resolution.
+/// re-toned version, weighted by the gradient mask × amount. Applies local tone
+/// (exposure/contrast/highlights/shadows/whites/blacks) + saturation, then local
+/// **noise reduction** (smooth luma toward its neighbourhood, inside the mask —
+/// for "this region is noisy" requests). Local clarity/dehaze/texture/temp/tint
+/// are deferred (the XMP→Lightroom path renders those). Mask coords are
+/// normalised so this works at any resolution.
 fn apply_masks(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
     for m in &r.masks {
         let local = EditRecipe {
@@ -275,13 +277,19 @@ fn apply_masks(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
         let lut = build_tone_lut(&local);
         let sat = m.saturation / 100.0;
         let amount = m.amount.clamp(0.0, 1.0);
+        // mask coverage × master amount at a pixel (with optional inversion).
+        let weight_at = |x: usize, y: usize| -> f32 {
+            let mut wgt = mask_weight(&m.mask, x as f32 / w as f32, y as f32 / h as f32);
+            if m.inverted {
+                wgt = 1.0 - wgt;
+            }
+            wgt * amount
+        };
+
+        // --- tone + saturation pass ---
         for y in 0..h {
             for x in 0..w {
-                let mut wgt = mask_weight(&m.mask, x as f32 / w as f32, y as f32 / h as f32);
-                if m.inverted {
-                    wgt = 1.0 - wgt;
-                }
-                wgt *= amount;
+                let wgt = weight_at(x, y);
                 if wgt <= 0.001 {
                     continue;
                 }
@@ -291,6 +299,25 @@ fn apply_masks(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
                 let t = apply_sat_vibrance(t[0], t[1], t[2], sat, 0.0);
                 for c in 0..3 {
                     data[i][c] = p[c] * (1.0 - wgt) + t[c] * wgt;
+                }
+            }
+        }
+
+        // --- local noise reduction pass (only where the mask covers) ---
+        let nr = (m.noise_reduction / 100.0).clamp(0.0, 1.0);
+        if nr > 0.0 {
+            let luma: Vec<f32> = data.iter().map(luma601).collect();
+            let blur = blur_plane(&luma, w, h, 2);
+            for y in 0..h {
+                for x in 0..w {
+                    let nw = weight_at(x, y) * nr;
+                    if nw <= 0.001 {
+                        continue;
+                    }
+                    let i = y * w + x;
+                    let l = luma[i];
+                    let new_l = l + (blur[i] - l) * nw;
+                    scale_chroma(&mut data[i], l, new_l);
                 }
             }
         }
@@ -634,6 +661,33 @@ mod tests {
         apply_develop(&mut data, w, h, &r);
         assert!((data[0][0] - 0.6).abs() < 0.03, "top should be ~unchanged: {}", data[0][0]);
         assert!(data[3][0] < 0.5, "bottom should darken: {}", data[3][0]);
+    }
+
+    #[test]
+    fn local_noise_reduction_smooths_only_inside_the_mask() {
+        // 8x1 strip of alternating luma (= noise). A linear mask covering the
+        // RIGHT half with full local NR should flatten the right; left untouched.
+        let (w, h) = (8usize, 1usize);
+        let mut data: Vec<[f32; 3]> =
+            (0..w).map(|x| { let v = if x % 2 == 0 { 0.3 } else { 0.7 }; [v, v, v] }).collect();
+        let r = EditRecipe {
+            masks: vec![LocalAdjustment {
+                mask: MaskGeometry::Linear { zero_x: 0.5, zero_y: 0.5, full_x: 1.0, full_y: 0.5 },
+                amount: 1.0,
+                noise_reduction: 100.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let var = |d: &[[f32; 3]], rng: std::ops::Range<usize>| {
+            let v: Vec<f32> = rng.map(|i| d[i][0]).collect();
+            let m = v.iter().sum::<f32>() / v.len() as f32;
+            v.iter().map(|x| (x - m).powi(2)).sum::<f32>() / v.len() as f32
+        };
+        let (left0, right0) = (var(&data, 0..4), var(&data, 4..8));
+        apply_develop(&mut data, w, h, &r);
+        assert!(var(&data, 4..8) < right0 * 0.8, "right half should smooth");
+        assert!((var(&data, 0..4) - left0).abs() < 1e-4, "left half untouched");
     }
 
     #[test]

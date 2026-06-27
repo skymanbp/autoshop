@@ -63,6 +63,11 @@ documented slider ranges. Use the `masks` array ONLY when a global edit cannot a
 (e.g. a too-bright sky needing local darkening, or a dim subject needing a local lift) — otherwise \
 leave it empty. Prefer a linear gradient (kind=linear; zero_* = start edge, full_* = end edge, in \
 0..1 frame coords) for skies/horizons/foregrounds; radial (kind=radial) for subjects/vignettes. \
+When the USER DIRECTION names a SPECIFIC AREA (e.g. 'that corner', 'the sky', 'the subject', \
+'top-left', 'this part is too noisy', 'brighten her face') translate it into a mask placed over \
+THAT area and set the relevant local sliders — including local `noise_reduction` (0..100) for a \
+noisy region. Use 1-3 masks for such localized requests; reserve the global sliders for \
+whole-image looks. \
 Local slider values use the same scale as the globals. METADATA: {meta_json}  HISTOGRAM: {hist}",
             meta_json = meta_json,
             hist = hist_summary(hist),
@@ -151,13 +156,15 @@ fn edit_recipe_schema() -> Value {
     let local_adjustment = json!({
         "type": "object", "additionalProperties": false,
         "required": ["mask","name","amount","inverted","exposure_ev","contrast","highlights",
-            "shadows","whites","blacks","clarity","dehaze","texture","saturation","temperature","tint"],
+            "shadows","whites","blacks","clarity","dehaze","texture","saturation","temperature","tint",
+            "noise_reduction"],
         "properties": {
             "mask": mask_geometry,
             "name": {"type": "string"}, "amount": num(), "inverted": {"type": "boolean"},
             "exposure_ev": num(), "contrast": num(), "highlights": num(), "shadows": num(),
             "whites": num(), "blacks": num(), "clarity": num(), "dehaze": num(),
-            "texture": num(), "saturation": num(), "temperature": num(), "tint": num()
+            "texture": num(), "saturation": num(), "temperature": num(), "tint": num(),
+            "noise_reduction": num()
         }
     });
     json!({

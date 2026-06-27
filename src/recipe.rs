@@ -159,6 +159,9 @@ pub struct LocalAdjustment {
     /// Relative warm/cool shift (NOT Kelvin) → `crs:LocalTemperature`.
     pub temperature: f32,
     pub tint: f32,
+    /// Local luminance noise reduction, 0..=100 → `crs:LocalLuminanceNoise`.
+    /// For "this region is noisy" requests; smooths only inside the mask.
+    pub noise_reduction: f32,
 }
 
 impl Default for LocalAdjustment {
@@ -180,6 +183,7 @@ impl Default for LocalAdjustment {
             saturation: 0.0,
             temperature: 0.0,
             tint: 0.0,
+            noise_reduction: 0.0,
         }
     }
 }
@@ -242,6 +246,7 @@ impl EditRecipe {
             ] {
                 *v = (*v).clamp(-100.0, 100.0);
             }
+            m.noise_reduction = m.noise_reduction.clamp(0.0, 100.0);
         }
     }
 

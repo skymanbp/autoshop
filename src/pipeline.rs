@@ -27,6 +27,7 @@ pub fn produce_recipe(
     verbose: bool,
     guidance: Option<&str>,
     base: Option<&EditRecipe>,
+    style_strength: f32,
 ) -> Result<(EditRecipe, Verdict)> {
     // decode_any: a camera RAW, or an already-baked PNG/TIFF/JPEG (PNG-source mode).
     let decoded = decode::decode_any(raw)?;
@@ -52,17 +53,21 @@ pub fn produce_recipe(
         .context("encode preview JPEG for advisor")?;
     let preview = Preview { jpeg };
 
-    // Soft style reference: the user's edits on the most SIMILAR past shots, if a
-    // style index has been built (autoshop style-index). Reference, not a target.
-    let reference = crate::style::StyleIndex::load(std::path::Path::new("out/style-index.json"))
-        .ok()
-        .and_then(|ix| {
+    // Style influence: retrieve the user's edits on the most SIMILAR past shots
+    // (needs `autoshop style-index`). style_strength == 0 disables it entirely;
+    // otherwise we inject a soft text reference AND, at higher strength, gently
+    // pull the FINAL recipe toward those historical means (the blend below).
+    let style = (style_strength > 0.0)
+        .then(|| crate::style::StyleIndex::load(std::path::Path::new("out/style-index.json")).ok())
+        .flatten()
+        .map(|ix| {
             let ex = ix.retrieve(&decoded.meta, &decoded.histogram, 4, stem(raw));
-            ix.render_reference(&ex)
+            (ix.render_reference(&ex), crate::style::style_targets(&ex))
         });
+    let reference: Option<String> = style.as_ref().and_then(|(r, _)| r.clone());
     let ref_str = reference.as_deref();
     if verbose && ref_str.is_some() {
-        println!("style    : using reference from your edits on similar shots");
+        println!("style    : reference from similar past edits (strength {:.0}%)", style_strength * 100.0);
     }
     if verbose
         && let Some(g) = guidance {
@@ -108,6 +113,14 @@ pub fn produce_recipe(
             recipe = openai.propose(&preview, meta, hist, ref_str, guidance, Some(&hint))?;
             verdict = claude.verify(&recipe, meta, hist)?;
         }
+
+    // Distill toward the user's historical style: a gentle, capped pull of the
+    // global sliders toward similar past edits. Capped at 60% so even max
+    // strength never fully overrides the AI's scene-specific proposal.
+    if let Some((_, targets)) = &style {
+        crate::style::blend_toward(&mut recipe, targets, style_strength.clamp(0.0, 1.0) * 0.6);
+        recipe.clamp();
+    }
     Ok((recipe, verdict))
 }
 

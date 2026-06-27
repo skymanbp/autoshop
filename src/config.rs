@@ -30,6 +30,10 @@ pub struct Config {
     pub denoise_script: String,
     /// Where the sidecar caches its model weights.
     pub denoise_cache: String,
+    /// How strongly to lean on the user's historical edit style (similarity
+    /// retrieval), 0.0 (ignore the library) .. 1.0 (strongest pull). Default 0.3.
+    /// The web UI's Style slider and CLI `--style` override this per run.
+    pub style_strength: f32,
 }
 
 impl Config {
@@ -54,6 +58,10 @@ impl Config {
                 .unwrap_or_else(|| "python/denoise.py".to_string()),
             denoise_cache: nonempty("AUTOSHOP_DENOISE_CACHE")
                 .unwrap_or_else(|| "python/weights".to_string()),
+            style_strength: nonempty("AUTOSHOP_STYLE_STRENGTH")
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.3)
+                .clamp(0.0, 1.0),
         }
     }
 }

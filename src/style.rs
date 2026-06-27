@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::decode::{self, Histogram, Meta};
 use crate::eval::crs_f32;
 use crate::pipeline;
+use crate::recipe::EditRecipe;
 
 const NDIM: usize = 14;
 /// Unbounded (log / ratio) dims to z-score; the rest are already ~bounded.
@@ -211,6 +212,61 @@ taste; reference, do NOT copy verbatim, the scene differs): {}",
     }
 }
 
+/// Mean of the retrieved exemplars' slider settings, keyed by the matching
+/// [`EditRecipe`] field name. This is the "distill toward my historical style"
+/// target — applied as a *gentle, capped* pull by [`blend_toward`], never a full
+/// override (per the user's "use as reference, not a target" decision).
+pub fn style_targets(ex: &[&StyleExemplar]) -> BTreeMap<&'static str, f32> {
+    // (xmp settings label from REF_KEYS) → (EditRecipe field name)
+    const MAP: [(&str, &str); 9] = [
+        ("exposure", "exposure_ev"),
+        ("contrast", "contrast"),
+        ("highlights", "highlights"),
+        ("shadows", "shadows"),
+        ("whites", "whites"),
+        ("blacks", "blacks"),
+        ("vibrance", "vibrance"),
+        ("clarity", "clarity"),
+        ("temperature_K", "temperature_k"),
+    ];
+    let mut out = BTreeMap::new();
+    for (label, field) in MAP {
+        let vals: Vec<f32> = ex.iter().filter_map(|e| e.settings.get(label).copied()).collect();
+        if !vals.is_empty() {
+            out.insert(field, vals.iter().sum::<f32>() / vals.len() as f32);
+        }
+    }
+    out
+}
+
+/// Pull `recipe`'s global sliders a fraction `t` (0..1) toward `targets` (your
+/// historical style means). `t = 0` is a no-op; the caller caps `t` so even
+/// "100% style" never fully overrides the AI's scene-specific proposal.
+pub fn blend_toward(recipe: &mut EditRecipe, targets: &BTreeMap<&'static str, f32>, t: f32) {
+    let t = t.clamp(0.0, 1.0);
+    if t <= 0.0 || targets.is_empty() {
+        return;
+    }
+    let lerp = |a: f32, b: f32| a + (b - a) * t;
+    for (field, &target) in targets {
+        match *field {
+            "exposure_ev" => recipe.exposure_ev = lerp(recipe.exposure_ev, target),
+            "contrast" => recipe.contrast = lerp(recipe.contrast, target),
+            "highlights" => recipe.highlights = lerp(recipe.highlights, target),
+            "shadows" => recipe.shadows = lerp(recipe.shadows, target),
+            "whites" => recipe.whites = lerp(recipe.whites, target),
+            "blacks" => recipe.blacks = lerp(recipe.blacks, target),
+            "vibrance" => recipe.vibrance = lerp(recipe.vibrance, target),
+            "clarity" => recipe.clarity = lerp(recipe.clarity, target),
+            "temperature_k" => {
+                let cur = recipe.temperature_k.unwrap_or(target);
+                recipe.temperature_k = Some(lerp(cur, target));
+            }
+            _ => {}
+        }
+    }
+}
+
 fn normalize(mut v: [f32; NDIM], mean: &[f32], std: &[f32]) -> [f32; NDIM] {
     for &d in &ZSCORE_DIMS {
         let s = std.get(d).copied().unwrap_or(1.0).max(1e-4);
@@ -256,5 +312,31 @@ mod tests {
         let tag = derive_tag(&f);
         assert!(tag.starts_with("tele/bright/"), "got {tag}");
         assert!(tag.ends_with("/landscape"), "got {tag}");
+    }
+
+    #[test]
+    fn style_blend_pulls_toward_historical_mean() {
+        let mk = |exp: f32, con: f32| StyleExemplar {
+            stem: "x".into(),
+            feat: vec![0.0; NDIM],
+            tag: "t".into(),
+            settings: BTreeMap::from([
+                ("exposure".to_string(), exp),
+                ("contrast".to_string(), con),
+            ]),
+        };
+        let (a, b) = (mk(0.4, 20.0), mk(0.6, 40.0));
+        let targets = style_targets(&[&a, &b]);
+        assert_eq!(targets.get("exposure_ev").copied(), Some(0.5)); // mean(0.4,0.6)
+        assert_eq!(targets.get("contrast").copied(), Some(30.0)); // mean(20,40)
+
+        let mut r = EditRecipe::default();
+        blend_toward(&mut r, &targets, 0.5); // pull halfway from 0
+        assert!((r.exposure_ev - 0.25).abs() < 1e-5, "{}", r.exposure_ev);
+        assert!((r.contrast - 15.0).abs() < 1e-4, "{}", r.contrast);
+
+        let before = r.clone();
+        blend_toward(&mut r, &targets, 0.0); // strength 0 = no-op
+        assert_eq!(r, before);
     }
 }

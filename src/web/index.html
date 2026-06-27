@@ -39,7 +39,9 @@
   .ba { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
   .ba figure { margin:0; }
   .ba figcaption { color:var(--muted); font-size:12px; margin-bottom:4px; }
-  .ba img { width:100%; border-radius:6px; background:#000; }
+  .ba img { width:100%; border-radius:6px; background:#000; display:block; }
+  .after-wrap { position:relative; cursor:crosshair; }
+  .sel-box { position:absolute; border:2px dashed var(--accent); background:rgba(76,139,245,.18); pointer-events:none; border-radius:3px; }
 
   .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:10px; }
   .guidance { flex:1; min-width:240px; background:#101113; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:9px 11px; font-size:13px; }
@@ -62,6 +64,12 @@
   .rationale { color:var(--muted); font-size:12px; margin-top:8px; font-style:italic; }
   .hint { color:#6b7177; font-size:11px; margin-top:6px; }
   body.dragging::after { content:"⤵  Drop photos to open"; position:fixed; inset:0; z-index:50; display:flex; align-items:center; justify-content:center; font-size:24px; font-weight:700; color:#cfe0ff; background:rgba(18,28,52,.85); border:3px dashed var(--accent); pointer-events:none; }
+  .info-btn { background:#2b2e31; border:1px solid var(--line); color:var(--muted); padding:4px 9px; border-radius:6px; font-size:12px; cursor:pointer; }
+  .info-btn:hover { color:var(--fg); }
+  .popover { position:absolute; top:38px; left:0; z-index:30; max-width:540px; background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:12px 14px; font-size:12px; line-height:1.5; color:var(--fg); box-shadow:0 10px 28px rgba(0,0,0,.55); }
+  .popover h4 { margin:0 0 6px; font-size:12px; color:var(--accent); }
+  .popover .scenes { color:var(--muted); margin-top:8px; }
+  .popover code { background:#101113; padding:1px 5px; border-radius:4px; }
 </style>
 </head>
 <body>
@@ -89,7 +97,10 @@
 <template id="detail-tpl">
   <div class="ba">
     <figure><figcaption>Before (source)</figcaption><img class="before" /></figure>
-    <figure><figcaption>After (edit)</figcaption><img class="after" /></figure>
+    <figure>
+      <figcaption>After (edit) — drag a box to target a region</figcaption>
+      <div class="after-wrap"><img class="after" draggable="false" /><div class="sel-box" hidden></div></div>
+    </figure>
   </div>
 
   <div class="row">
@@ -97,6 +108,15 @@
     <label class="chk" title="On: adjust your CURRENT sliders. Off: propose fresh from the original.">
       <input type="checkbox" class="refine" /> Refine current edit
     </label>
+  </div>
+  <div class="row" style="position:relative">
+    <label class="chk" title="How strongly the AI leans on your past editing style (needs a built style-index; 0% = ignore the library, 100% = strongest pull toward your historical look).">
+      Style influence
+      <input type="range" class="style-strength" min="0" max="100" step="5" value="30" style="width:140px" />
+      <span class="style-val">30%</span>
+    </label>
+    <button type="button" class="info-btn" title="What's in my style library?">ⓘ Library info</button>
+    <div class="popover" hidden></div>
   </div>
   <div class="row">
     <button class="analyze">✨ Analyze</button>
@@ -321,8 +341,33 @@ async function selectPhoto(id, stem, el) {
   resetHistory(state.recipe);
   renderAfter();
 
+  const ss = main.querySelector(".style-strength");
+  ss.oninput = () => { main.querySelector(".style-val").textContent = ss.value + "%"; };
+  const pop = main.querySelector(".popover");
+  main.querySelector(".info-btn").onclick = async () => {
+    if (!pop.hidden) { pop.hidden = true; return; }
+    pop.hidden = false; pop.innerHTML = "Loading…";
+    try {
+      const d = await (await fetch("/api/style-info")).json();
+      if (!d.built) {
+        pop.innerHTML = `<h4>No style library yet</h4>The Style slider needs an index of your past edits. Build it once:<br><br><code>autoshop style-index "D:\\path\\to\\your\\library"</code><br><br>It scans your RAW + .xmp pairs (your Lightroom/ACR edits) so the AI can lean toward how you edited similar shots.`;
+      } else {
+        const scenes = (d.scenes||[]).map(s => `${escapeHtml(s.tag)} ×${s.n}`).join("  ·  ");
+        pop.innerHTML = `<h4>Style library: ${d.total} of your edits indexed</h4>The Style slider leans the AI toward how you edited <i>similar</i> shots (matched by EXIF + histogram). 0% ignores your library; higher pulls the recipe toward your historical look (capped so it never fully overrides the AI).<div class="scenes">Scenes it knows: ${scenes || "—"}</div>`;
+      }
+    } catch (e) { pop.innerHTML = "failed to load style info"; }
+  };
+  // region box-select wiring (the window-level move/up handlers live at module top)
+  state.region = null;
+  const wrap = main.querySelector(".after-wrap");
+  const selBox = main.querySelector(".sel-box");
+  wrap.onmousedown = e => {
+    const rect = wrap.getBoundingClientRect();
+    drag = { wrap, box: selBox, x0: e.clientX - rect.left, y0: e.clientY - rect.top };
+    selBox.hidden = true; e.preventDefault();
+  };
   main.querySelector(".analyze").onclick = analyze;
-  main.querySelector(".reset").onclick = ()=>{ state.recipe = structuredClone(DEFAULT_RECIPE); syncSliders(); pushHistory(state.recipe); renderAfter(); };
+  main.querySelector(".reset").onclick = ()=>{ state.recipe = structuredClone(DEFAULT_RECIPE); state.region = null; selBox.hidden = true; syncSliders(); pushHistory(state.recipe); renderAfter(); };
   main.querySelector(".savexmp").onclick = saveXmp;
   main.querySelector(".export").onclick = exportFull;
   main.querySelector(".download").onclick = downloadFull;
@@ -346,8 +391,10 @@ async function analyze() {
   setStatus(refine ? "refining your current edit with AI…" : "analyzing with GPT + Claude… (~10-30s)");
   const btn = $(".analyze"); btn.disabled = true;
   try {
-    const body = { id: state.id, guidance };
-    if (refine) body.base = state.recipe;        // adjust current edit, don't start over
+    const style = (parseFloat(document.querySelector(".style-strength")?.value ?? "30") || 0) / 100;
+    const body = { id: state.id, guidance, style_strength: style };
+    if (refine) body.base = state.recipe;          // adjust current edit, don't start over
+    if (state.region) body.region = state.region;  // box-select: target this region
     const r = await fetch("/api/analyze", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
     if (!r.ok) { setStatus("analyze failed: " + await r.text()); return; }
     const data = await r.json();
@@ -396,6 +443,33 @@ async function downloadFull() {
     setStatus("downloaded");
   } finally { btn.disabled = false; }
 }
+
+// Region box-select on the After image (Phase 3): drag a box to anchor a local
+// edit; the normalized box is sent with Analyze so the AI masks exactly there.
+const clampv = (v, a, b) => Math.max(a, Math.min(b, v));
+let drag = null;
+window.addEventListener("mousemove", e => {
+  if (!drag) return;
+  const rect = drag.wrap.getBoundingClientRect();
+  const x1 = clampv(e.clientX - rect.left, 0, rect.width), y1 = clampv(e.clientY - rect.top, 0, rect.height);
+  drag.box.hidden = false;
+  drag.box.style.left = Math.min(drag.x0, x1) + "px";
+  drag.box.style.top = Math.min(drag.y0, y1) + "px";
+  drag.box.style.width = Math.abs(x1 - drag.x0) + "px";
+  drag.box.style.height = Math.abs(y1 - drag.y0) + "px";
+});
+window.addEventListener("mouseup", e => {
+  if (!drag) return;
+  const rect = drag.wrap.getBoundingClientRect();
+  const x1 = clampv(e.clientX - rect.left, 0, rect.width), y1 = clampv(e.clientY - rect.top, 0, rect.height);
+  const l = Math.min(drag.x0, x1) / rect.width, t = Math.min(drag.y0, y1) / rect.height;
+  const r = Math.max(drag.x0, x1) / rect.width, b = Math.max(drag.y0, y1) / rect.height;
+  const box = drag.box; drag = null;
+  if (r - l > 0.02 && b - t > 0.02) {
+    state.region = { left: l, top: t, right: r, bottom: b };
+    setStatus(`region set ${Math.round((r-l)*100)}×${Math.round((b-t)*100)}% — type a direction, then Analyze (small click clears)`);
+  } else { state.region = null; box.hidden = true; setStatus(""); }
+});
 
 loadList();
 </script>

@@ -85,6 +85,7 @@ fn handle(request: Request, state: &AppState) -> Result<()> {
         (false, "/api/thumb") => api_image(request, state, 256),
         (false, "/api/preview") => api_image(request, state, 1200),
         (false, "/api/recipe") => api_recipe(request, state),
+        (false, "/api/style-info") => api_style_info(request, state),
         (true, "/api/import") => api_import(request, state),
         (true, "/api/upload") => api_upload(request, state),
         (true, "/api/analyze") => api_analyze(request, state),
@@ -223,6 +224,29 @@ fn api_recipe(request: Request, state: &AppState) -> Result<()> {
         .map_err(Into::into)
 }
 
+/// Style-library info for the UI's info box: is an index built, how many of the
+/// user's edits it holds, and the scene "tags" it covers. Instant (just reads the
+/// JSON; no per-photo decode).
+fn api_style_info(request: Request, _state: &AppState) -> Result<()> {
+    match crate::style::StyleIndex::load(Path::new("out/style-index.json")) {
+        Ok(ix) => {
+            let mut tags: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+            for e in &ix.exemplars {
+                *tags.entry(e.tag.clone()).or_default() += 1;
+            }
+            let mut top: Vec<_> = tags.into_iter().collect();
+            top.sort_by(|a, b| b.1.cmp(&a.1));
+            top.truncate(6);
+            let scenes: Vec<_> = top.into_iter().map(|(t, n)| json!({ "tag": t, "n": n })).collect();
+            respond_json(
+                request,
+                &json!({ "built": true, "total": ix.exemplars.len(), "scenes": scenes }),
+            )
+        }
+        Err(_) => respond_json(request, &json!({ "built": false })),
+    }
+}
+
 #[derive(Deserialize)]
 struct AnalyzeReq {
     id: usize,
@@ -233,6 +257,22 @@ struct AnalyzeReq {
     /// `None` (the default) = propose from the original.
     #[serde(default)]
     base: Option<EditRecipe>,
+    /// 0..1 — how strongly to follow the user's historical style (the Style
+    /// slider). `None` falls back to the configured default.
+    #[serde(default)]
+    style_strength: Option<f32>,
+    /// A box the user dragged on the image (normalized 0..1) to target a local
+    /// edit; the direction is then applied to a mask over that region.
+    #[serde(default)]
+    region: Option<Region>,
+}
+
+#[derive(Deserialize)]
+struct Region {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
 }
 #[derive(Deserialize)]
 struct DevelopReq {
@@ -256,14 +296,26 @@ struct XmpReq {
 fn api_analyze(mut request: Request, state: &AppState) -> Result<()> {
     let req: AnalyzeReq = read_json(&mut request)?;
     let raw = state.at(req.id).ok_or_else(|| anyhow!("bad id"))?;
+    // A dragged region anchors the edit: fold its coords into the direction so the
+    // AI places a mask over exactly that box (reuses the Phase-2 area→mask prompt).
+    let region_guidance = req.region.as_ref().map(|g| {
+        format!(
+            "The user SELECTED a target region (normalized 0..1 frame coords): left={:.3} top={:.3} \
+             right={:.3} bottom={:.3}. Apply the direction ONLY to that region — emit a mask covering \
+             it (a radial mask with those exact left/top/right/bottom bounds and feather ~0.4 is \
+             ideal, or a linear gradient for a thin edge band). Direction: {}",
+            g.left,
+            g.top,
+            g.right,
+            g.bottom,
+            req.guidance.as_deref().unwrap_or("make a tasteful local improvement"),
+        )
+    });
+    let guidance = region_guidance.as_deref().or(req.guidance.as_deref());
     // base = Some → refine the current edit; None → fresh proposal from original.
-    let (recipe, verdict) = pipeline::produce_recipe(
-        &raw,
-        &state.cfg,
-        false,
-        req.guidance.as_deref(),
-        req.base.as_ref(),
-    )?;
+    let style = req.style_strength.unwrap_or(state.cfg.style_strength);
+    let (recipe, verdict) =
+        pipeline::produce_recipe(&raw, &state.cfg, false, guidance, req.base.as_ref(), style)?;
     pipeline::write_recipe(&raw, &recipe, None)?;
     if decode::is_raw(&raw) {
         pipeline::write_xmp(&raw, &recipe)?;

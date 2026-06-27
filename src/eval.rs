@@ -120,7 +120,9 @@ pub fn run(dir: &Path, limit: usize) -> Result<()> {
         let xmp_text = std::fs::read_to_string(raw.with_extension("xmp"))
             .with_context(|| format!("read user xmp for {}", raw.display()))?;
         let user = parse_user_xmp(&xmp_text);
-        let (ai, _verdict) = match pipeline::produce_recipe(raw, &cfg, false, None, None) {
+        // style_strength = 0: eval measures the raw AI proposal vs your edits, so
+        // it must NOT pull toward your historical style (that would bias the gap).
+        let (ai, _verdict) = match pipeline::produce_recipe(raw, &cfg, false, None, None, 0.0) {
             Ok(v) => v,
             Err(e) => {
                 println!("FAILED: {e}");
