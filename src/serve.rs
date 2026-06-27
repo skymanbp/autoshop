@@ -169,7 +169,7 @@ fn api_upload(mut request: Request, state: &AppState) -> Result<()> {
         .headers()
         .iter()
         .find(|h| h.field.equiv("X-Filename"))
-        .map(|h| h.value.as_str().to_string())
+        .map(|h| percent_decode(h.value.as_str()))
         .unwrap_or_default();
     // basename only — never let an upload name escape ./out/imported.
     let safe = Path::new(&name)
@@ -473,6 +473,29 @@ fn raw_for(request: &Request, state: &AppState) -> Result<PathBuf> {
     state.at(id).ok_or_else(|| anyhow!("bad id"))
 }
 
+/// Percent-decode a value (e.g. an `encodeURIComponent`-encoded filename) back to
+/// its UTF-8 string. HTTP header values are ISO-8859-1 only, so the browser must
+/// percent-encode non-ASCII filenames (Chinese, emoji, …) — we decode them here.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) =
+                ((b[i + 1] as char).to_digit(16), (b[i + 2] as char).to_digit(16))
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn query_param(url: &str, key: &str) -> Option<String> {
     let q = url.split_once('?')?.1;
     q.split('&').find_map(|pair| {
@@ -519,4 +542,20 @@ fn respond_status(request: Request, code: u16, msg: &str) -> Result<()> {
     request
         .respond(Response::from_string(msg).with_status_code(code))
         .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percent_decode;
+
+    #[test]
+    fn percent_decode_unicode_and_literals() {
+        assert_eq!(percent_decode("DSC09528.ARW"), "DSC09528.ARW"); // ASCII untouched
+        // encodeURIComponent("测试照片.png")
+        assert_eq!(percent_decode("%E6%B5%8B%E8%AF%95%E7%85%A7%E7%89%87.png"), "测试照片.png");
+        assert_eq!(percent_decode("a%20b.jpg"), "a b.jpg"); // %20 = space
+        assert_eq!(percent_decode("100%25.png"), "100%.png"); // literal percent round-trips
+        assert_eq!(percent_decode("bad%ZZ"), "bad%ZZ"); // invalid escape passes through
+        assert_eq!(percent_decode("tail%E6"), "tail\u{fffd}"); // truncated UTF-8 → replacement
+    }
 }

@@ -275,19 +275,23 @@ $("#import-path").addEventListener("keydown", e => { if (e.key === "Enter") $("#
 // Drag-drop + file picker. Browsers can't give a local server a dropped file's
 // disk PATH (security), so we upload the bytes (saved under ./out/imported).
 async function uploadFiles(files) {
-  let firstId = null, ok = 0;
+  let firstId = null, ok = 0; const failed = [];
   for (const f of files) {
     setStatus(`uploading ${f.name}…`);
     try {
       const buf = await f.arrayBuffer();
-      const r = await fetch("/api/upload", {method:"POST", headers:{"X-Filename": f.name}, body: buf});
-      if (!r.ok) { setStatus("upload failed: " + await r.text()); continue; }
+      // Header values are Latin-1 only, so percent-encode the name — otherwise a
+      // non-ASCII (e.g. Chinese) filename throws and the upload silently fails.
+      // The server percent-decodes it back.
+      const r = await fetch("/api/upload", {method:"POST", headers:{"X-Filename": encodeURIComponent(f.name)}, body: buf});
+      if (!r.ok) { failed.push(`${f.name}: ${await r.text()}`); continue; }
       const d = await r.json();
       if (firstId == null) firstId = d.id;
       ok++;
-    } catch (e) { setStatus("upload error: " + e); }
+    } catch (e) { failed.push(`${f.name}: ${e.message || e}`); }
   }
-  if (ok) { setStatus(`opened ${ok} file${ok>1?"s":""}`); revealNew(firstId); }
+  if (ok) { setStatus(`opened ${ok} file${ok>1?"s":""}${failed.length?` · ${failed.length} failed`:""}`); revealNew(firstId); }
+  else if (failed.length) { setStatus(`could not open: ${failed[0]}`); }
 }
 
 $("#open-files").onclick = () => $("#file-input").click();
