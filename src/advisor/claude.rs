@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::decode::{Histogram, Meta};
 use crate::recipe::EditRecipe;
 
-use super::{balanced_objects, hist_summary, strip_code_fence, Advisor, AdvisorError, Verdict};
+use super::{balanced_objects, build_verify_prompt, strip_code_fence, Advisor, AdvisorError, Verdict};
 
 pub struct ClaudeProvider {
     bin: String,
@@ -25,7 +25,7 @@ impl ClaudeProvider {
     pub fn new(cfg: &Config) -> Self {
         Self {
             bin: cfg.claude_bin.clone(),
-            model: cfg.claude_model.clone(),
+            model: cfg.analysis_model.clone(),
         }
     }
 }
@@ -101,28 +101,4 @@ impl Advisor for ClaudeProvider {
         };
         Ok(verdict)
     }
-}
-
-fn build_verify_prompt(
-    recipe: &EditRecipe,
-    meta: &Meta,
-    hist: &Histogram,
-) -> Result<String, AdvisorError> {
-    let recipe_json = serde_json::to_string_pretty(recipe)?;
-    let meta_json = serde_json::to_string(meta)?;
-    Ok(format!(
-        "You are a photo-edit QA verifier. You do NOT see the image — judge ONLY from the data below.\n\
-Decide whether this proposed RAW develop recipe is safe to apply. Check, concretely:\n\
-- every slider is within its documented range (exposure_ev -5..5; most sliders -100..100; sharpening 0..150; confidence 0..1);\n\
-- adjustments are consistent with the metadata + histogram (e.g. do NOT brighten when highlights already clip; do NOT crush shadows that are already dark; large moves need justification);\n\
-- the rationale matches the numbers and confidence is adequate to auto-apply.\n\n\
-METADATA: {meta_json}\n\
-HISTOGRAM: {hist}\n\
-PROPOSED RECIPE:\n{recipe_json}\n\n\
-Output ONLY the JSON object: no reasoning, no preamble, no markdown fence. Your entire reply must start with '{{' and end with '}}'. Shape:\n\
-{{\"decision\":\"accept\"|\"revise\"|\"reject\",\"reasons\":[\"short reason\", ...],\"revised_hint\":\"a short instruction for the next attempt if revise/reject, else null\"}}",
-        meta_json = meta_json,
-        hist = hist_summary(hist),
-        recipe_json = recipe_json,
-    ))
 }

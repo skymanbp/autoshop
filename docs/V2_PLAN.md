@@ -62,7 +62,7 @@ Companion changes required by the schema addition (all `[verified]` against curr
 
 ### 2a. XMP write format
 
-The masks element is a sibling of `<crs:ToneCurvePV2012>`, emitted before `</rdf:Description>` (`src/xmp.rs:116`). Empty `masks` ⇒ emit nothing. Structure is byte-faithful to the user's real sidecar `D:/Photography/Raw/2023/23-06-Cornwall-Raw/DSC08724.xmp` lines 231–281 [verified: file read].
+The masks element is a sibling of `<crs:ToneCurvePV2012>`, emitted before `</rdf:Description>` (`src/xmp.rs:116`). Empty `masks` ⇒ emit nothing. Structure is byte-faithful to the user's real sidecar `<library>/Raw/2023/23-06-Cornwall-Raw/DSC08724.xmp` lines 231–281 [verified: file read].
 
 ```xml
 <crs:MaskGroupBasedCorrections>

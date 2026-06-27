@@ -1,16 +1,25 @@
 @echo off
 REM ==========================================================================
-REM  Autoshop web UI launcher.
-REM  - Double-click  -> serves your whole library (D:\Photography\Raw).
-REM  - Drag a folder onto this file -> serves just that folder (faster).
-REM  Opens the browser automatically. Outputs go to D:\Projects\Autoshop\out.
+REM  Autoshop web UI launcher (portable - resolves paths from this file's
+REM  own folder, so it works wherever the repo is cloned).
+REM  - Double-click             -> serves %USERPROFILE%\Pictures
+REM  - Drag a folder onto this  -> serves just that folder (faster).
+REM  Opens the browser automatically. Outputs go to <project>\out.
 REM ==========================================================================
 
-REM cd into the project so .env (OpenAI key) and ./out resolve correctly.
-cd /d "D:\Projects\Autoshop"
+REM cd into the project (this .bat's own folder) so .env and ./out resolve.
+cd /d "%~dp0"
 
 set "DIR=%~1"
-if "%DIR%"=="" set "DIR=D:\Photography\Raw"
+if "%DIR%"=="" set "DIR=%USERPROFILE%\Pictures"
+
+set "EXE=%~dp0target\release\autoshop.exe"
+if not exist "%EXE%" (
+  echo   autoshop.exe not found. Build it first:  cargo build --release
+  echo   ^(expected at: %EXE%^)
+  pause
+  exit /b 1
+)
 
 echo.
 echo   Autoshop UI  -  serving: %DIR%
@@ -21,4 +30,4 @@ echo.
 REM Open the browser shortly after the server starts (detached).
 start "" cmd /c "timeout /t 2 /nobreak >nul & start "" http://127.0.0.1:8080"
 
-"D:\Projects\Autoshop\target\release\autoshop.exe" serve "%DIR%" --port 8080
+"%EXE%" serve "%DIR%" --port 8080

@@ -94,12 +94,19 @@ develop pipeline runs on either. RAWs also get an `.xmp`; baked sources get
 
 ## AI setup
 
-| Provider | What | Needs |
-|----------|------|-------|
-| **Claude** (verifier) | acceptance-verifies each recipe | the `claude` CLI on PATH, signed in (reuses Claude Code OAuth — **no API key**) |
-| **GPT** (vision advisor) | looks at the photo → `EditRecipe` | `OPENAI_API_KEY` in a gitignored `.env`. Without it, a histogram heuristic is used. |
+Two roles, each configurable in the in-app **Settings (⚙)** panel (or via env):
 
-`.env` example (never committed):
+| Role | What | Default | Other option |
+|------|------|---------|--------------|
+| **分析 / Analysis** (verifier) | data-only acceptance-check of each recipe | **OAuth** — the `claude` CLI on PATH, signed in (reuses Claude Code OAuth, **no API key**), model `opus` | **API** — any OpenAI-compatible chat endpoint (base URL + key + model) |
+| **图像 / Image** (vision advisor) | looks at the photo → `EditRecipe` | **API** — `OPENAI_API_KEY`, model `gpt-5.5` | point the base URL at any OpenAI-compatible **vision** endpoint. Without a key, a histogram heuristic is used. |
+
+The `claude` CLI has no image input in print mode, so the image role is
+**API-only** (the Settings panel shows its OAuth option as unavailable).
+
+Configure keys + models from the **Settings** panel — written to the gitignored
+`autoshop.local.json`, which overrides the environment. Keys never leave your
+machine (the server is `127.0.0.1` only). You can also use `.env`:
 
 ```
 OPENAI_API_KEY=sk-...
@@ -122,11 +129,19 @@ blind, best for real high-ISO/astro), `color_real_gan`, `color_15/25/50`.
 
 ## Configuration (env vars)
 
+Everything below is also settable in the **Settings (⚙)** panel; the local file
+`autoshop.local.json` (gitignored) overrides the environment.
+
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `OPENAI_API_KEY` | — | GPT vision advisor + generative |
-| `AUTOSHOP_OPENAI_MODEL` | `gpt-5.5` | vision model id |
-| `AUTOSHOP_CLAUDE_MODEL` | `claude-sonnet-4-6` | verifier model |
+| `OPENAI_API_KEY` | — | image (vision) advisor + generative key |
+| `AUTOSHOP_OPENAI_MODEL` | `gpt-5.5` | image/vision model id |
+| `AUTOSHOP_OPENAI_BASE_URL` | `https://api.openai.com/v1` | image API base (any OpenAI-compatible) |
+| `AUTOSHOP_OPENAI_IMAGE_MODEL` | `gpt-image-1.5` | generative (retouch/reimagine) model |
+| `AUTOSHOP_ANALYSIS_PROVIDER` | `oauth` | verifier provider: `oauth` (claude CLI) or `api` |
+| `AUTOSHOP_ANALYSIS_MODEL` | `opus` | verifier model (claude alias for oauth; chat id for api) |
+| `AUTOSHOP_ANALYSIS_API_KEY` | — | verifier key when provider = `api` |
+| `AUTOSHOP_ANALYSIS_BASE_URL` | `https://api.openai.com/v1` | verifier API base when provider = `api` |
 | `AUTOSHOP_PYTHON` | `python` | interpreter for the denoise sidecar |
 | `AUTOSHOP_DENOISE_MODEL` | `color_real_psnr` | default SCUNet weights |
 

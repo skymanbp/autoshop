@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tiny_http::{Header, Request, Response, Server};
 
-use crate::config::Config;
+use crate::config::{Config, LocalSettings};
 use crate::decode;
 use crate::denoise::DenoiseOpts;
 use crate::pipeline;
@@ -34,7 +34,9 @@ struct AppState {
     dir: PathBuf,
     /// The source list, mutable so the UI can import more at runtime.
     raws: RwLock<Vec<PathBuf>>,
-    cfg: Config,
+    /// Config behind a lock so the Settings panel can hot-reload it (POST
+    /// /api/settings rewrites the local file, then swaps in a fresh `Config`).
+    cfg: RwLock<Config>,
 }
 
 impl AppState {
@@ -45,6 +47,10 @@ impl AppState {
     fn count(&self) -> usize {
         self.raws.read().map(|r| r.len()).unwrap_or(0)
     }
+    /// Current config snapshot (read guard; recovers from a poisoned lock).
+    fn config(&self) -> std::sync::RwLockReadGuard<'_, Config> {
+        self.cfg.read().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 pub fn serve(dir: &Path, port: u16) -> Result<()> {
@@ -54,14 +60,15 @@ pub fn serve(dir: &Path, port: u16) -> Result<()> {
     let state = Arc::new(AppState {
         dir: dir.to_path_buf(),
         raws: RwLock::new(raws),
-        cfg: Config::load(),
+        cfg: RwLock::new(Config::load()),
     });
     let addr = format!("127.0.0.1:{port}");
     let server = Server::http(&addr).map_err(|e| anyhow!("start server on {addr}: {e}"))?;
     println!("Autoshop UI: {n} source(s) under {}", dir.display());
     println!("  open  →  http://{addr}");
-    if state.cfg.openai_api_key.is_none() {
-        println!("  note: OPENAI_API_KEY not set — Analyze will use the heuristic baseline.");
+    if state.config().openai_api_key.is_none() {
+        println!("  note: no image API key set — Analyze will use the heuristic baseline.");
+        println!("        configure providers + keys in the in-app Settings (⚙) panel.");
     }
 
     for request in server.incoming_requests() {
@@ -87,6 +94,8 @@ fn handle(request: Request, state: &AppState) -> Result<()> {
         (false, "/api/preview") => api_image(request, state, 1200),
         (false, "/api/recipe") => api_recipe(request, state),
         (false, "/api/style-info") => api_style_info(request, state),
+        (false, "/api/settings") => api_settings_get(request, state),
+        (true, "/api/settings") => api_settings_post(request, state),
         (true, "/api/import") => api_import(request, state),
         (true, "/api/upload") => api_upload(request, state),
         (true, "/api/analyze") => api_analyze(request, state),
@@ -331,9 +340,10 @@ fn api_analyze(mut request: Request, state: &AppState) -> Result<()> {
     });
     let guidance = region_guidance.as_deref().or(req.guidance.as_deref());
     // base = Some → refine the current edit; None → fresh proposal from original.
-    let style = req.style_strength.unwrap_or(state.cfg.style_strength);
+    let cfg = state.config();
+    let style = req.style_strength.unwrap_or(cfg.style_strength);
     let (recipe, verdict) =
-        pipeline::produce_recipe(&raw, &state.cfg, false, guidance, req.base.as_ref(), style)?;
+        pipeline::produce_recipe(&raw, &cfg, false, guidance, req.base.as_ref(), style)?;
     pipeline::write_recipe(&raw, &recipe, None)?;
     if decode::is_raw(&raw) {
         pipeline::write_xmp(&raw, &recipe)?;
@@ -369,7 +379,7 @@ fn api_export(mut request: Request, state: &AppState) -> Result<()> {
     let raw = state.at(req.id).ok_or_else(|| anyhow!("bad id"))?;
     let out = pipeline::default_out(&raw, "developed", fmt_ext(&req));
     pipeline::ensure_parent(&out)?;
-    render::render_to_file(&raw, &req.recipe, &out, denoise_opts(&req, &state.cfg).as_ref())?;
+    render::render_to_file(&raw, &req.recipe, &out, denoise_opts(&req, &state.config()).as_ref())?;
     respond_text(request, &out.display().to_string())
 }
 
@@ -384,7 +394,7 @@ fn api_download(mut request: Request, state: &AppState) -> Result<()> {
         std::process::id(),
         DL_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    render::render_to_file(&raw, &req.recipe, &tmp, denoise_opts(&req, &state.cfg).as_ref())?;
+    render::render_to_file(&raw, &req.recipe, &tmp, denoise_opts(&req, &state.config()).as_ref())?;
     let bytes = std::fs::read(&tmp).with_context(|| format!("read {}", tmp.display()))?;
     let _ = std::fs::remove_file(&tmp);
     let ctype = if ext == "jpg" { "image/jpeg" } else { "image/tiff" };
@@ -436,9 +446,11 @@ fn api_retouch(mut request: Request, state: &AppState) -> Result<()> {
         return respond_status(request, 500, &format!("stage mask: {e}"));
     }
     let out = pipeline::default_out(&raw, "retouch", "png");
-    let quality = req.quality.unwrap_or_else(|| state.cfg.openai_image_quality.clone());
+    let cfg = state.config();
+    let quality = req.quality.unwrap_or_else(|| cfg.openai_image_quality.clone());
     let result =
-        crate::generative::retouch(&state.cfg, &raw, &mask_tmp, &req.prompt, &quality, req.full_res, &out);
+        crate::generative::retouch(&cfg, &raw, &mask_tmp, &req.prompt, &quality, req.full_res, &out);
+    drop(cfg);
     let _ = std::fs::remove_file(&mask_tmp);
     match result {
         Ok(()) => {
@@ -456,6 +468,69 @@ fn api_retouch(mut request: Request, state: &AppState) -> Result<()> {
         }
         Err(e) => respond_status(request, 500, &format!("retouch failed: {e}")),
     }
+}
+
+/// Current provider/model settings for the Settings panel. Never returns the raw
+/// API keys — only whether each is present.
+fn api_settings_get(request: Request, state: &AppState) -> Result<()> {
+    let cfg = state.config();
+    let body = json!({
+        "analysis": {
+            "provider": cfg.analysis_provider,
+            "model": cfg.analysis_model,
+            "base_url": cfg.analysis_base_url,
+            "key_present": cfg.analysis_api_key.is_some(),
+        },
+        "image": {
+            "model": cfg.openai_model,
+            "base_url": cfg.openai_base_url,
+            "gen_model": cfg.openai_image_model,
+            "key_present": cfg.openai_api_key.is_some(),
+        },
+        // The `claude` CLI has no image input in print mode → image-via-OAuth is
+        // not available; the image role always uses an OpenAI-compatible API.
+        "image_oauth_supported": false,
+        "settings_file": crate::config::local_settings_path().display().to_string(),
+    });
+    respond_json(request, &body)
+}
+
+/// Persist provider/model/key changes to the gitignored local file, then
+/// hot-reload the running config. Blank key fields are left unchanged (the GET
+/// side never reveals existing keys, so the UI sends a key only when it changes).
+fn api_settings_post(mut request: Request, state: &AppState) -> Result<()> {
+    let inc: LocalSettings = read_json(&mut request)?;
+    let mut cur = crate::config::load_local_settings();
+    // Non-secret fields: take whatever the UI sent (empty ⇒ falls back to default).
+    if inc.analysis_provider.is_some() {
+        cur.analysis_provider = inc.analysis_provider;
+    }
+    if inc.analysis_model.is_some() {
+        cur.analysis_model = inc.analysis_model;
+    }
+    if inc.analysis_base_url.is_some() {
+        cur.analysis_base_url = inc.analysis_base_url;
+    }
+    if inc.image_model.is_some() {
+        cur.image_model = inc.image_model;
+    }
+    if inc.image_base_url.is_some() {
+        cur.image_base_url = inc.image_base_url;
+    }
+    if inc.image_gen_model.is_some() {
+        cur.image_gen_model = inc.image_gen_model;
+    }
+    // Secrets: only overwrite when a non-empty value was actually provided.
+    if let Some(k) = inc.analysis_api_key.filter(|s| !s.trim().is_empty()) {
+        cur.analysis_api_key = Some(k);
+    }
+    if let Some(k) = inc.image_api_key.filter(|s| !s.trim().is_empty()) {
+        cur.image_api_key = Some(k);
+    }
+
+    let path = crate::config::save_local_settings(&cur).map_err(|e| anyhow!("write settings: {e}"))?;
+    *state.cfg.write().unwrap_or_else(|e| e.into_inner()) = Config::load();
+    respond_json(request, &json!({ "ok": true, "saved": path.display().to_string() }))
 }
 
 // --- helpers ---------------------------------------------------------------

@@ -73,6 +73,19 @@
   .popover h4 { margin:0 0 6px; font-size:12px; color:var(--accent); }
   .popover .scenes { color:var(--muted); margin-top:8px; }
   .popover code { background:#101113; padding:1px 5px; border-radius:4px; }
+
+  /* Settings modal */
+  .modal-bg { position:fixed; inset:0; z-index:60; background:rgba(0,0,0,.6); display:flex; align-items:flex-start; justify-content:center; padding:5vh 16px; overflow:auto; }
+  .modal-card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:18px 20px; width:580px; max-width:100%; box-shadow:0 20px 60px rgba(0,0,0,.55); }
+  .modal-card h2 { font-size:16px; margin:0 0 6px; display:flex; justify-content:space-between; align-items:center; }
+  .modal-x { background:#2b2e31; border:1px solid var(--line); color:var(--muted); border-radius:6px; padding:2px 9px; cursor:pointer; font-size:13px; }
+  .modal-note { color:var(--muted); font-size:11px; margin:0 0 12px; }
+  .settings-sec { border-top:1px solid var(--line); padding:12px 0; }
+  .settings-sec h3 { font-size:13px; color:var(--accent); text-transform:none; letter-spacing:0; margin:0 0 10px; font-weight:600; }
+  .srow { display:flex; gap:10px; align-items:center; margin:7px 0; flex-wrap:wrap; }
+  .srow > label:first-child { width:100px; color:var(--muted); font-size:12px; flex:none; }
+  .sinput { flex:1; min-width:180px; background:#101113; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:7px 9px; font-size:12px; }
+  .keystat { font-size:11px; color:#5ec27e; min-width:60px; }
 </style>
 </head>
 <body>
@@ -86,6 +99,8 @@
     <span class="sep"></span>
     <button class="secondary" id="undo" disabled title="Undo (Ctrl+Z)">↶ Undo</button>
     <button class="secondary" id="redo" disabled title="Redo (Ctrl+Y)">↷ Redo</button>
+    <span class="sep"></span>
+    <button class="secondary" id="settings-btn" title="AI provider / model / API key settings">⚙ Settings</button>
   </div>
   <span id="status"></span>
 </header>
@@ -174,6 +189,43 @@
     </div>
   </div>
 </template>
+
+<div class="modal-bg" id="settings-modal" hidden>
+  <div class="modal-card">
+    <h2>Settings <button class="modal-x" id="settings-close" title="Close">✕</button></h2>
+    <p class="modal-note">Saved locally to <code id="settings-file">autoshop.local.json</code> (gitignored). Keys stay on this machine — the server is 127.0.0.1 only. Applies to the next Analyze.</p>
+
+    <section class="settings-sec">
+      <h3>分析 / Analysis — the verifier</h3>
+      <div class="srow">
+        <label>Provider</label>
+        <label class="chk"><input type="radio" name="an-provider" value="oauth" /> OAuth (Claude CLI)</label>
+        <label class="chk"><input type="radio" name="an-provider" value="api" /> API (OpenAI-compatible)</label>
+      </div>
+      <div class="srow"><label>Model</label><input id="an-model" class="sinput" placeholder="opus (OAuth alias) — or a chat model id for API" /></div>
+      <div class="srow an-api"><label>Base URL</label><input id="an-base" class="sinput" placeholder="https://api.openai.com/v1" /></div>
+      <div class="srow an-api"><label>API Key</label><input id="an-key" class="sinput" type="password" placeholder="leave blank to keep current" /><span class="keystat" id="an-keystat"></span></div>
+    </section>
+
+    <section class="settings-sec">
+      <h3>图像 / Image — the vision proposer</h3>
+      <div class="srow">
+        <label>Provider</label>
+        <label class="chk"><input type="radio" name="im-provider" value="api" checked /> API (OpenAI-compatible)</label>
+        <label class="chk" title="The claude CLI has no image input in print mode, so Claude-via-OAuth can't do vision."><input type="radio" disabled /> OAuth (unavailable)</label>
+      </div>
+      <div class="srow"><label>Vision model</label><input id="im-model" class="sinput" placeholder="gpt-5.5" /></div>
+      <div class="srow"><label>Base URL</label><input id="im-base" class="sinput" placeholder="https://api.openai.com/v1" /></div>
+      <div class="srow"><label>API Key</label><input id="im-key" class="sinput" type="password" placeholder="leave blank to keep current" /><span class="keystat" id="im-keystat"></span></div>
+      <div class="srow"><label>Image-gen model</label><input id="im-gen" class="sinput" placeholder="gpt-image-1.5" /></div>
+    </section>
+
+    <div class="srow" style="justify-content:flex-end; margin-top:10px">
+      <span id="settings-status" class="modal-note" style="margin:0"></span>
+      <button id="settings-save">Save settings</button>
+    </div>
+  </div>
+</div>
 
 <script>
 const SLIDERS = [
@@ -556,6 +608,53 @@ window.addEventListener("mouseup", e => {
     setStatus(`region set ${Math.round((r-l)*100)}×${Math.round((b-t)*100)}% — type a direction, then Analyze (small click clears)`);
   } else { state.region = null; box.hidden = true; setStatus(""); }
 });
+
+// --- settings (provider / model / API keys) --------------------------------
+const settingsModal = $("#settings-modal");
+const anApiVisible = on => document.querySelectorAll(".an-api").forEach(e => e.style.display = on ? "flex" : "none");
+document.querySelectorAll('input[name="an-provider"]').forEach(r =>
+  r.onchange = () => anApiVisible(document.querySelector('input[name="an-provider"]:checked').value === "api"));
+$("#settings-btn").onclick = openSettings;
+$("#settings-close").onclick = () => settingsModal.hidden = true;
+settingsModal.onclick = e => { if (e.target === settingsModal) settingsModal.hidden = true; };
+
+async function openSettings() {
+  settingsModal.hidden = false;
+  $("#settings-status").textContent = "";
+  try {
+    const d = await (await fetch("/api/settings")).json();
+    $("#settings-file").textContent = d.settings_file || "autoshop.local.json";
+    const ap = d.analysis.provider === "api" ? "api" : "oauth";
+    document.querySelector(`input[name="an-provider"][value="${ap}"]`).checked = true;
+    anApiVisible(ap === "api");
+    $("#an-model").value = d.analysis.model || "";
+    $("#an-base").value = d.analysis.base_url || "";
+    $("#an-key").value = "";
+    $("#an-keystat").textContent = d.analysis.key_present ? "key set ✓" : "no key";
+    $("#im-model").value = d.image.model || "";
+    $("#im-base").value = d.image.base_url || "";
+    $("#im-gen").value = d.image.gen_model || "";
+    $("#im-key").value = "";
+    $("#im-keystat").textContent = d.image.key_present ? "key set ✓" : "no key";
+  } catch (e) { $("#settings-status").textContent = "failed to load settings"; }
+}
+
+$("#settings-save").onclick = async () => {
+  const body = {
+    analysis_provider: document.querySelector('input[name="an-provider"]:checked').value,
+    analysis_model: $("#an-model").value.trim(),
+    analysis_base_url: $("#an-base").value.trim(),
+    analysis_api_key: $("#an-key").value,          // blank ⇒ keep current
+    image_model: $("#im-model").value.trim(),
+    image_base_url: $("#im-base").value.trim(),
+    image_gen_model: $("#im-gen").value.trim(),
+    image_api_key: $("#im-key").value,             // blank ⇒ keep current
+  };
+  $("#settings-status").textContent = "saving…";
+  const r = await fetch("/api/settings", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+  if (r.ok) { $("#settings-status").textContent = "saved ✓ — applies to the next Analyze"; setStatus("settings saved"); }
+  else { $("#settings-status").textContent = "save failed: " + await r.text(); }
+};
 
 loadList();
 </script>

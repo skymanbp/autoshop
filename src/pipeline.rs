@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::advisor::{
-    Advisor, ClaudeProvider, Decision, HeuristicProposer, OpenAiProvider, Preview, Verdict,
+    Advisor, ClaudeProvider, Decision, HeuristicProposer, OpenAiProvider, OpenAiVerifier, Preview,
+    Verdict,
 };
 use crate::config::Config;
 use crate::decode;
@@ -98,11 +99,18 @@ pub fn produce_recipe(
         (heuristic.propose(&preview, meta, hist, None, None, None)?, false)
     };
 
-    let claude = ClaudeProvider::new(cfg);
+    // Verifier (analysis role): OAuth `claude` CLI by default, or an
+    // OpenAI-compatible API when the analysis provider is set to `api`.
+    let verifier: Box<dyn Advisor> = if cfg.analysis_is_api() {
+        Box::new(OpenAiVerifier::new(cfg))
+    } else {
+        Box::new(ClaudeProvider::new(cfg))
+    };
     if verbose {
-        println!("verifier : Claude ({})", cfg.claude_model);
+        let who = if cfg.analysis_is_api() { "OpenAI-API" } else { "Claude (OAuth)" };
+        println!("verifier : {who} ({})", cfg.analysis_model);
     }
-    let mut verdict = claude.verify(&recipe, meta, hist)?;
+    let mut verdict = verifier.verify(&recipe, meta, hist)?;
 
     // One revision round — only if GPT actually produced the recipe.
     if verdict.decision != Decision::Accept && can_revise
@@ -111,7 +119,7 @@ pub fn produce_recipe(
                 println!("verdict was {:?} → one revision round (hint: {hint})", verdict.decision);
             }
             recipe = openai.propose(&preview, meta, hist, ref_str, guidance, Some(&hint))?;
-            verdict = claude.verify(&recipe, meta, hist)?;
+            verdict = verifier.verify(&recipe, meta, hist)?;
         }
 
     // Distill toward the user's historical style: a gentle, capped pull of the

@@ -16,9 +16,11 @@
 /python/weights/
 **/__pycache__/
 
-# Local config that may hold secrets (e.g. OpenAI key for the optional GPT path)
+# Local config that may hold secrets (OpenAI/analysis API keys, model choices).
+# Written by the in-app Settings panel; never commit it.
 .env
 autoshop.local.toml
+autoshop.local.json
 
 # OS / editor cruft
 Thumbs.db
