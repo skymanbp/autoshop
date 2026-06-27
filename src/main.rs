@@ -159,6 +159,10 @@ enum Command {
         /// "high" keeps it recognizably the same photo; "low" = free rein.
         #[arg(long, default_value = "high")]
         fidelity: String,
+        /// Output quality tier: low | medium | high | auto (higher = more detail,
+        /// higher cost). Defaults to AUTOSHOP_IMAGE_QUALITY (config default: high).
+        #[arg(long)]
+        quality: Option<String>,
         /// Output PNG (default: ./out/<stem>.reimagine.png).
         #[arg(short, long)]
         out: Option<PathBuf>,
@@ -174,6 +178,10 @@ enum Command {
         /// What to do (e.g. "remove the trash can, fill with pavement").
         #[arg(long)]
         prompt: String,
+        /// Output quality tier: low | medium | high | auto (higher = more detail,
+        /// higher cost). Defaults to AUTOSHOP_IMAGE_QUALITY (config default: high).
+        #[arg(long)]
+        quality: Option<String>,
         /// Output PNG (default: ./out/<stem>.retouch.png).
         #[arg(short, long)]
         out: Option<PathBuf>,
@@ -203,15 +211,17 @@ fn main() -> Result<()> {
         Command::Batch { dir, render, limit } => batch_cmd(&dir, render, limit),
         Command::Eval { dir, limit } => eval::run(&dir, limit),
         Command::StyleIndex { dir } => style_index_cmd(&dir),
-        Command::Reimagine { raw, prompt, fidelity, out } => {
+        Command::Reimagine { raw, prompt, fidelity, quality, out } => {
             let cfg = Config::load();
             let out = out.unwrap_or_else(|| default_out(&raw, "reimagine", "png"));
-            generative::reimagine(&cfg, &raw, &prompt, &fidelity, &out)
+            let q = quality.unwrap_or_else(|| cfg.openai_image_quality.clone());
+            generative::reimagine(&cfg, &raw, &prompt, &fidelity, &q, &out)
         }
-        Command::Retouch { raw, mask, prompt, out } => {
+        Command::Retouch { raw, mask, prompt, quality, out } => {
             let cfg = Config::load();
             let out = out.unwrap_or_else(|| default_out(&raw, "retouch", "png"));
-            generative::retouch(&cfg, &raw, &mask, &prompt, &out)
+            let q = quality.unwrap_or_else(|| cfg.openai_image_quality.clone());
+            generative::retouch(&cfg, &raw, &mask, &prompt, &q, &out)
         }
         Command::Serve { dir, port } => serve::serve(&dir, port),
         Command::RecipeSchema => {

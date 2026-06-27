@@ -639,6 +639,19 @@ fn to_u16(v: f32) -> u16 {
 }
 
 /// Apply the RAW's stored orientation so portraits/flips display correctly.
+fn oriented(img: DynamicImage, o: Orientation) -> DynamicImage {
+    match o {
+        Orientation::Normal | Orientation::Unknown => img,
+        Orientation::HorizontalFlip => img.fliph(),
+        Orientation::Rotate180 => img.rotate180(),
+        Orientation::VerticalFlip => img.flipv(),
+        Orientation::Rotate90 => img.rotate90(),
+        Orientation::Rotate270 => img.rotate270(),
+        Orientation::Transpose => img.rotate90().fliph(),
+        Orientation::Transverse => img.rotate270().fliph(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,18 +757,5 @@ mod tests {
         apply_develop(&mut data, w, h, &r);
         let after = data[4][0] - data[3][0];
         assert!(after > before, "edge step {after} should exceed {before}");
-    }
-}
-
-fn oriented(img: DynamicImage, o: Orientation) -> DynamicImage {
-    match o {
-        Orientation::Normal | Orientation::Unknown => img,
-        Orientation::HorizontalFlip => img.fliph(),
-        Orientation::Rotate180 => img.rotate180(),
-        Orientation::VerticalFlip => img.flipv(),
-        Orientation::Rotate90 => img.rotate90(),
-        Orientation::Rotate270 => img.rotate270(),
-        Orientation::Transpose => img.rotate90().fliph(),
-        Orientation::Transverse => img.rotate270().fliph(),
     }
 }

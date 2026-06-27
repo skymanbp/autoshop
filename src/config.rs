@@ -21,6 +21,10 @@ pub struct Config {
     pub claude_model: String,
     /// Image model for generative retouch/reimagine (V2_PLAN §5).
     pub openai_image_model: String,
+    /// Output quality tier for generative edits: low | medium | high | auto.
+    /// Default `high` — Phase 4 prioritizes pixel quality (higher = more detail,
+    /// higher cost). CLI `--quality` overrides per run.
+    pub openai_image_quality: String,
     /// Python interpreter for the AI-denoise sidecar (`python/denoise.py`).
     pub python_bin: String,
     /// SCUNet weight set: color_real_psnr (blind, default) / color_real_gan /
@@ -51,6 +55,8 @@ impl Config {
                 .unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
             openai_image_model: nonempty("AUTOSHOP_OPENAI_IMAGE_MODEL")
                 .unwrap_or_else(|| "gpt-image-1.5".to_string()),
+            openai_image_quality: nonempty("AUTOSHOP_IMAGE_QUALITY")
+                .unwrap_or_else(|| "high".to_string()),
             python_bin: nonempty("AUTOSHOP_PYTHON").unwrap_or_else(|| "python".to_string()),
             denoise_model: nonempty("AUTOSHOP_DENOISE_MODEL")
                 .unwrap_or_else(|| "color_real_psnr".to_string()),

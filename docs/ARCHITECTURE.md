@@ -3,7 +3,7 @@
 > Status: **implemented**. The full decode → advise → verify → render pipeline
 > ships, plus the web UI, AI denoise (SCUNet sidecar), the PNG/TIFF baked-source
 > mode, style retrieval, XMP sidecars (global + local masks), and experimental
-> generative edits. 16 unit tests pass. This document describes the design; a few
+> generative edits. 22 unit tests pass. This document describes the design; a few
 > historical **[verify]** notes are left in place for provenance.
 >
 > Confirmed by the user (2026-06-25): Sony `.ARW`; output = XMP sidecar **and**

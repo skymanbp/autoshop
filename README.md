@@ -139,7 +139,11 @@ blind, best for real high-ISO/astro), `color_real_gan`, `color_15/25/50`.
   identical to Adobe.
 - Kelvin white balance is a no-op on baked PNG/TIFF sources (no raw WB
   coefficients); relative tweaks still apply.
-- Generative `reimagine`/`retouch` are low-res, lossy experiments — not masters.
+- Generative `reimagine` is a low-res, lossy re-render — an experiment, not a
+  master. `retouch` (generative fill) regenerates only the masked region and
+  composites it back onto the full-resolution original with a feathered seam, so
+  the rest of the frame keeps native pixels. Both pick an aspect-correct size
+  (no square-squash) and default to `quality=high` (override `--quality`).
 
 ## Tech
 

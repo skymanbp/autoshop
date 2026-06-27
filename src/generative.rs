@@ -1,63 +1,201 @@
 //! Generative image editing (V2_PLAN §5) — a SEPARATE, EXPERIMENTAL concern from
 //! the parametric develop pipeline. Calls OpenAI's Images `edits` endpoint
-//! (gpt-image-*), which RE-GENERATES pixels, so output is:
-//!   * low resolution (≈1 MP here vs the 61 MP RAW),
-//!   * a lossy generative re-render (not pixel-faithful),
-//!   * non-deterministic.
+//! (gpt-image-*), which RE-GENERATES pixels.
 //!
-//! Strictly a low-res experiment / preview — NOT a deliverable master. The
-//! XMP-first parametric path remains the real workflow.
+//! Phase 4 raises the pixel quality of this path ("give GPT higher-level pixels"):
+//!   * **Aspect-correct sizing** — pick 1536×1024 / 1024×1536 / 1024×1024 by
+//!     orientation instead of squashing every photo into a 1:1 square.
+//!   * **Configurable quality tier** (`low|medium|high|auto`, default `high`).
+//!   * **`retouch` composites back at FULL resolution** — only the masked
+//!     (inpainted) region carries generative pixels; the rest of the frame keeps
+//!     the original full-res pixels, with a feathered seam.
 //!
-//! `reimagine` = full-frame restyle (no mask). `retouch` = object removal /
-//! inpainting (RGBA mask; transparent pixels = the region to regenerate).
+//! `reimagine` = full-frame restyle (no mask) → still a generative re-render at
+//! the chosen size, so it stays a low-res experiment / preview, NOT a master.
+//! `retouch` = object removal / generative fill (RGBA mask; transparent pixels =
+//! the region to regenerate) → full-res composite, suitable as a real edit for
+//! the inpainted region.
 
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
-use image::DynamicImage;
+use image::imageops::FilterType;
+use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
 
 use crate::config::Config;
 use crate::{decode, pipeline};
 
 const BOUNDARY: &str = "----autoshopBoundaryX7MA4YWxkTrZu0gW";
-const SIZE: &str = "1024x1024";
-/// Cost guard: "low" keeps the experiment cheap (~$0.02). Raise for quality.
-const QUALITY: &str = "low";
 
 /// Full-frame generative restyle (the user's experiment). `fidelity` = "high"
 /// keeps it recognizably the same photo; "low" gives the model free rein.
-pub fn reimagine(cfg: &Config, raw_path: &Path, prompt: &str, fidelity: &str, out: &Path) -> Result<()> {
-    let src = decode::preview_only(raw_path)?
-        .resize_exact(1024, 1024, image::imageops::FilterType::Triangle);
-    let png = encode_png(&src)?;
+/// `quality` is the output tier (low|medium|high|auto).
+pub fn reimagine(
+    cfg: &Config,
+    raw_path: &Path,
+    prompt: &str,
+    fidelity: &str,
+    quality: &str,
+    out: &Path,
+) -> Result<()> {
+    let src = decode::preview_only(raw_path)?;
+    let (w, h) = src.dimensions();
+    let size = pick_size(w, h);
+    let (sw, sh) = parse_size(size);
+    let small = src.resize_exact(sw, sh, FilterType::Triangle);
+    let png = encode_png(&small)?;
     println!(
-        "⚠ EXPERIMENTAL generative re-render via {} (low-res, lossy — not a master)",
+        "⚠ EXPERIMENTAL generative re-render via {} ({size}, quality={quality} — low-res, lossy, not a master)",
         cfg.openai_image_model
     );
-    let result = call_images_edit(cfg, &png, None, prompt, fidelity)?;
+    let result = call_images_edit(cfg, &png, None, prompt, fidelity, size, quality)?;
     pipeline::ensure_parent(out)?;
     std::fs::write(out, result).with_context(|| format!("write {}", out.display()))?;
-    println!("generative -> {}", out.display());
+    println!("generative -> {} ({size}, generative re-render)", out.display());
     Ok(())
 }
 
-/// Object removal / inpainting. `mask_path` is an RGBA PNG; transparent (alpha=0)
-/// pixels mark the region to regenerate.
-pub fn retouch(cfg: &Config, raw_path: &Path, mask_path: &Path, prompt: &str, out: &Path) -> Result<()> {
-    let src = decode::preview_only(raw_path)?
-        .resize_exact(1024, 1024, image::imageops::FilterType::Triangle);
-    let png = encode_png(&src)?;
-    let mask = image::open(mask_path)
-        .with_context(|| format!("open mask {}", mask_path.display()))?
-        .resize_exact(1024, 1024, image::imageops::FilterType::Nearest);
-    let mask_png = encode_png(&mask)?;
-    println!("⚠ EXPERIMENTAL generative retouch via {} (low-res)", cfg.openai_image_model);
-    let result = call_images_edit(cfg, &png, Some(&mask_png), prompt, "high")?;
+/// Object removal / generative fill. `mask_path` is an RGBA PNG; transparent
+/// (alpha=0) pixels mark the region to regenerate. The generative result is
+/// composited back over the FULL-resolution source so only the masked region is
+/// re-rendered and everything else stays at native resolution.
+pub fn retouch(
+    cfg: &Config,
+    raw_path: &Path,
+    mask_path: &Path,
+    prompt: &str,
+    quality: &str,
+    out: &Path,
+) -> Result<()> {
+    let base = decode::preview_only(raw_path)?; // full-resolution source
+    let (bw, bh) = base.dimensions();
+    let size = pick_size(bw, bh);
+    let (sw, sh) = parse_size(size);
+
+    let png = encode_png(&base.resize_exact(sw, sh, FilterType::Triangle))?;
+    let mask_img = image::open(mask_path)
+        .with_context(|| format!("open mask {}", mask_path.display()))?;
+    let mask_png = encode_png(&mask_img.resize_exact(sw, sh, FilterType::Nearest))?;
+
+    println!(
+        "⚠ EXPERIMENTAL generative fill via {} ({size}, quality={quality}; full-res composite)",
+        cfg.openai_image_model
+    );
+    let result = call_images_edit(cfg, &png, Some(&mask_png), prompt, "high", size, quality)?;
+
+    // Composite the regenerated region back onto the full-res original. Upscale
+    // the generative tile to source dimensions; the user's mask (alpha=0 =
+    // regenerate) becomes the blend weight, feathered for a soft seam.
+    let gen_img = image::load_from_memory(&result)
+        .context("decode generative result")?
+        .resize_exact(bw, bh, FilterType::Lanczos3)
+        .to_rgba8();
+    let mask_full = mask_img.resize_exact(bw, bh, FilterType::Nearest).to_rgba8();
+    let base_rgba = base.to_rgba8();
+    let feather = ((bw.min(bh) as usize) / 100).clamp(2, 64); // ~1% of short side, capped
+    let composite = composite_region(&base_rgba, &gen_img, &mask_full, feather);
+
     pipeline::ensure_parent(out)?;
-    std::fs::write(out, result).with_context(|| format!("write {}", out.display()))?;
-    println!("generative -> {}", out.display());
+    composite
+        .save(out)
+        .with_context(|| format!("write {}", out.display()))?;
+    println!(
+        "generative fill -> {} ({bw}x{bh}, full-res composite)",
+        out.display()
+    );
     Ok(())
+}
+
+/// Pick the supported gpt-image output size whose aspect best matches the source,
+/// so we stop squashing every photo into a 1:1 square. gpt-image supports exactly
+/// 1024×1024, 1536×1024 (landscape 3:2) and 1024×1536 (portrait 2:3).
+fn pick_size(w: u32, h: u32) -> &'static str {
+    if h == 0 {
+        return "1024x1024";
+    }
+    let r = w as f32 / h as f32;
+    if r >= 1.2 {
+        "1536x1024"
+    } else if r <= 0.833 {
+        "1024x1536"
+    } else {
+        "1024x1024"
+    }
+}
+
+fn parse_size(s: &str) -> (u32, u32) {
+    s.split_once('x')
+        .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
+        .unwrap_or((1024, 1024))
+}
+
+/// Blend `gen_img` into `base` ONLY where `mask` is transparent (alpha→0 =
+/// regenerate), feathering the boundary so the seam is soft. All three share
+/// dimensions. Untouched areas keep the original `base` pixels; only the
+/// inpainted region carries generative pixels.
+fn composite_region(
+    base: &RgbaImage,
+    gen_img: &RgbaImage,
+    mask: &RgbaImage,
+    feather: usize,
+) -> RgbaImage {
+    let (w, h) = base.dimensions();
+    let (wu, hu) = (w as usize, h as usize);
+    // weight = 1 where mask is transparent (regenerate), 0 where opaque (keep base).
+    let mut weight: Vec<f32> = mask.pixels().map(|p| 1.0 - p[3] as f32 / 255.0).collect();
+    if feather > 0 {
+        weight = box_blur(&weight, wu, hu, feather);
+    }
+    let mut out = base.clone();
+    for y in 0..h {
+        for x in 0..w {
+            let a = weight[(y as usize) * wu + x as usize].clamp(0.0, 1.0);
+            if a <= 0.0001 {
+                continue; // outside the (feathered) mask → keep the full-res original
+            }
+            let b = base.get_pixel(x, y);
+            let g = gen_img.get_pixel(x, y);
+            let mix =
+                |bc: u8, gc: u8| (bc as f32 * (1.0 - a) + gc as f32 * a).round().clamp(0.0, 255.0) as u8;
+            out.put_pixel(x, y, Rgba([mix(b[0], g[0]), mix(b[1], g[1]), mix(b[2], g[2]), 255]));
+        }
+    }
+    out
+}
+
+/// Separable box blur with prefix sums — cost is O(w·h), independent of `radius`,
+/// so a wide feather on a full-res frame stays cheap.
+fn box_blur(src: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> {
+    if radius == 0 || w == 0 || h == 0 {
+        return src.to_vec();
+    }
+    let mut tmp = vec![0.0f32; src.len()];
+    let mut prefix = vec![0.0f32; w + 1];
+    for y in 0..h {
+        let row = y * w;
+        for x in 0..w {
+            prefix[x + 1] = prefix[x] + src[row + x];
+        }
+        for x in 0..w {
+            let lo = x.saturating_sub(radius);
+            let hi = (x + radius + 1).min(w);
+            tmp[row + x] = (prefix[hi] - prefix[lo]) / (hi - lo) as f32;
+        }
+    }
+    let mut out = vec![0.0f32; src.len()];
+    let mut col = vec![0.0f32; h + 1];
+    for x in 0..w {
+        for y in 0..h {
+            col[y + 1] = col[y] + tmp[y * w + x];
+        }
+        for y in 0..h {
+            let lo = y.saturating_sub(radius);
+            let hi = (y + radius + 1).min(h);
+            out[y * w + x] = (col[hi] - col[lo]) / (hi - lo) as f32;
+        }
+    }
+    out
 }
 
 fn encode_png(img: &DynamicImage) -> Result<Vec<u8>> {
@@ -85,12 +223,15 @@ fn part_file(buf: &mut Vec<u8>, name: &str, filename: &str, bytes: &[u8]) {
     buf.extend_from_slice(b"\r\n");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn call_images_edit(
     cfg: &Config,
     image_png: &[u8],
     mask_png: Option<&[u8]>,
     prompt: &str,
     fidelity: &str,
+    size: &str,
+    quality: &str,
 ) -> Result<Vec<u8>> {
     let key = cfg
         .openai_api_key
@@ -101,8 +242,8 @@ fn call_images_edit(
     part_text(&mut body, "model", &cfg.openai_image_model);
     part_text(&mut body, "prompt", prompt);
     part_text(&mut body, "input_fidelity", fidelity);
-    part_text(&mut body, "size", SIZE);
-    part_text(&mut body, "quality", QUALITY);
+    part_text(&mut body, "size", size);
+    part_text(&mut body, "quality", quality);
     part_file(&mut body, "image", "image.png", image_png);
     if let Some(m) = mask_png {
         part_file(&mut body, "mask", "mask.png", m);
@@ -136,4 +277,56 @@ fn call_images_edit(
     base64::engine::general_purpose::STANDARD
         .decode(b64)
         .context("decode b64_json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{Rgba, RgbaImage};
+
+    #[test]
+    fn pick_size_matches_orientation() {
+        assert_eq!(pick_size(6000, 4000), "1536x1024"); // 3:2 landscape
+        assert_eq!(pick_size(4000, 6000), "1024x1536"); // 2:3 portrait
+        assert_eq!(pick_size(4000, 4000), "1024x1024"); // square
+        assert_eq!(pick_size(4000, 0), "1024x1024"); // divide-by-zero guard
+    }
+
+    #[test]
+    fn parse_size_roundtrips_and_falls_back() {
+        assert_eq!(parse_size("1536x1024"), (1536, 1024));
+        assert_eq!(parse_size("1024x1536"), (1024, 1536));
+        assert_eq!(parse_size("garbage"), (1024, 1024));
+    }
+
+    #[test]
+    fn composite_keeps_base_outside_mask_and_gen_inside() {
+        let (w, h) = (8u32, 4u32);
+        let base = RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 255])); // black original
+        let gen_img = RgbaImage::from_pixel(w, h, Rgba([255, 255, 255, 255])); // white generative
+        // Left half transparent (regenerate), right half opaque (keep original).
+        let mut mask = RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 255]));
+        for y in 0..h {
+            for x in 0..w / 2 {
+                mask.put_pixel(x, y, Rgba([0, 0, 0, 0]));
+            }
+        }
+        let out = composite_region(&base, &gen_img, &mask, 0); // no feather → crisp boundary
+        assert_eq!(out.get_pixel(0, 0)[0], 255, "inside mask should be generative");
+        assert_eq!(out.get_pixel(w - 1, 0)[0], 0, "outside mask should stay original");
+    }
+
+    #[test]
+    fn feather_softens_the_seam() {
+        let (w, h) = (16u32, 1u32);
+        let base = RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 255]));
+        let gen_img = RgbaImage::from_pixel(w, h, Rgba([255, 255, 255, 255]));
+        let mut mask = RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 255]));
+        for x in 0..w / 2 {
+            mask.put_pixel(x, 0, Rgba([0, 0, 0, 0]));
+        }
+        let out = composite_region(&base, &gen_img, &mask, 3);
+        let mid = out.get_pixel(w / 2, 0)[0];
+        assert!(mid > 0 && mid < 255, "seam pixel should feather to gray, got {mid}");
+    }
 }
