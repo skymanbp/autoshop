@@ -112,22 +112,36 @@ pub fn produce_recipe(
     }
     let mut verdict = verifier.verify(&recipe, meta, hist)?;
 
-    // One revision round — only if GPT actually produced the recipe.
-    if verdict.decision != Decision::Accept && can_revise
-        && let Some(hint) = verdict.revised_hint.clone() {
-            if verbose {
-                println!("verdict was {:?} → one revision round (hint: {hint})", verdict.decision);
-            }
-            recipe = openai.propose(&preview, meta, hist, ref_str, guidance, Some(&hint))?;
-            verdict = verifier.verify(&recipe, meta, hist)?;
+    // Bounded verify→revise loop (only if GPT actually produced the recipe). With
+    // the now-symmetric verifier — which pushes a too-flat edit to commit AND a
+    // too-cooked one to ease — a few rounds converge toward a finished look instead
+    // of just ratcheting down. Capped at MAX_REVISIONS to bound cost/latency; we
+    // stop early on Accept or when the verifier stops giving a revision hint.
+    const MAX_REVISIONS: usize = 2;
+    let mut round = 0;
+    while can_revise && round < MAX_REVISIONS && verdict.decision != Decision::Accept {
+        let Some(hint) = verdict.revised_hint.clone() else { break };
+        round += 1;
+        if verbose {
+            println!("verdict {:?} → revision {round}/{MAX_REVISIONS} (hint: {hint})", verdict.decision);
         }
+        recipe = openai.propose(&preview, meta, hist, ref_str, guidance, Some(&hint))?;
+        verdict = verifier.verify(&recipe, meta, hist)?;
+    }
 
     // Distill toward the user's historical style: a gentle, capped pull of the
     // global sliders toward similar past edits. Capped at 60% so even max
     // strength never fully overrides the AI's scene-specific proposal.
     if let Some((_, targets)) = &style {
+        let blended = style_strength > 0.0 && !targets.is_empty();
         crate::style::blend_toward(&mut recipe, targets, style_strength.clamp(0.0, 1.0) * 0.6);
         recipe.clamp();
+        // The blend mutated the recipe AFTER the verdict, so the verdict above is
+        // stale. Re-verify the FINAL recipe so the returned verdict honestly
+        // reflects what will actually be applied (not the pre-blend proposal).
+        if blended {
+            verdict = verifier.verify(&recipe, meta, hist)?;
+        }
     }
     Ok((recipe, verdict))
 }
