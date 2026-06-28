@@ -19,9 +19,11 @@ const PREVIEW_EDGE: u32 = 1280; // working preview size for fast live develop
 const HSL_BANDS: [&str; 8] = ["Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta"];
 const GRADE_REGIONS: [&str; 4] = ["shadow", "midtone", "highlight", "global"];
 
-/// Messages from worker threads back to the UI.
+/// Messages from worker threads back to the UI. The `Analyzed` payload is boxed
+/// because `(EditRecipe, Verdict)` is large; boxing keeps the channel message
+/// small (clippy::large_enum_variant).
 enum Msg {
-    Analyzed(anyhow::Result<(EditRecipe, autoshop::advisor::Verdict)>),
+    Analyzed(Box<anyhow::Result<(EditRecipe, autoshop::advisor::Verdict)>>),
     Exported(anyhow::Result<String>),
 }
 
@@ -117,7 +119,7 @@ impl AutoshopApp {
             // Config is reloaded in-thread (cheap) so we don't need it to be Clone.
             let cfg = autoshop::config::Config::load();
             let res = autoshop::pipeline::produce_recipe(&path, &cfg, false, None, None, style);
-            let _ = tx.send(Msg::Analyzed(res));
+            let _ = tx.send(Msg::Analyzed(Box::new(res)));
         });
     }
 
@@ -154,18 +156,20 @@ impl AutoshopApp {
             }
         }
         match got {
-            Some(Msg::Analyzed(Ok((recipe, verdict)))) => {
-                self.recipe = recipe;
-                self.verdict = Some(format!("{:?} — {}", verdict.decision, verdict.reasons.join("; ")));
-                self.rationale = self.recipe.rationale.clone();
-                self.dirty = true;
-                self.busy = false;
-                self.status = "AI develop applied".into();
-            }
-            Some(Msg::Analyzed(Err(e))) => {
-                self.busy = false;
-                self.status = format!("analyze failed: {e}");
-            }
+            Some(Msg::Analyzed(boxed)) => match *boxed {
+                Ok((recipe, verdict)) => {
+                    self.recipe = recipe;
+                    self.verdict = Some(format!("{:?} — {}", verdict.decision, verdict.reasons.join("; ")));
+                    self.rationale = self.recipe.rationale.clone();
+                    self.dirty = true;
+                    self.busy = false;
+                    self.status = "AI develop applied".into();
+                }
+                Err(e) => {
+                    self.busy = false;
+                    self.status = format!("analyze failed: {e}");
+                }
+            },
             Some(Msg::Exported(Ok(p))) => {
                 self.busy = false;
                 self.status = format!("exported → {p}");
@@ -193,11 +197,11 @@ impl AutoshopApp {
             self.recipe.temperature_k = if custom_wb { Some(5500.0) } else { None };
             changed = true;
         }
-        if let Some(mut k) = self.recipe.temperature_k {
-            if Self::slider(ui, "Temp (K)", &mut k, 2000.0, 40000.0) {
-                self.recipe.temperature_k = Some(k);
-                changed = true;
-            }
+        if let Some(mut k) = self.recipe.temperature_k
+            && Self::slider(ui, "Temp (K)", &mut k, 2000.0, 40000.0)
+        {
+            self.recipe.temperature_k = Some(k);
+            changed = true;
         }
 
         let r = &mut self.recipe;
@@ -289,13 +293,12 @@ impl eframe::App for AutoshopApp {
             ui.horizontal(|ui| {
                 ui.heading("Autoshop");
                 ui.separator();
-                if ui.button("Open photo…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
+                if ui.button("Open photo…").clicked()
+                    && let Some(path) = rfd::FileDialog::new()
                         .add_filter("Photos", &["arw", "dng", "raf", "nef", "cr2", "cr3", "png", "tif", "tiff", "jpg", "jpeg"])
                         .pick_file()
-                    {
-                        self.open_path(ctx, path);
-                    }
+                {
+                    self.open_path(ctx, path);
                 }
                 let has = self.src_path.is_some();
                 ui.add_enabled_ui(has && !self.busy, |ui| {

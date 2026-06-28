@@ -173,8 +173,8 @@ fn heal_one(src: &RgbImage, dst: &mut RgbImage, cx: f32, cy: f32, r: f32, feathe
             corr[c] += tp[c] - dp[c];
         }
     }
-    for c in 0..3 {
-        corr[c] /= 24.0;
+    for v in &mut corr {
+        *v /= 24.0;
     }
 
     let r_i = r.ceil() as i32;
