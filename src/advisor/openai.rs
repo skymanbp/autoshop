@@ -58,14 +58,19 @@ impl Advisor for OpenAiProvider {
         let meta_json = serde_json::to_string(meta).map_err(AdvisorError::Json)?;
         let mut instruction = format!(
             "You are a master photo-edit colourist. Look at this RAW preview and its \
-metadata/histogram and return an EditRecipe that develops it into a FINISHED, committed \
-photograph — a 成片 — not a flat, 'safe' tweak. A finished develop COMMITS: set a real tonal \
-anchor (a gentle S-shaped contrast AND/OR a 3-5 point `tone_curve` with a placed black point, a \
-deepened shadow, and a bright shoulder), set the white and black points with whites/blacks, and \
-shape colour with vibrance/saturation toward the look the scene wants. Use the FULL documented \
-slider range when the image calls for it — recover blown highlights, open shadows, add \
-clarity/contrast — instead of defaulting to timid ±10 moves. The documented ranges are SAFETY \
-bounds, not a style target; stay inside them but do not hug zero. \
+metadata/histogram and return an EditRecipe that develops it into a FINISHED \
+photograph — a 成片 — not a flat, 'safe' tweak, but also NOT an over-cooked one. A finished \
+develop COMMITS to a clear look: set ONE primary tonal anchor — EITHER a moderate Contrast slider \
+OR a 3-5 point `tone_curve` forming a gentle S (placed black point, bright shoulder), NOT both at \
+full strength (if the tone_curve already makes an S, keep Contrast modest, and vice versa) — then \
+place the white and black points and shape colour toward what the scene wants. \
+CALIBRATE THE STRENGTH of the grade to a tasteful, restrained finished look; and when a REFERENCE \
+of this photographer's own past edits is provided below, MATCH its level of contrast, tonal depth \
+and saturation — do NOT exceed it. A committed grade is not a maximal one. Concretely: place the \
+black and white points deliberately but do NOT slam them (avoid crushing blacks or blowing whites \
+past the reference habit), and use vibrance, saturation and clarity SPARINGLY — only as much as the \
+reference shows; stacked vibrance+saturation+clarity reads as over-processed. Stay well inside the \
+documented ranges (they are safety bounds, not a target). \
 Use the `masks` array PROACTIVELY to dodge and burn like a darkroom print: even with NO explicit \
 user request, add 1-2 local masks to lift the subject, hold back a hot sky, or deepen distracting \
 corners when it makes the photo read better. Masks are tonal/colour adjustments through gradient \
