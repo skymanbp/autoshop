@@ -6,31 +6,20 @@
 //! output logic lives in [`pipeline`]; the CLI here and the web UI ([`serve`])
 //! both call it.
 
-mod advisor;
-mod config;
-mod decode;
-mod denoise;
-mod eval;
-mod generative;
-mod pipeline;
-mod recipe;
-mod render;
-mod retouch;
-mod serve;
-mod style;
-mod xmp;
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use image::GenericImageView;
 
-use advisor::Verdict;
-use config::Config;
-use pipeline::{default_out, ensure_parent, find_raws, produce_recipe, stem, write_recipe, write_xmp, xmp_target};
-use recipe::EditRecipe;
-use style::StyleIndex;
+// The engine modules now live in the `autoshop` library crate (src/lib.rs),
+// shared with the native GUI binary (src/bin/gui.rs).
+use autoshop::{decode, denoise, eval, generative, pipeline, render, retouch, serve};
+use autoshop::advisor::Verdict;
+use autoshop::config::Config;
+use autoshop::pipeline::{default_out, ensure_parent, find_raws, produce_recipe, stem, write_recipe, write_xmp, xmp_target};
+use autoshop::recipe::EditRecipe;
+use autoshop::style::StyleIndex;
 
 #[derive(Parser)]
 #[command(
