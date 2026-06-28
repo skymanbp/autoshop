@@ -178,6 +178,39 @@ pub fn recipe_to_xmp(r: &EditRecipe) -> String {
     attr(&mut a, "Vibrance", &signed(r.vibrance));
     attr(&mut a, "Saturation", &signed(r.saturation));
 
+    // Per-colour HSL / Color mixer (8 ACR bands). Emit only when non-neutral so
+    // a plain global recipe still produces a minimal, v1-compatible sidecar.
+    if !r.hsl.is_neutral() {
+        for (i, band) in crate::recipe::HSL_BANDS.iter().enumerate() {
+            attr(&mut a, &format!("HueAdjustment{band}"), &signed(r.hsl.hue[i]));
+            attr(&mut a, &format!("SaturationAdjustment{band}"), &signed(r.hsl.saturation[i]));
+            attr(&mut a, &format!("LuminanceAdjustment{band}"), &signed(r.hsl.luminance[i]));
+        }
+    }
+
+    // Colour grading (3-wheel + global). ACR convention VERIFIED against the
+    // user's own sidecar: shadow/highlight hue+sat round-trip via the legacy
+    // SplitToning* keys; lum, midtone, global, blending via ColorGrade*; balance
+    // via SplitToningBalance. Hue/sat/blending are unsigned, lum/balance signed.
+    if !r.color_grade.is_neutral() {
+        let cg = &r.color_grade;
+        let uns = |v: f32| (v.round() as i64).to_string();
+        attr(&mut a, "SplitToningShadowHue", &uns(cg.shadow_hue));
+        attr(&mut a, "SplitToningShadowSaturation", &uns(cg.shadow_sat));
+        attr(&mut a, "SplitToningHighlightHue", &uns(cg.highlight_hue));
+        attr(&mut a, "SplitToningHighlightSaturation", &uns(cg.highlight_sat));
+        attr(&mut a, "SplitToningBalance", &signed(cg.balance));
+        attr(&mut a, "ColorGradeShadowLum", &signed(cg.shadow_lum));
+        attr(&mut a, "ColorGradeMidtoneHue", &uns(cg.midtone_hue));
+        attr(&mut a, "ColorGradeMidtoneSat", &uns(cg.midtone_sat));
+        attr(&mut a, "ColorGradeMidtoneLum", &signed(cg.midtone_lum));
+        attr(&mut a, "ColorGradeHighlightLum", &signed(cg.highlight_lum));
+        attr(&mut a, "ColorGradeGlobalHue", &uns(cg.global_hue));
+        attr(&mut a, "ColorGradeGlobalSat", &uns(cg.global_sat));
+        attr(&mut a, "ColorGradeGlobalLum", &signed(cg.global_lum));
+        attr(&mut a, "ColorGradeBlending", &uns(cg.blending));
+    }
+
     // recipe sharpening is 0..150; crs Sharpness is 0..100 — rescale + clamp.
     let sharp = ((r.sharpening * 2.0 / 3.0).round() as i64).clamp(0, 100);
     attr(&mut a, "Sharpness", &sharp.to_string());
@@ -204,19 +237,26 @@ pub fn recipe_to_xmp(r: &EditRecipe) -> String {
         if r.tone_curve.is_empty() { "Linear" } else { "Custom" },
     );
 
-    // Tone curve is a child element (rdf:Seq of "x, y" strings), not an attribute.
-    let tone = if r.tone_curve.is_empty() {
-        String::new()
-    } else {
-        let pts: String = r
-            .tone_curve
+    // Tone curves are child elements (rdf:Seq of "x, y" strings), not attributes.
+    // One builder for the master + the three per-channel curves (verified key
+    // names against the user's sidecar: ToneCurvePV2012Red/Green/Blue).
+    let curve_elem = |tag: &str, points: &[crate::recipe::CurvePoint]| -> String {
+        if points.is_empty() {
+            return String::new();
+        }
+        let pts: String = points
             .iter()
             .map(|p| format!("     <rdf:li>{}, {}</rdf:li>\n", p.input, p.output))
             .collect();
-        format!(
-            "\n   <crs:ToneCurvePV2012>\n    <rdf:Seq>\n{pts}    </rdf:Seq>\n   </crs:ToneCurvePV2012>"
-        )
+        format!("\n   <crs:{tag}>\n    <rdf:Seq>\n{pts}    </rdf:Seq>\n   </crs:{tag}>")
     };
+    let tone = curve_elem("ToneCurvePV2012", &r.tone_curve);
+    let rgb_curves = format!(
+        "{}{}{}",
+        curve_elem("ToneCurvePV2012Red", &r.red_curve),
+        curve_elem("ToneCurvePV2012Green", &r.green_curve),
+        curve_elem("ToneCurvePV2012Blue", &r.blue_curve),
+    );
 
     format!(
         "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Autoshop\">\n\
@@ -224,7 +264,7 @@ pub fn recipe_to_xmp(r: &EditRecipe) -> String {
  <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n\
   <rdf:Description rdf:about=\"\"\n\
     xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\"{attrs}\n\
-    crs:HasSettings=\"True\">{tone}{masks}\n\
+    crs:HasSettings=\"True\">{tone}{rgb_curves}{masks}\n\
   </rdf:Description>\n\
  </rdf:RDF>\n\
 </x:xmpmeta>\n",
@@ -232,6 +272,7 @@ pub fn recipe_to_xmp(r: &EditRecipe) -> String {
         conf = r.confidence,
         attrs = a,
         tone = tone,
+        rgb_curves = rgb_curves,
         masks = masks_xml(r),
     )
 }
@@ -313,5 +354,70 @@ mod tests {
         assert!(xmp.contains("<rdf:li>0, 0</rdf:li>"));
         // rationale is XML-escaped in the comment
         assert!(xmp.contains("&lt;test&gt;"));
+    }
+
+    #[test]
+    fn renders_hsl_bands_only_when_set() {
+        let r = EditRecipe {
+            hsl: crate::recipe::Hsl {
+                hue: [0.0, 15.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], // orange +15
+                saturation: [0.0, 0.0, 0.0, -40.0, 0.0, 0.0, 0.0, 0.0], // green -40
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let xmp = recipe_to_xmp(&r);
+        assert!(xmp.contains(r#"crs:HueAdjustmentOrange="+15""#));
+        assert!(xmp.contains(r#"crs:SaturationAdjustmentGreen="-40""#));
+        assert!(xmp.contains(r#"crs:LuminanceAdjustmentRed="0""#)); // full 24-key block
+        // A neutral recipe emits NO HSL keys (minimal, v1-compatible sidecar).
+        assert!(!recipe_to_xmp(&EditRecipe::default()).contains("HueAdjustment"));
+    }
+
+    #[test]
+    fn renders_color_grade_with_verified_split_toning_mapping() {
+        let r = EditRecipe {
+            color_grade: crate::recipe::ColorGrade {
+                shadow_hue: 220.0, shadow_sat: 30.0,
+                highlight_hue: 45.0, highlight_sat: 20.0,
+                midtone_lum: -10.0, balance: 15.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let xmp = recipe_to_xmp(&r);
+        // shadow/highlight hue+sat round-trip via the legacy SplitToning* keys
+        assert!(xmp.contains(r#"crs:SplitToningShadowHue="220""#));
+        assert!(xmp.contains(r#"crs:SplitToningShadowSaturation="30""#));
+        assert!(xmp.contains(r#"crs:SplitToningHighlightHue="45""#));
+        assert!(xmp.contains(r#"crs:SplitToningBalance="+15""#));
+        // lum / midtone / global / blending via ColorGrade*
+        assert!(xmp.contains(r#"crs:ColorGradeMidtoneLum="-10""#));
+        assert!(xmp.contains(r#"crs:ColorGradeBlending="50""#)); // ACR default
+        // A neutral recipe emits NO grading keys at all.
+        let neutral = recipe_to_xmp(&EditRecipe::default());
+        assert!(!neutral.contains("ColorGrade") && !neutral.contains("SplitToning"));
+    }
+
+    #[test]
+    fn renders_per_channel_rgb_curves() {
+        let r = EditRecipe {
+            red_curve: vec![CurvePoint { input: 0, output: 10 }, CurvePoint { input: 255, output: 250 }],
+            blue_curve: vec![
+                CurvePoint { input: 0, output: 0 },
+                CurvePoint { input: 128, output: 110 },
+                CurvePoint { input: 255, output: 255 },
+            ],
+            ..Default::default()
+        };
+        let xmp = recipe_to_xmp(&r);
+        assert!(xmp.contains("<crs:ToneCurvePV2012Red>"));
+        assert!(xmp.contains("<rdf:li>0, 10</rdf:li>"));
+        assert!(xmp.contains("<crs:ToneCurvePV2012Blue>"));
+        assert!(xmp.contains("<rdf:li>128, 110</rdf:li>"));
+        // The empty green channel emits no element.
+        assert!(!xmp.contains("ToneCurvePV2012Green"));
+        // A neutral recipe emits no per-channel curves at all.
+        assert!(!recipe_to_xmp(&EditRecipe::default()).contains("ToneCurvePV2012Red"));
     }
 }

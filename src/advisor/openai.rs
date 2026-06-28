@@ -71,6 +71,18 @@ black and white points deliberately but do NOT slam them (avoid crushing blacks 
 past the reference habit), and use vibrance, saturation and clarity SPARINGLY — only as much as the \
 reference shows; stacked vibrance+saturation+clarity reads as over-processed. Stay well inside the \
 documented ranges (they are safety bounds, not a target). \
+For deeper LOOK shaping, you may use the colour-mixer controls — but the SAME restraint applies: \
+use them the way the photographer does (sparingly, to MATCH the reference), never to over-saturate. \
+`hsl` is the 8-band HSL mixer: each of `hue`, `saturation`, `luminance` MUST be an array of EXACTLY \
+8 numbers (-100..100) in this FIXED band order — red, orange, yellow, green, aqua, blue, purple, \
+magenta (e.g. drop blue+aqua luminance to deepen a sky; lift/shift orange for skin). `color_grade` \
+is the 3-wheel toning (shadow / midtone / highlight + global): set a wheel's `*_hue` (0..360) and \
+`*_sat` (0..100) to tone that tonal region and `*_lum` (-100..100) to lift/drop it; keep `blending` \
+at 50 unless you have reason; small saturations (~5..25) read as a tasteful split-tone. \
+`red_curve`/`green_curve`/`blue_curve` are per-channel curves (same {{input,output}} 0..255 points as \
+`tone_curve`) for a deliberate colour cast in specific tones. Leave any of these NEUTRAL when the \
+photo does not call for them — `hsl` all zeros, `color_grade` wheels at 0 (blending 50), curves \
+empty. Most photos need only a couple of HSL bands or one subtle wheel, if any. \
 Use the `masks` array PROACTIVELY to dodge and burn like a darkroom print: even with NO explicit \
 user request, add 1-2 local masks to lift the subject, hold back a hot sky, or deepen distracting \
 corners when it makes the photo read better. Masks are tonal/colour adjustments through gradient \
@@ -180,25 +192,61 @@ fn edit_recipe_schema() -> Value {
             "noise_reduction": num()
         }
     });
+    // HSL: three numeric arrays (red..magenta). Length is pinned at 8 by
+    // recipe::Hsl's [f32;8] at DESERIALIZE time; OpenAI strict mode cannot pin
+    // array length (minItems/maxItems are unsupported and 400 the request), so the
+    // proposer prompt enforces "exactly 8, in band order".
+    let hsl_axis = || json!({"type": "array", "items": num()});
+    let hsl = json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["hue", "saturation", "luminance"],
+        "properties": {"hue": hsl_axis(), "saturation": hsl_axis(), "luminance": hsl_axis()}
+    });
+    // Colour grading wheels (flat scalar object), per recipe::ColorGrade.
+    let color_grade = json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["shadow_hue","shadow_sat","shadow_lum","midtone_hue","midtone_sat","midtone_lum",
+            "highlight_hue","highlight_sat","highlight_lum","global_hue","global_sat","global_lum",
+            "blending","balance"],
+        "properties": {
+            "shadow_hue": num(), "shadow_sat": num(), "shadow_lum": num(),
+            "midtone_hue": num(), "midtone_sat": num(), "midtone_lum": num(),
+            "highlight_hue": num(), "highlight_sat": num(), "highlight_lum": num(),
+            "global_hue": num(), "global_sat": num(), "global_lum": num(),
+            "blending": num(), "balance": num()
+        }
+    });
+    // An array of {input,output} curve points (master + the three RGB channels).
+    // Bound the integers to 0..255 (recipe::CurvePoint is u8) so the model can't
+    // emit an out-of-range value that fails the whole-recipe deserialize.
+    let int255 = || json!({"type": "integer", "minimum": 0, "maximum": 255});
+    let curve_arr = || json!({"type": "array", "items": {"type": "object",
+        "additionalProperties": false, "required": ["input", "output"],
+        "properties": {"input": int255(), "output": int255()}}});
     json!({
         "type": "object",
         "additionalProperties": false,
         "required": ["version","exposure_ev","contrast","highlights","shadows","whites","blacks",
-            "temperature_k","tint","vibrance","saturation","clarity","dehaze","sharpening",
-            "noise_reduction","straighten_deg","crop","tone_curve","masks","rationale","confidence"],
+            "temperature_k","tint","vibrance","saturation","clarity","dehaze","hsl","color_grade",
+            "sharpening","noise_reduction","straighten_deg","crop",
+            "tone_curve","red_curve","green_curve","blue_curve",
+            "masks","rationale","confidence"],
         "properties": {
             "version": {"type": "integer"},
             "exposure_ev": num(), "contrast": num(), "highlights": num(), "shadows": num(),
             "whites": num(), "blacks": num(),
             "temperature_k": {"type": ["number","null"]}, "tint": num(),
             "vibrance": num(), "saturation": num(), "clarity": num(), "dehaze": num(),
+            "hsl": hsl,
+            "color_grade": color_grade,
             "sharpening": num(), "noise_reduction": num(), "straighten_deg": num(),
             "crop": {"type": ["object","null"], "additionalProperties": false,
                 "required": ["left","top","right","bottom"],
                 "properties": {"left": num(), "top": num(), "right": num(), "bottom": num()}},
-            "tone_curve": {"type": "array", "items": {"type": "object",
-                "additionalProperties": false, "required": ["input","output"],
-                "properties": {"input": {"type": "integer"}, "output": {"type": "integer"}}}},
+            "tone_curve": curve_arr(),
+            "red_curve": curve_arr(),
+            "green_curve": curve_arr(),
+            "blue_curve": curve_arr(),
             "masks": {"type": "array", "items": local_adjustment},
             "rationale": {"type": "string"},
             "confidence": num()

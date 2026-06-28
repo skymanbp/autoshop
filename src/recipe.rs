@@ -54,6 +54,14 @@ pub struct EditRecipe {
     /// -100..=100, atmospheric haze removal.
     pub dehaze: f32,
 
+    // --- Per-colour HSL (the 8 ACR colour bands) ----------------------------
+    /// Lightroom's HSL / Color mixer. Default = all bands neutral (v1-compatible).
+    pub hsl: Hsl,
+
+    // --- Colour grading (3-wheel + global) ----------------------------------
+    /// Lightroom's Color Grading wheels. Default = neutral (v1-compatible).
+    pub color_grade: ColorGrade,
+
     // --- Detail -------------------------------------------------------------
     /// 0..=150, capture sharpening amount.
     pub sharpening: f32,
@@ -70,6 +78,13 @@ pub struct EditRecipe {
     /// Monotonic control points on the master tone curve, input/output in
     /// 0..=255. Empty = identity curve.
     pub tone_curve: Vec<CurvePoint>,
+
+    /// Per-channel RGB tone curves (red/green/blue), input/output 0..=255. Empty =
+    /// identity. The colour-shaping companion to `tone_curve`; emitted as
+    /// `crs:ToneCurvePV2012Red/Green/Blue`.
+    pub red_curve: Vec<CurvePoint>,
+    pub green_curve: Vec<CurvePoint>,
+    pub blue_curve: Vec<CurvePoint>,
 
     // --- Local (masked) adjustments -----------------------------------------
     /// Local adjustments applied through gradient masks. Empty = global-only
@@ -100,11 +115,16 @@ impl Default for EditRecipe {
             saturation: 0.0,
             clarity: 0.0,
             dehaze: 0.0,
+            hsl: Hsl::default(),
+            color_grade: ColorGrade::default(),
             sharpening: 0.0,
             noise_reduction: 0.0,
             straighten_deg: 0.0,
             crop: None,
             tone_curve: Vec::new(),
+            red_curve: Vec::new(),
+            green_curve: Vec::new(),
+            blue_curve: Vec::new(),
             masks: Vec::new(),
             rationale: String::new(),
             confidence: 0.0,
@@ -129,6 +149,114 @@ pub struct CurvePoint {
     pub input: u8,
     /// Output value, 0..=255.
     pub output: u8,
+}
+
+/// The 8 ACR colour bands, in the order the [`Hsl`] arrays are indexed. These
+/// map 1:1 to Lightroom's `crs:{Hue,Saturation,Luminance}AdjustmentRed` … keys.
+pub const HSL_BANDS: [&str; 8] =
+    ["Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta"];
+
+/// Per-colour HSL adjustments — Lightroom's HSL / Color mixer. Each array is
+/// indexed by [`HSL_BANDS`] (red, orange, yellow, green, aqua, blue, purple,
+/// magenta). Values -100..=100, 0 = no change: `hue` rotates a band, `saturation`
+/// changes its intensity, `luminance` its brightness. This is the single biggest
+/// "look" control the global sliders cannot express (e.g. teal-foliage / orange-skin).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Hsl {
+    pub hue: [f32; 8],
+    pub saturation: [f32; 8],
+    pub luminance: [f32; 8],
+}
+
+impl Default for Hsl {
+    fn default() -> Self {
+        Self { hue: [0.0; 8], saturation: [0.0; 8], luminance: [0.0; 8] }
+    }
+}
+
+impl Hsl {
+    /// True when every band on every axis is neutral (lets the render + XMP skip it).
+    pub fn is_neutral(&self) -> bool {
+        self.hue.iter().chain(&self.saturation).chain(&self.luminance).all(|&v| v == 0.0)
+    }
+
+    /// Clamp every band to the documented -100..=100 range.
+    pub fn clamp(&mut self) {
+        for arr in [&mut self.hue, &mut self.saturation, &mut self.luminance] {
+            for v in arr.iter_mut() {
+                *v = v.clamp(-100.0, 100.0);
+            }
+        }
+    }
+}
+
+/// Lightroom's Color Grading (the 3-wheel + global model that supersedes Split
+/// Toning). Each tonal region (shadow/midtone/highlight) plus a global wheel gets
+/// a `hue` (0..=360°), `sat` (0..=100), and `lum` (-100..=100). `blending` (0..=100,
+/// default 50) sets how much the regions overlap; `balance` (-100..=100) shifts the
+/// shadow/highlight split. Default = neutral. ACR XMP convention (verified against
+/// the user's own sidecar): shadow/highlight hue+sat round-trip via the legacy
+/// `crs:SplitToning*` keys, everything else via `crs:ColorGrade*`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ColorGrade {
+    pub shadow_hue: f32,
+    pub shadow_sat: f32,
+    pub shadow_lum: f32,
+    pub midtone_hue: f32,
+    pub midtone_sat: f32,
+    pub midtone_lum: f32,
+    pub highlight_hue: f32,
+    pub highlight_sat: f32,
+    pub highlight_lum: f32,
+    pub global_hue: f32,
+    pub global_sat: f32,
+    pub global_lum: f32,
+    pub blending: f32,
+    pub balance: f32,
+}
+
+impl Default for ColorGrade {
+    fn default() -> Self {
+        Self {
+            shadow_hue: 0.0, shadow_sat: 0.0, shadow_lum: 0.0,
+            midtone_hue: 0.0, midtone_sat: 0.0, midtone_lum: 0.0,
+            highlight_hue: 0.0, highlight_sat: 0.0, highlight_lum: 0.0,
+            global_hue: 0.0, global_sat: 0.0, global_lum: 0.0,
+            blending: 50.0, // ACR default
+            balance: 0.0,
+        }
+    }
+}
+
+impl ColorGrade {
+    /// True when no wheel tints or lifts (sat + lum all zero) — render + XMP skip it.
+    /// `blending`/`balance` alone do nothing without a saturated or lifted wheel.
+    pub fn is_neutral(&self) -> bool {
+        [
+            self.shadow_sat, self.shadow_lum, self.midtone_sat, self.midtone_lum,
+            self.highlight_sat, self.highlight_lum, self.global_sat, self.global_lum,
+        ]
+        .iter()
+        .all(|&v| v == 0.0)
+    }
+
+    /// Clamp every wheel to its documented range (hue 0..360, sat 0..100, lum/balance
+    /// -100..100, blending 0..100).
+    pub fn clamp(&mut self) {
+        for h in [&mut self.shadow_hue, &mut self.midtone_hue, &mut self.highlight_hue, &mut self.global_hue] {
+            *h = h.rem_euclid(360.0);
+        }
+        for s in [&mut self.shadow_sat, &mut self.midtone_sat, &mut self.highlight_sat, &mut self.global_sat] {
+            *s = s.clamp(0.0, 100.0);
+        }
+        for l in [&mut self.shadow_lum, &mut self.midtone_lum, &mut self.highlight_lum, &mut self.global_lum] {
+            *l = l.clamp(-100.0, 100.0);
+        }
+        self.blending = self.blending.clamp(0.0, 100.0);
+        self.balance = self.balance.clamp(-100.0, 100.0);
+    }
 }
 
 /// A local (masked) adjustment: *where* it applies (`mask`) plus the slider
@@ -228,12 +356,17 @@ impl EditRecipe {
         self.saturation = c(self.saturation, -100.0, 100.0);
         self.clarity = c(self.clarity, -100.0, 100.0);
         self.dehaze = c(self.dehaze, -100.0, 100.0);
+        self.hsl.clamp();
+        self.color_grade.clamp();
         self.sharpening = c(self.sharpening, 0.0, 150.0);
         self.noise_reduction = c(self.noise_reduction, 0.0, 100.0);
         self.straighten_deg = c(self.straighten_deg, -45.0, 45.0);
         self.confidence = c(self.confidence, 0.0, 1.0);
         if let Some(k) = self.temperature_k {
-            self.temperature_k = Some(c(k, 2000.0, 50000.0));
+            // Ceiling matches the render engine's blackbody fit validity (kelvin_to_rgb
+            // is documented + re-clamped to 1000..40000); keep one source of truth so
+            // the recipe never carries a Kelvin the engine would silently re-clamp.
+            self.temperature_k = Some(c(k, 2000.0, 40000.0));
         }
         // Clamp each local adjustment to the same UI ranges as the globals.
         for m in self.masks.iter_mut() {

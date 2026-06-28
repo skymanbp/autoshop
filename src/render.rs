@@ -226,7 +226,14 @@ fn apply_develop(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
         px[1] = sample_lut(&lut, px[1]);
         px[2] = sample_lut(&lut, px[2]);
     }
-    // 2) clarity — large-radius, midtone-masked local contrast.
+    // 1b) per-channel RGB curves (red/green/blue), right after the master curve.
+    apply_rgb_curves(data, r);
+    // 2) per-colour HSL (the 8 ACR bands): rotate/scale each colour family,
+    //    after global tone and before clarity/saturation (ACR ordering).
+    apply_hsl(data, &r.hsl);
+    // 2b) colour grading wheels (shadow/midtone/highlight/global toning + lum).
+    apply_color_grade(data, &r.color_grade);
+    // 3) clarity — large-radius, midtone-masked local contrast.
     if r.clarity != 0.0 {
         let radius = ((0.02 * w.min(h) as f32).round() as usize).max(8);
         unsharp_luma(data, w, h, radius, r.clarity / 100.0, true);
@@ -642,6 +649,40 @@ fn sample_lut(lut: &[f32], x: f32) -> f32 {
     lut[i] * (1.0 - t) + lut[i + 1] * t
 }
 
+/// Apply the per-channel RGB curves (red/green/blue) in place — the colour
+/// companion to the master tone curve. No-op when all three are empty.
+fn apply_rgb_curves(data: &mut [[f32; 3]], r: &EditRecipe) {
+    let curves = [&r.red_curve, &r.green_curve, &r.blue_curve];
+    if curves.iter().all(|c| c.is_empty()) {
+        return;
+    }
+    let luts: [Vec<f32>; 3] = [
+        channel_curve_lut(curves[0]),
+        channel_curve_lut(curves[1]),
+        channel_curve_lut(curves[2]),
+    ];
+    for px in data.iter_mut() {
+        for ch in 0..3 {
+            if !curves[ch].is_empty() {
+                px[ch] = sample_lut(&luts[ch], px[ch]);
+            }
+        }
+    }
+}
+
+/// A 256-entry [0,1]→[0,1] LUT from one channel's control points; identity if empty.
+fn channel_curve_lut(points: &[crate::recipe::CurvePoint]) -> Vec<f32> {
+    if points.is_empty() {
+        return (0..256).map(|i| i as f32 / 255.0).collect();
+    }
+    let mut pts: Vec<(f32, f32)> = points
+        .iter()
+        .map(|p| (p.input as f32 / 255.0, p.output as f32 / 255.0))
+        .collect();
+    pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    (0..256).map(|i| interp(&pts, i as f32 / 255.0)).collect()
+}
+
 /// Saturation + vibrance around the pixel's luma. Vibrance boosts low-saturation
 /// pixels more (so already-vivid colours don't blow out).
 fn apply_sat_vibrance(r: f32, g: f32, b: f32, sat: f32, vib: f32) -> [f32; 3] {
@@ -655,6 +696,148 @@ fn apply_sat_vibrance(r: f32, g: f32, b: f32, sat: f32, vib: f32) -> [f32; 3] {
         (l + (g - l) * factor).clamp(0.0, 1.0),
         (l + (b - l) * factor).clamp(0.0, 1.0),
     ]
+}
+
+/// Per-colour HSL (the 8 ACR bands). For each pixel: find which colour band(s)
+/// its hue falls in (triangular partition of unity over the band centres), then
+/// rotate hue / scale saturation / scale luminance by the band-weighted amounts.
+/// Achromatic pixels (no hue) are untouched. Runs in sRGB-gamma space — a
+/// tasteful approximation; the XMP→Lightroom path renders the exact ACR model.
+fn apply_hsl(data: &mut [[f32; 3]], hsl: &crate::recipe::Hsl) {
+    if hsl.is_neutral() {
+        return;
+    }
+    // ACR band centres in degrees (red..magenta), matching recipe::HSL_BANDS.
+    const CENTERS: [f32; 8] = [0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 270.0, 300.0];
+    for px in data.iter_mut() {
+        let (h, s, l) = rgb_to_hsl(px[0], px[1], px[2]);
+        if s < 1e-4 {
+            continue; // grey: no colour band applies
+        }
+        let (b0, b1, w1) = bracket_bands(h * 360.0, &CENTERS);
+        let w0 = 1.0 - w1;
+        let hue_adj = w0 * hsl.hue[b0] + w1 * hsl.hue[b1];
+        let sat_adj = w0 * hsl.saturation[b0] + w1 * hsl.saturation[b1];
+        let lum_adj = w0 * hsl.luminance[b0] + w1 * hsl.luminance[b1];
+        // hue: ±100 → ±30° rotation; sat: ±100 → ±100%; lum gentler (×0.5).
+        let new_h = (h + (hue_adj / 100.0) * (30.0 / 360.0)).rem_euclid(1.0);
+        let new_s = (s * (1.0 + sat_adj / 100.0)).clamp(0.0, 1.0);
+        let new_l = (l * (1.0 + 0.5 * lum_adj / 100.0)).clamp(0.0, 1.0);
+        let (r, g, b) = hsl_to_rgb(new_h, new_s, new_l);
+        *px = [r, g, b];
+    }
+}
+
+/// The two band indices bracketing hue `deg` and the blend weight toward the
+/// second (partition of unity). Centres are non-uniform and wrap (magenta 300°
+/// → red 360°/0°), so the last segment spans 300..360 back to red.
+fn bracket_bands(deg: f32, centers: &[f32; 8]) -> (usize, usize, f32) {
+    let d = deg.rem_euclid(360.0);
+    for i in 0..8 {
+        let lo = centers[i];
+        let hi = if i + 1 < 8 { centers[i + 1] } else { 360.0 };
+        if d >= lo && d < hi {
+            let upper = if i + 1 < 8 { i + 1 } else { 0 };
+            return (i, upper, (d - lo) / (hi - lo));
+        }
+    }
+    (0, 1, 0.0) // unreachable: the segments tile [0,360)
+}
+
+/// sRGB-gamma RGB → HSL, all in [0,1] (hue normalised to turns).
+fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    let d = max - min;
+    if d < 1e-6 {
+        return (0.0, 0.0, l); // achromatic
+    }
+    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+    let h = if max == r {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if max == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    } / 6.0;
+    (h.rem_euclid(1.0), s, l)
+}
+
+/// HSL → sRGB-gamma RGB (inverse of [`rgb_to_hsl`]).
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    if s < 1e-6 {
+        return (l, l, l);
+    }
+    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let p = 2.0 * l - q;
+    let hue2rgb = |mut t: f32| -> f32 {
+        if t < 0.0 {
+            t += 1.0;
+        }
+        if t > 1.0 {
+            t -= 1.0;
+        }
+        if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 1.0 / 2.0 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        }
+    };
+    (hue2rgb(h + 1.0 / 3.0), hue2rgb(h), hue2rgb(h - 1.0 / 3.0))
+}
+
+/// Lightroom-style colour grading: tint + lift the shadow / midtone / highlight
+/// tonal regions (and a global wheel) by their hue/sat/lum. Region membership is a
+/// smoothstep split on luma; `blending` scales the regional effect, `balance`
+/// shifts the shadow/highlight split. Approximation; XMP→Lightroom is exact.
+fn apply_color_grade(data: &mut [[f32; 3]], cg: &crate::recipe::ColorGrade) {
+    if cg.is_neutral() {
+        return;
+    }
+    let blend = (cg.blending / 100.0).clamp(0.0, 1.0);
+    // balance shifts the shadow/highlight midpoint: positive leans toward highlights.
+    let mid = (0.5 - 0.25 * (cg.balance / 100.0)).clamp(0.05, 0.95);
+    for px in data.iter_mut() {
+        let l = luma601(px);
+        let w_hi = smoothstep(mid, 1.0, l);
+        let w_sh = 1.0 - smoothstep(0.0, mid, l);
+        let w_mid = (1.0 - w_hi - w_sh).clamp(0.0, 1.0);
+        apply_wheel(px, cg.shadow_hue, cg.shadow_sat, cg.shadow_lum, w_sh * blend);
+        apply_wheel(px, cg.midtone_hue, cg.midtone_sat, cg.midtone_lum, w_mid * blend);
+        apply_wheel(px, cg.highlight_hue, cg.highlight_sat, cg.highlight_lum, w_hi * blend);
+        apply_wheel(px, cg.global_hue, cg.global_sat, cg.global_lum, 1.0); // global: all tones
+    }
+}
+
+/// Apply one colour-grade wheel to a pixel: shift chroma toward the wheel's hue
+/// (scaled by sat × weight) and scale brightness by its luminance — both gentle.
+fn apply_wheel(px: &mut [f32; 3], hue_deg: f32, sat: f32, lum: f32, weight: f32) {
+    if weight <= 1e-4 {
+        return;
+    }
+    if sat.abs() > 1e-4 {
+        // Tint toward the pure hue AT THIS PIXEL'S OWN LUMINANCE (not a fixed
+        // 0.5-grey anchor) and blend — this keeps luma roughly constant, so deep
+        // shadows / bright highlights aren't crushed past [0,1] the way a fixed
+        // additive push does. Closer to ACR's luma-aware toning.
+        let l = luma601(px);
+        let tint = hsl_to_rgb((hue_deg / 360.0).rem_euclid(1.0), 1.0, l);
+        let amt = (sat / 100.0) * weight * 0.4;
+        px[0] = (px[0] + (tint.0 - px[0]) * amt).clamp(0.0, 1.0);
+        px[1] = (px[1] + (tint.1 - px[1]) * amt).clamp(0.0, 1.0);
+        px[2] = (px[2] + (tint.2 - px[2]) * amt).clamp(0.0, 1.0);
+    }
+    if lum.abs() > 1e-4 {
+        let k = (1.0 + (lum / 100.0) * weight * 0.5).max(0.0);
+        for c in px.iter_mut() {
+            *c = (*c * k).clamp(0.0, 1.0);
+        }
+    }
 }
 
 fn to_u8(v: f32) -> u8 {
@@ -820,5 +1003,76 @@ mod tests {
         apply_develop(&mut data, w, h, &r);
         let after = data[4][0] - data[3][0];
         assert!(after > before, "edge step {after} should exceed {before}");
+    }
+
+    #[test]
+    fn hsl_adjusts_only_the_targeted_colour_band() {
+        use crate::recipe::Hsl;
+        // Red-band saturation -100 desaturates a red pixel toward grey but leaves
+        // a blue pixel (a different band) untouched.
+        let mut hsl = Hsl::default();
+        hsl.saturation[0] = -100.0; // red band
+        let mut data = vec![[0.8_f32, 0.1, 0.1], [0.1, 0.1, 0.8]];
+        apply_hsl(&mut data, &hsl);
+        let red = data[0];
+        assert!(
+            (red[0] - red[1]).abs() < 0.05 && (red[1] - red[2]).abs() < 0.05,
+            "red pixel desaturated toward grey: {red:?}"
+        );
+        let blue = data[1];
+        assert!(
+            (blue[0] - 0.1).abs() < 0.02 && (blue[2] - 0.8).abs() < 0.02,
+            "blue pixel untouched: {blue:?}"
+        );
+    }
+
+    #[test]
+    fn hsl_neutral_is_identity_and_grey_is_untouched() {
+        use crate::recipe::Hsl;
+        // A neutral HSL is an exact no-op.
+        let mut data = vec![[0.6_f32, 0.2, 0.2], [0.5, 0.5, 0.5]];
+        let orig = data.clone();
+        apply_hsl(&mut data, &Hsl::default());
+        assert_eq!(data, orig);
+        // A grey pixel has no hue, so even a strong all-band push leaves it alone.
+        let hsl = Hsl { saturation: [100.0; 8], ..Hsl::default() };
+        let mut grey = vec![[0.5_f32, 0.5, 0.5]];
+        apply_hsl(&mut grey, &hsl);
+        assert!(
+            (grey[0][0] - 0.5).abs() < 1e-4 && (grey[0][2] - 0.5).abs() < 1e-4,
+            "grey untouched: {:?}",
+            grey[0]
+        );
+    }
+
+    #[test]
+    fn color_grade_tints_the_targeted_tonal_region() {
+        use crate::recipe::ColorGrade;
+        // A blue shadow wheel pushes a DARK pixel toward blue; neutral is a no-op.
+        let cg = ColorGrade { shadow_hue: 240.0, shadow_sat: 100.0, blending: 100.0, ..Default::default() };
+        let mut data = vec![[0.15_f32, 0.15, 0.15]]; // dark grey
+        apply_color_grade(&mut data, &cg);
+        let p = data[0];
+        assert!(p[2] > p[0] && p[2] > p[1], "shadow tinted blue: {p:?}");
+
+        let mut d2 = vec![[0.4_f32, 0.3, 0.2]];
+        let orig = d2.clone();
+        apply_color_grade(&mut d2, &ColorGrade::default()); // neutral
+        assert_eq!(d2, orig);
+    }
+
+    #[test]
+    fn rgb_curves_shape_each_channel_independently() {
+        use crate::recipe::CurvePoint;
+        // A red curve lifting the black point brightens RED only, via the full pipeline.
+        let r = EditRecipe {
+            red_curve: vec![CurvePoint { input: 0, output: 60 }, CurvePoint { input: 255, output: 255 }],
+            ..Default::default()
+        };
+        let mut data = vec![[0.0_f32, 0.0, 0.0]];
+        apply_develop(&mut data, 1, 1, &r);
+        let p = data[0];
+        assert!(p[0] > 0.15, "red channel lifted: {p:?}");
+        assert!(p[1] < 0.02 && p[2] < 0.02, "green/blue untouched: {p:?}");
     }
 }
