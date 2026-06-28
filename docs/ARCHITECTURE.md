@@ -3,7 +3,7 @@
 > Status: **implemented**. The full decode → advise → verify → render pipeline
 > ships, plus the web UI, AI denoise (SCUNet sidecar), the PNG/TIFF baked-source
 > mode, style retrieval, XMP sidecars (global + local masks), and experimental
-> generative edits. 22 unit tests pass. This document describes the design; a few
+> generative edits. 23 unit tests pass. This document describes the design; a few
 > historical **[verify]** notes are left in place for provenance.
 >
 > Confirmed by the user (2026-06-25): Sony `.ARW`; output = XMP sidecar **and**
@@ -55,31 +55,32 @@ is the advisor's required output format.
 ## 3. The unified AI provider framework (统一 API 框架)
 
 A single Rust trait abstracts *all* AI calls so providers are interchangeable and
-transport-agnostic (HTTP API, or shelling out to the `claude` CLI). Two roles:
+transport-agnostic (an HTTP API, or shelling out to the `claude` CLI). Two roles,
+each independently configurable in the in-app **Settings (⚙)** panel:
 
-| Role | Who (default) | Sees pixels? | Job |
-|------|---------------|--------------|-----|
-| **Image advisor** | GPT (vision model) | **yes** (preview) | Look at the photo → emit an `EditRecipe`. |
-| **Analyst / verifier** | Claude | **no** (data only) | Reason over EXIF/histogram; **acceptance-verify** the recipe before it's applied (ranges sane? consistent with metadata & stated intent? confidence adequate?) and flag/veto bad recipes. |
+| Role | Provider options | Sees pixels? | Job |
+|------|------------------|--------------|-----|
+| **Image advisor** (图像) | **API only** — OpenAI-compatible vision (default `gpt-5.5`) | **yes** (preview) | Look at the photo → emit an `EditRecipe`. The `claude` CLI has no image input in print mode, so this role can't use OAuth. |
+| **Analyst / verifier** (分析) | **OAuth** (`claude` CLI, default model `opus`) **or** API (OpenAI-compatible chat) | **no** (data only) | Reason over EXIF/histogram; **acceptance-verify** the recipe (ranges sane? consistent with metadata & intent? confidence adequate?) and flag/veto bad recipes. |
 
-> Interpretation of "收货验证" (to confirm): Claude verifies at the **data level**
-> — recipe + histogram/clipping stats + the advisor's rationale — *without*
-> re-doing vision. The trait leaves room to optionally hand Claude a thumbnail
-> later if pixel-level QA proves necessary.
+> The verifier judges at the **data level** — recipe + histogram/clipping stats +
+> the advisor's rationale — *without* re-doing vision.
 
-Sketch (final shape pinned in M1):
+Sketch (final shape):
 
 ```rust
 trait Advisor {                      // one trait, many providers
     fn propose(&self, img: &Preview, meta: &Meta) -> Result<EditRecipe>;   // image role
     fn verify(&self, recipe: &EditRecipe, meta: &Meta) -> Result<Verdict>; // analyst role
 }
-// impls: OpenAiProvider (HTTP, vision)  |  ClaudeProvider (claude CLI -p, OAuth, or Anthropic API)
+// propose: OpenAiProvider (HTTP vision)        |  HeuristicProposer (no-key baseline)
+// verify:  ClaudeProvider (claude CLI -p OAuth) |  OpenAiVerifier (HTTP chat, OpenAI-compatible)
 ```
 
-Provider selection + keys live in `autoshop.local.toml` / `.env` (gitignored).
-Claude via the `claude` CLI reuses Claude Code OAuth — **no Anthropic key needed**;
-the OpenAI vision path needs an `OPENAI_API_KEY`.
+Provider/model/key selection lives in `autoshop.local.json` (written by the
+Settings panel) and/or `.env` — both gitignored; the local file overrides env.
+The OAuth analysis path reuses Claude Code OAuth — **no API key needed**; the
+image path and the API analysis path each need an OpenAI-compatible key.
 
 ## 4. Components & milestones
 
@@ -115,10 +116,12 @@ pinned in config — not hardcoded from memory.
 
 ### 4.3 Claude analyst / verifier (M1)
 
-Claude is called for non-image reasoning + acceptance verification via
-`claude -p --output-format json --model <opus|sonnet>` (flags verified present in
-CLI v2.1.158: `--print`, `--output-format`, `--model`, `--append-system-prompt`),
-reusing Claude Code OAuth — no API key. It returns a `Verdict` (accept / revise /
+The verifier (analysis role) runs one of two providers (set in Settings):
+**OAuth** — the `claude` CLI for non-image reasoning + acceptance verification via
+`claude -p --bare --output-format json --model <opus>` (default `opus`; flags
+verified present in CLI v2.1.158), reusing Claude Code OAuth — no API key; or
+**API** — an OpenAI-compatible chat endpoint (`OpenAiVerifier`, `/chat/completions`)
+sharing the same data-only prompt. Either returns a `Verdict` (accept / revise /
 reject + reasons). A rejected recipe can trigger one revision round with the
 vision advisor.
 
