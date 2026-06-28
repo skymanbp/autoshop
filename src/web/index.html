@@ -59,12 +59,22 @@
   label.chk { display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--muted); cursor:pointer; user-select:none; }
 
   .controls { margin-top:16px; display:grid; grid-template-columns:1fr 320px; gap:16px; align-items:start; }
+  .leftcol { display:flex; flex-direction:column; gap:14px; min-width:0; }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px 14px; }
   .panel h3 { margin:0 0 10px; font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+  .panel h3 .sub { color:#6b7177; text-transform:none; letter-spacing:0; font-weight:400; }
   .slider { display:grid; grid-template-columns:92px 1fr 46px; gap:8px; align-items:center; margin:5px 0; }
   .slider label { font-size:12px; }
   .slider input[type=range] { width:100%; }
   .slider .val { font-size:12px; text-align:right; color:var(--muted); }
+  /* sub-selector row (HSL band / grading region) + a colour swatch for the band */
+  .subrow { display:flex; gap:8px; align-items:center; margin:0 0 10px; flex-wrap:wrap; }
+  .subrow select { flex:none; }
+  .subrow .swatch { width:16px; height:16px; border-radius:50%; border:1px solid var(--line); flex:none; }
+  .subrow .hint { margin:0; }
+  .panel .reset-mini { background:#2b2e31; border:1px solid var(--line); color:var(--muted); padding:2px 8px; border-radius:6px; font-size:11px; cursor:pointer; margin-left:auto; }
+  .panel .reset-mini:hover { color:var(--fg); }
+  .wb-custom { margin-top:8px; }
 
   .save-panel .savegrid { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
   .verdict { font-size:13px; }
@@ -162,7 +172,26 @@
   </div>
 
   <div class="controls">
-    <div class="panel sliders"><h3>Develop</h3></div>
+    <div class="leftcol">
+      <div class="panel sliders"><h3>Develop</h3></div>
+      <div class="panel hsl-panel">
+        <h3>Color Mixer <span class="sub">· HSL per-colour</span></h3>
+        <div class="subrow">
+          <span class="swatch hsl-swatch"></span>
+          <select class="hsl-band"></select>
+          <span class="hint">hue / saturation / luminance of the chosen colour</span>
+          <button type="button" class="reset-mini hsl-reset" title="Reset all 8 HSL bands">reset HSL</button>
+        </div>
+      </div>
+      <div class="panel grade-panel">
+        <h3>Color Grading <span class="sub">· split-tone wheels</span></h3>
+        <div class="subrow">
+          <select class="grade-region"></select>
+          <span class="hint">tone this tonal region (hue/sat) + lift it (lum)</span>
+          <button type="button" class="reset-mini grade-reset" title="Reset all grading wheels">reset grade</button>
+        </div>
+      </div>
+    </div>
     <div>
       <div class="panel" style="margin-bottom:14px">
         <h3>Verdict</h3>
@@ -269,13 +298,31 @@ const SLIDERS = [
   ["dehaze","Dehaze",-100,100,1],
   ["vibrance","Vibrance",-100,100,1],
   ["saturation","Saturation",-100,100,1],
+  ["tint","Tint",-100,100,1],
   ["sharpening","Sharpening",0,150,1],
   ["noise_reduction","Noise Reduction",0,100,1],
 ];
+// HSL bands — recipe.hsl arrays are indexed in THIS order; each band gets a
+// representative swatch colour for the selector.
+const HSL_BANDS = [
+  ["Red","#e0524a"],["Orange","#e08a3c"],["Yellow","#d8c63a"],["Green","#5bbf57"],
+  ["Aqua","#46c0c0"],["Blue","#4c8bf5"],["Purple","#9a6cd0"],["Magenta","#d05ba8"],
+];
+const HSL_AXES = [["hue","Hue"],["saturation","Saturation"],["luminance","Luminance"]];
+// Colour-grade wheels (recipe.color_grade field prefixes) + the two globals.
+const GRADE_REGIONS = [["shadow","Shadows"],["midtone","Midtones"],["highlight","Highlights"],["global","Global"]];
+const newHsl = () => ({ hue:[0,0,0,0,0,0,0,0], saturation:[0,0,0,0,0,0,0,0], luminance:[0,0,0,0,0,0,0,0] });
+const newGrade = () => ({
+  shadow_hue:0, shadow_sat:0, shadow_lum:0, midtone_hue:0, midtone_sat:0, midtone_lum:0,
+  highlight_hue:0, highlight_sat:0, highlight_lum:0, global_hue:0, global_sat:0, global_lum:0,
+  blending:50, balance:0
+});
 const DEFAULT_RECIPE = {
   version:1, exposure_ev:0, contrast:0, highlights:0, shadows:0, whites:0, blacks:0,
   temperature_k:null, tint:0, vibrance:0, saturation:0, clarity:0, dehaze:0,
-  sharpening:0, noise_reduction:0, straighten_deg:0, crop:null, tone_curve:[],
+  hsl:newHsl(), color_grade:newGrade(),
+  sharpening:0, noise_reduction:0, straighten_deg:0, crop:null,
+  tone_curve:[], red_curve:[], green_curve:[], blue_curve:[],
   masks:[], rationale:"", confidence:0
 };
 
@@ -453,10 +500,111 @@ function buildSliders(container) {
   }
 }
 function syncSliders() {
-  document.querySelectorAll(".slider input").forEach(input=>{
+  // Only the keyed Develop sliders here — HSL/grade sliders sync separately.
+  document.querySelectorAll(".slider input[data-key]").forEach(input=>{
     const k = input.dataset.key;
     input.value = state.recipe[k] ?? 0;
     input.parentElement.querySelector(".val").textContent = fmtVal(state.recipe[k] ?? 0, parseFloat(input.step));
+  });
+  syncWb(); syncHsl(); syncGrade();
+}
+
+// --- white balance (temperature_k is nullable = as-shot) -------------------
+function buildWb(panel) {
+  const row = document.createElement("div");
+  row.className = "slider wb-temp-row";
+  row.innerHTML = `<label>Temp (K)</label>
+    <input type="range" class="wb-temp" min="2000" max="40000" step="50"/>
+    <span class="val wb-temp-val"></span>`;
+  const chk = document.createElement("label");
+  chk.className = "chk wb-custom";
+  chk.innerHTML = `<input type="checkbox" class="wb-custom-on"/> Custom white balance (off = as-shot)`;
+  panel.querySelector("h3").after(row, chk);
+  const temp = row.querySelector(".wb-temp"), on = chk.querySelector(".wb-custom-on");
+  temp.oninput = () => {
+    if (!on.checked) return;
+    state.recipe.temperature_k = parseFloat(temp.value);
+    row.querySelector(".wb-temp-val").textContent = Math.round(temp.value);
+    scheduleAfter();
+  };
+  temp.onchange = () => pushHistory(state.recipe);
+  on.onchange = () => {
+    if (on.checked) { if (state.recipe.temperature_k == null) temp.value = 5500; state.recipe.temperature_k = parseFloat(temp.value); }
+    else state.recipe.temperature_k = null;
+    syncWb(); scheduleAfter(); pushHistory(state.recipe);
+  };
+}
+function syncWb() {
+  const temp = document.querySelector(".wb-temp"), on = document.querySelector(".wb-custom-on");
+  if (!temp || !on) return;
+  const k = state.recipe.temperature_k;
+  on.checked = k != null;
+  temp.disabled = k == null;
+  temp.value = k != null ? k : 5500;
+  document.querySelector(".wb-temp-val").textContent = k != null ? Math.round(k) : "auto";
+}
+
+// --- HSL colour mixer (8 bands × hue/sat/lum) ------------------------------
+function buildHsl(panel) {
+  const sel = panel.querySelector(".hsl-band");
+  sel.innerHTML = HSL_BANDS.map((b,i)=>`<option value="${i}">${b[0]}</option>`).join("");
+  panel.querySelectorAll(".slider").forEach(e=>e.remove());
+  for (const [axis,label] of HSL_AXES) {
+    const row = document.createElement("div"); row.className = "slider hsl-slider";
+    row.innerHTML = `<label>${label}</label><input type="range" min="-100" max="100" step="1" data-axis="${axis}"/><span class="val"></span>`;
+    const input = row.querySelector("input");
+    input.oninput = () => { const b=+sel.value; (state.recipe.hsl ||= newHsl())[axis][b]=parseFloat(input.value); row.querySelector(".val").textContent=Math.round(input.value); scheduleAfter(); };
+    input.onchange = () => pushHistory(state.recipe);
+    panel.appendChild(row);
+  }
+  sel.onchange = syncHsl;
+  panel.querySelector(".hsl-reset").onclick = () => { state.recipe.hsl = newHsl(); syncHsl(); pushHistory(state.recipe); renderAfter(); };
+  syncHsl();
+}
+function syncHsl() {
+  const sel = document.querySelector(".hsl-band"); if (!sel) return;
+  const b = +sel.value;
+  const sw = document.querySelector(".hsl-swatch"); if (sw) sw.style.background = HSL_BANDS[b][1];
+  document.querySelectorAll(".hsl-slider").forEach(row=>{
+    const axis = row.querySelector("input").dataset.axis;
+    const v = state.recipe.hsl?.[axis]?.[b] ?? 0;
+    row.querySelector("input").value = v;
+    row.querySelector(".val").textContent = Math.round(v);
+  });
+}
+
+// --- colour grading (shadow/mid/highlight/global wheels) -------------------
+function gradeKey(attr) {
+  if (attr === "blending" || attr === "balance") return attr;        // globals
+  const region = document.querySelector(".grade-region")?.value || "shadow";
+  return `${region}_${attr}`;
+}
+function buildGrade(panel) {
+  const sel = panel.querySelector(".grade-region");
+  sel.innerHTML = GRADE_REGIONS.map(r=>`<option value="${r[0]}">${r[1]}</option>`).join("");
+  panel.querySelectorAll(".slider").forEach(e=>e.remove());
+  const mk = (label, attr, min, max) => {
+    const row = document.createElement("div"); row.className = "slider grade-slider"; row.dataset.attr = attr;
+    row.innerHTML = `<label>${label}</label><input type="range" min="${min}" max="${max}" step="1"/><span class="val"></span>`;
+    const input = row.querySelector("input");
+    input.oninput = () => { (state.recipe.color_grade ||= newGrade())[gradeKey(attr)] = parseFloat(input.value); row.querySelector(".val").textContent = Math.round(input.value); scheduleAfter(); };
+    input.onchange = () => pushHistory(state.recipe);
+    panel.appendChild(row);
+  };
+  mk("Hue","hue",0,360); mk("Saturation","sat",0,100); mk("Luminance","lum",-100,100);
+  mk("Blending","blending",0,100); mk("Balance","balance",-100,100);
+  sel.onchange = syncGrade;
+  panel.querySelector(".grade-reset").onclick = () => { state.recipe.color_grade = newGrade(); syncGrade(); pushHistory(state.recipe); renderAfter(); };
+  syncGrade();
+}
+function syncGrade() {
+  if (!document.querySelector(".grade-region")) return;
+  document.querySelectorAll(".grade-slider").forEach(row=>{
+    const attr = row.dataset.attr;
+    const dflt = attr === "blending" ? 50 : 0;
+    const v = state.recipe.color_grade?.[gradeKey(attr)] ?? dflt;
+    row.querySelector("input").value = v;
+    row.querySelector(".val").textContent = Math.round(v);
   });
 }
 
@@ -481,7 +629,6 @@ async function selectPhoto(id, stem, el) {
   const main = $("#main");
   main.innerHTML = "";
   main.appendChild($("#detail-tpl").content.cloneNode(true));
-  buildSliders(main.querySelector(".sliders"));
   $(".before").src = `/api/preview?id=${id}`;
 
   const rr = await fetch(`/api/recipe?id=${id}`);
@@ -493,6 +640,11 @@ async function selectPhoto(id, stem, el) {
     state.recipe = structuredClone(DEFAULT_RECIPE);
     $(".verdict").textContent = "Not analyzed yet.";
   }
+  // Build the controls now that state.recipe is known, then populate them.
+  buildSliders(main.querySelector(".sliders"));
+  buildWb(main.querySelector(".sliders"));
+  buildHsl(main.querySelector(".hsl-panel"));
+  buildGrade(main.querySelector(".grade-panel"));
   syncSliders();
   resetHistory(state.recipe);
   renderAfter();
