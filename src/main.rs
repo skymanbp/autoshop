@@ -242,12 +242,14 @@ fn main() -> Result<()> {
         Command::Reimagine { raw, prompt, fidelity, quality, out } => {
             let cfg = Config::load();
             let out = out.unwrap_or_else(|| default_out(&raw, "reimagine", "png"));
+            pipeline::guard_readonly(&out, &raw)?; // never write into the source library
             let q = quality.unwrap_or_else(|| cfg.openai_image_quality.clone());
             generative::reimagine(&cfg, &raw, &prompt, &fidelity, &q, &out)
         }
         Command::Retouch { raw, mask, prompt, quality, full_res, out } => {
             let cfg = Config::load();
             let out = out.unwrap_or_else(|| default_out(&raw, "retouch", "png"));
+            pipeline::guard_readonly(&out, &raw)?; // never write into the source library
             let q = quality.unwrap_or_else(|| cfg.openai_image_quality.clone());
             generative::retouch(&cfg, &raw, &mask, &prompt, &q, full_res, &out)
         }

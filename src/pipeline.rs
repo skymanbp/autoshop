@@ -237,3 +237,34 @@ pub fn find_sources(dir: &Path) -> Result<Vec<PathBuf>> {
     out.sort();
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guard_refuses_writes_into_the_source_library() {
+        // A RAW living in the (read-only) photo library.
+        let raw = Path::new("D:/Photography/Raw/2024/Trip/DSC0001.ARW");
+        // Writing a sibling INTO that folder must be refused.
+        let sibling = Path::new("D:/Photography/Raw/2024/Trip/DSC0001.developed.tif");
+        assert!(guard_readonly(sibling, raw).is_err(), "must refuse a sibling write");
+        // A subfolder under the RAW's folder is refused too.
+        let under = Path::new("D:/Photography/Raw/2024/Trip/out/DSC0001.tif");
+        assert!(guard_readonly(under, raw).is_err(), "must refuse a subfolder write");
+        // The default ./out (outside the library) is allowed.
+        let safe = default_out(raw, "developed", "tif");
+        assert!(guard_readonly(&safe, raw).is_ok(), "./out must be allowed");
+    }
+
+    #[test]
+    fn outputs_always_default_outside_the_library() {
+        let raw = Path::new("D:/Photography/Raw/2024/Trip/DSC0001.ARW");
+        // Every default output + the XMP sidecar land under ./out, never beside
+        // the RAW — the library stays read-only by construction.
+        assert!(default_out(raw, "developed", "tif").starts_with("out"));
+        assert!(default_out(raw, "recipe", "json").starts_with("out"));
+        assert!(xmp_target(raw).starts_with("out"));
+        assert_eq!(xmp_target(raw), Path::new("out/DSC0001.xmp")); // stem preserved
+    }
+}
