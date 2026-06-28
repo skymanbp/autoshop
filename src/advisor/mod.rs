@@ -147,9 +147,13 @@ pub(crate) fn build_verify_prompt(
     let meta_json = serde_json::to_string(meta)?;
     Ok(format!(
         "You are a photo-edit QA verifier. You do NOT see the image — judge ONLY from the data below.\n\
-Decide whether this proposed RAW develop recipe is safe to apply. Check, concretely:\n\
+Decide whether this proposed RAW develop recipe is both SAFE and COMMITTED enough to apply. A \
+finished photograph is the goal, NOT timidity. Check, concretely:\n\
 - every slider is within its documented range (exposure_ev -5..5; most sliders -100..100; sharpening 0..150; confidence 0..1);\n\
-- adjustments are consistent with the metadata + histogram (e.g. do NOT brighten when highlights already clip; do NOT crush shadows that are already dark; large moves need justification);\n\
+- adjustments are consistent with the metadata + histogram:\n\
+  * do NOT push exposure/whites further INTO already-clipping highlights, and do NOT crush detail already sitting at the floor — but a few percent of intentional highlight/shadow clipping is normal and fine for a finished look;\n\
+  * large, decisive moves are GOOD when the histogram supports them (a flat, low-contrast histogram wants real contrast or an S-curve; a muddy image wants a committed black point). Do NOT penalise a move just for being large;\n\
+- CONVERSELY, REVISE a recipe that is too FLAT or TIMID for a finished result: near-zero contrast with no tonal anchor (no S-curve, empty tone_curve, ~0 contrast), or every slider hugging 0 while the histogram clearly has tonal room. Tell it to commit — add contrast / an S-curve, set the white and black points, shape the subject with a dodge/burn mask;\n\
 - the rationale matches the numbers and confidence is adequate to auto-apply.\n\n\
 METADATA: {meta_json}\n\
 HISTOGRAM: {hist}\n\

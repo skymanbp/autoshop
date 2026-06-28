@@ -57,17 +57,25 @@ impl Advisor for OpenAiProvider {
         let b64 = base64::engine::general_purpose::STANDARD.encode(&img.jpeg);
         let meta_json = serde_json::to_string(meta).map_err(AdvisorError::Json)?;
         let mut instruction = format!(
-            "You are a photo-edit advisor. Look at this RAW preview and its metadata/histogram and \
-return an EditRecipe (develop adjustments) that makes a tasteful, natural edit. Stay within the \
-documented slider ranges. Use the `masks` array ONLY when a global edit cannot achieve the look \
-(e.g. a too-bright sky needing local darkening, or a dim subject needing a local lift) — otherwise \
-leave it empty. Prefer a linear gradient (kind=linear; zero_* = start edge, full_* = end edge, in \
-0..1 frame coords) for skies/horizons/foregrounds; radial (kind=radial) for subjects/vignettes. \
+            "You are a master photo-edit colourist. Look at this RAW preview and its \
+metadata/histogram and return an EditRecipe that develops it into a FINISHED, committed \
+photograph — a 成片 — not a flat, 'safe' tweak. A finished develop COMMITS: set a real tonal \
+anchor (a gentle S-shaped contrast AND/OR a 3-5 point `tone_curve` with a placed black point, a \
+deepened shadow, and a bright shoulder), set the white and black points with whites/blacks, and \
+shape colour with vibrance/saturation toward the look the scene wants. Use the FULL documented \
+slider range when the image calls for it — recover blown highlights, open shadows, add \
+clarity/contrast — instead of defaulting to timid ±10 moves. The documented ranges are SAFETY \
+bounds, not a style target; stay inside them but do not hug zero. \
+Use the `masks` array PROACTIVELY to dodge and burn like a darkroom print: even with NO explicit \
+user request, add 1-2 local masks to lift the subject, hold back a hot sky, or deepen distracting \
+corners when it makes the photo read better. Masks are tonal/colour adjustments through gradient \
+masks — never painting, generating, or adding content. If a global edit alone achieves the look, \
+leave masks empty. Prefer a linear gradient (kind=linear; zero_* = start edge, full_* = end edge, \
+in 0..1 frame coords) for skies/horizons/foregrounds; radial (kind=radial) for subjects/vignettes. \
 When the USER DIRECTION names a SPECIFIC AREA (e.g. 'that corner', 'the sky', 'the subject', \
 'top-left', 'this part is too noisy', 'brighten her face') translate it into a mask placed over \
 THAT area and set the relevant local sliders — including local `noise_reduction` (0..100) for a \
-noisy region. Use 1-3 masks for such localized requests; reserve the global sliders for \
-whole-image looks. \
+noisy region. Use 1-3 masks for such localized requests. \
 Local slider values use the same scale as the globals. METADATA: {meta_json}  HISTOGRAM: {hist}",
             meta_json = meta_json,
             hist = hist_summary(hist),

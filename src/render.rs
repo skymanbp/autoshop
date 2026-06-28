@@ -530,11 +530,19 @@ fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
 /// curve, over input gamma values [0,1].
 fn build_tone_lut(r: &EditRecipe) -> Vec<f32> {
     let gain = 2.0_f32.powf(r.exposure_ev);
-    let contrast = r.contrast / 100.0;
+    // Clamp to [-1,1] so the S-curve below stays monotonic even if an
+    // un-clamped recipe (preview / mask-local) carries an out-of-range value.
+    let contrast = (r.contrast / 100.0).clamp(-1.0, 1.0);
     let (whites, blacks) = (r.whites / 100.0, r.blacks / 100.0);
     let (highlights, shadows) = (r.highlights / 100.0, r.shadows / 100.0);
     // Pre-build the user tone curve as a 256-entry LUT (identity if empty).
     let curve = tone_curve_lut(r);
+
+    // Per-region authority: how far (in output units) a fully-pushed slider may
+    // move its zone. Raised from the old gentle ±0.15 to ±0.30 so highlight
+    // recovery / shadow lift are actually visible in a finished look (plan T1.B).
+    const REGION_AUTH: f32 = 0.30;
+    use std::f32::consts::PI;
 
     (0..LUT_N)
         .map(|i| {
@@ -543,13 +551,32 @@ fn build_tone_lut(r: &EditRecipe) -> Vec<f32> {
             // 1) exposure in linear light
             let mut v = linear_to_srgb((srgb_to_linear(x) * gain).clamp(0.0, 1.0));
 
-            // 2) contrast (linear slope around mid-grey)
-            v = (0.5 + (v - 0.5) * (1.0 + contrast)).clamp(0.0, 1.0);
+            // 2) contrast as a real S-curve pinned at 0 and 1 (toe + shoulder),
+            //    NOT a clipping linear slope. With u = 2(v-0.5) ∈ [-1,1] and
+            //    k = contrast/π: f(v) = 0.5 + 0.5·(u + k·sin(πu)). Exact identity
+            //    at contrast=0, central slope 1+contrast, endpoint slope
+            //    1-|contrast| ≥ 0 — monotonic over the whole −100..100 range, so
+            //    shadows/highlights compress toward the pinned ends instead of
+            //    blocking up / clipping the way the old linear stretch did.
+            let u = 2.0 * (v - 0.5);
+            let k = contrast / PI;
+            v = (0.5 + 0.5 * (u + k * (PI * u).sin())).clamp(0.0, 1.0);
 
-            // 3) region tones (gentle ±0.15 weighting toward each end)
-            let hi = smoothstep(0.5, 1.0, v);
-            let lo = 1.0 - smoothstep(0.0, 0.5, v);
-            v = (v + 0.15 * (whites * hi + highlights * hi + blacks * lo + shadows * lo))
+            // 3) region tones — four DIFFERENTIATED zones (ACR-like): whites move
+            //    the white point, highlights the upper-mids, shadows the
+            //    lower-mids, blacks the black point. whites/blacks reach the
+            //    pinned endpoints; highlights/shadows are midtone humps that fade
+            //    to 0 at the extremes (so they recover detail without re-clipping).
+            let w_black = 1.0 - smoothstep(0.0, 0.5, v); // 1 @ black → 0 @ mid
+            let w_white = smoothstep(0.5, 1.0, v); // 0 @ mid → 1 @ white
+            let w_shadow = smoothstep(0.0, 0.35, v) * (1.0 - smoothstep(0.35, 0.7, v));
+            let w_highlight = smoothstep(0.3, 0.65, v) * (1.0 - smoothstep(0.65, 1.0, v));
+            v = (v
+                + REGION_AUTH
+                    * (whites * w_white
+                        + highlights * w_highlight
+                        + shadows * w_shadow
+                        + blacks * w_black))
                 .clamp(0.0, 1.0);
 
             // 4) user tone curve
@@ -742,6 +769,42 @@ mod tests {
                 assert!((a[c] - b[c]).abs() < 0.02, "channel drift {} vs {}", a[c], b[c]);
             }
         }
+    }
+
+    #[test]
+    fn scurve_contrast_pins_ends_and_steepens_midtones() {
+        // Positive contrast must keep 0→0 and 1→1 (pinned endpoints), darken a
+        // shadow value, brighten a highlight value (the S shape), and stay
+        // monotonic — the old linear stretch clipped instead of pinning.
+        let lut = build_tone_lut(&EditRecipe { contrast: 80.0, ..Default::default() });
+        assert!(sample_lut(&lut, 0.0) < 0.01, "black pinned: {}", sample_lut(&lut, 0.0));
+        assert!(sample_lut(&lut, 1.0) > 0.99, "white pinned: {}", sample_lut(&lut, 1.0));
+        assert!(sample_lut(&lut, 0.25) < 0.25, "shadow darkened: {}", sample_lut(&lut, 0.25));
+        assert!(sample_lut(&lut, 0.75) > 0.75, "highlight brightened: {}", sample_lut(&lut, 0.75));
+        let mut prev = -1.0;
+        for &y in &lut {
+            assert!(y >= prev - 1e-4, "non-monotonic: {y} after {prev}");
+            prev = y;
+        }
+    }
+
+    #[test]
+    fn region_tones_target_four_different_zones() {
+        // The old engine moved whites≡highlights and blacks≡shadows with the
+        // SAME weight; now each owns a distinct tonal zone. Gentle (±30) pushes
+        // keep every sample point unclamped so the comparison is clean.
+        let base = build_tone_lut(&EditRecipe::default());
+        let d = |r: &EditRecipe, x: f32| sample_lut(&build_tone_lut(r), x) - sample_lut(&base, x);
+        let whites = EditRecipe { whites: 30.0, ..Default::default() };
+        let highs = EditRecipe { highlights: 30.0, ..Default::default() };
+        let shadows = EditRecipe { shadows: 30.0, ..Default::default() };
+        let blacks = EditRecipe { blacks: 30.0, ..Default::default() };
+        // Bright side: upper-mid (0.6) belongs to highlights, white point (0.9) to whites.
+        assert!(d(&highs, 0.6) > d(&whites, 0.6) + 0.02, "highlights own the upper-mids");
+        assert!(d(&whites, 0.9) > d(&highs, 0.9) + 0.02, "whites own the white point");
+        // Dark side mirrors it: lower-mid (0.4) to shadows, black point (0.1) to blacks.
+        assert!(d(&shadows, 0.4) > d(&blacks, 0.4) + 0.02, "shadows own the lower-mids");
+        assert!(d(&blacks, 0.1) > d(&shadows, 0.1) + 0.02, "blacks own the black point");
     }
 
     #[test]
