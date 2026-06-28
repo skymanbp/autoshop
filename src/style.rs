@@ -122,6 +122,11 @@ pub struct StyleIndex {
     pub mean: Vec<f32>,
     pub std: Vec<f32>,
     pub exemplars: Vec<StyleExemplar>,
+    /// Absolute folder this index was built from (the user's edited-RAW library),
+    /// so the UI can show its provenance. `#[serde(default)]` keeps old index
+    /// files (written before this field) loadable.
+    #[serde(default)]
+    pub source_dir: Option<String>,
 }
 
 impl StyleIndex {
@@ -152,7 +157,9 @@ impl StyleIndex {
             }
         }
         let (mean, std) = compute_norm(&exemplars);
-        Ok(StyleIndex { version: 1, mean, std, exemplars })
+        // Record where this index was built from, for UI provenance / other users.
+        let source_dir = std::path::absolute(dir).map(|p| p.display().to_string()).ok();
+        Ok(StyleIndex { version: 1, mean, std, exemplars, source_dir })
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {

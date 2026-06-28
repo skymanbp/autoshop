@@ -2,8 +2,9 @@
 
 > Status: **implemented**. The full decode → advise → verify → render pipeline
 > ships, plus the web UI, AI denoise (SCUNet sidecar), the PNG/TIFF baked-source
-> mode, style retrieval, XMP sidecars (global + local masks), and experimental
-> generative edits. 23 unit tests pass. This document describes the design; a few
+> mode, style retrieval, XMP sidecars (global + local masks), experimental
+> generative edits, and an optional pixel-**heal** retouch mode (§4.7). 27 unit
+> tests pass. This document describes the design; a few
 > historical **[verify]** notes are left in place for provenance.
 >
 > Confirmed by the user (2026-06-25): Sony `.ARW`; output = XMP sidecar **and**
@@ -97,6 +98,7 @@ image path and the API analysis path each need an OpenAI-compatible key.
 | V2 | AI denoise (high-ISO/astro) | Python sidecar → **SCUNet** on GPU, called from Rust | **done** |
 | V2 | Baked-source mode (edit exported PNG/TIFF) | extension dispatch; develop runs on loaded pixels | **done** |
 | V2 | Generative reimagine / retouch | OpenAI Images (`gpt-image-*`) | **done (experimental)** |
+| V2 | Pixel retouch / heal (spot removal) | deterministic heal engine + vision spot-detect ([`src/retouch.rs`](../src/retouch.rs)) | **done (experimental)** |
 
 ### 4.1 RAW decode (M1)
 
@@ -144,6 +146,27 @@ The user's **finished edits** are ground truth. If they're Lightroom XMP/develop
 settings, diff the AI recipe against them; if they're exported JPEGs, compare the
 AI render perceptually. Lets us measure "does the AI match *how the user*
 develops a shot?" and tune the advisor prompt accordingly.
+
+### 4.7 Pixel retouch / heal (optional) — V2
+
+A third, opt-in editing mode (`autoshop heal`, or the UI's **修图 · 去瑕疵** panel),
+distinct from BOTH the parametric path (which never touches pixels) and the
+generative path (which *synthesises* them). It does traditional **spot-healing**:
+small defects (dust, sensor spots, blemishes, specks) are removed by sampling
+SURROUNDING REAL pixels and blending them over the defect with a mean-corrected,
+feathered patch (the "heal" vs "clone" distinction). By construction the engine
+only ever copies / shifts / averages pixels that ALREADY exist — it never invents
+content, so this stays *retouching, not generation* (the hard design constraint).
+
+Targeting is hybrid: a vision model auto-detects small spots
+([`detect_spots`](../src/retouch.rs), constrained by prompt + schema to small
+spot-removals) and/or the user paints regions in the UI
+([`plan_from_mask`](../src/retouch.rs) → connected components → circular targets);
+both feed the deterministic [`heal_image`](../src/retouch.rs) engine. Donors are
+auto-searched (the in-bounds neighbour whose surroundings best match the spot's
+border) unless an explicit source offset is given. Output is a pixel master in
+./out — **non-XMP** (pixel edits don't serialise to ACR). Runs on the embedded
+preview by default; `--full-res` heals the full-sensor develop (slow, RAW only).
 
 ## 5. Why Rust
 

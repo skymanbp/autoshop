@@ -29,8 +29,8 @@ The mechanical part is *applying* it. Autoshop splits exactly there:
 [`EditRecipe`](src/recipe.rs) — a small, bounded, Lightroom/ACR-style JSON of
 slider values — and a deterministic engine renders from the original RAW. That
 keeps results reproducible, non-destructive, auditable, and free of hallucinated
-detail. (Two *opt-in*, clearly-labelled exceptions touch pixels: AI **denoise**
-and **generative** retouch — see below.)
+detail. (Three *opt-in*, clearly-labelled exceptions touch pixels: AI **denoise**,
+**generative** retouch, and **pixel heal** — see below.)
 
 ## Features
 
@@ -49,6 +49,10 @@ and **generative** retouch — see below.)
 - **Style retrieval** — learns from *similar* past edits you've made (k-NN over
   EXIF + histogram) and offers them to the advisor as soft reference.
 - **Generative (experimental)** — `reimagine` / `retouch` via OpenAI Images.
+- **Pixel retouch / Heal (experimental)** — an optional mode where the AI removes
+  dust / blemishes / specks by healing from SURROUNDING REAL pixels
+  (deterministic; *not* generative — it invents nothing). Hybrid targeting: AI
+  auto-detect + paint-to-add. Writes a pixel master to `./out`.
 - **Batch** the whole library, **eval** the AI against your own edits.
 - **Your library stays read-only** — outputs only ever go to `./out`; the engine
   refuses to write into a source RAW's folder.
@@ -59,7 +63,7 @@ and **generative** retouch — see below.)
 
 ```bash
 cargo build --release            # builds target/release/autoshop(.exe)
-cargo test                       # 16 passing tests
+cargo test                       # 27 passing tests
 ```
 
 Then either:
@@ -84,7 +88,8 @@ autoshop eval    <dir> [--limit N]           # compare AI edits vs your own .xmp
 autoshop style-index <dir>                   # build the "your taste" reference index
 autoshop serve   <dir> [--port 8080]         # local web UI
 autoshop reimagine <raw> --prompt "..."      # experimental generative restyle
-autoshop retouch   <raw> --mask m.png --prompt "..."    # experimental object removal
+autoshop retouch   <raw> --mask m.png --prompt "..."    # experimental generative object removal
+autoshop heal      <src> [--mask m.png] [--no-auto]     # pixel heal: spot/blemish removal (NOT generative)
 autoshop recipe-schema                       # print the EditRecipe JSON shape
 ```
 
@@ -164,6 +169,13 @@ Everything below is also settable in the **Settings (⚙)** panel; the local fil
   (~60 MP; slow — only the small removed patch is upscaled). Both pick an
   aspect-correct size (no square-squash) and default to `quality=high`
   (override `--quality`).
+- Pixel **heal** (`autoshop heal` / the UI's 去瑕疵 panel) is the *non*-generative
+  retoucher: it removes only SMALL defects (dust / blemishes / specks) by sampling
+  surrounding REAL pixels — it never invents content. Best on fairly uniform
+  backgrounds (sky, skin, wall, water); busy backgrounds heal approximately. AI
+  auto-detection needs the vision key; the paint-a-mask path works offline. Runs
+  on the preview by default; `--full-res` heals the full-sensor develop (slow,
+  RAW only).
 
 ## Tech
 

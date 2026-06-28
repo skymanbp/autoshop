@@ -15,6 +15,7 @@ mod generative;
 mod pipeline;
 mod recipe;
 mod render;
+mod retouch;
 mod serve;
 mod style;
 mod xmp;
@@ -191,6 +192,28 @@ enum Command {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+    /// OPTIONAL pixel-retouch mode — AI-driven HEAL (spot / blemish / dust
+    /// removal) that edits pixels directly by sampling SURROUNDING REAL pixels.
+    /// Retouching, NOT generation: no gpt-image, no invented content. Non-XMP;
+    /// writes a pixel master to ./out. Targeting is hybrid (AI auto-detect and/or
+    /// a painted mask).
+    Heal {
+        /// RAW or baked image (.png/.tif/.jpg) to retouch.
+        src: PathBuf,
+        /// Optional painted RGBA mask (transparent = heal here) to ADD manual targets.
+        #[arg(long)]
+        mask: Option<PathBuf>,
+        /// Skip AI auto-detection (heal only the painted mask).
+        #[arg(long)]
+        no_auto: bool,
+        /// Heal the full-sensor develop (e.g. 61 MP) instead of the embedded
+        /// preview. Slow; RAW only.
+        #[arg(long)]
+        full_res: bool,
+        /// Output image (default: ./out/<stem>.heal.png).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
     /// Start the local web UI (open the printed URL in a browser).
     Serve {
         /// Photo library folder to browse (scanned recursively for .ARW).
@@ -228,6 +251,7 @@ fn main() -> Result<()> {
             let q = quality.unwrap_or_else(|| cfg.openai_image_quality.clone());
             generative::retouch(&cfg, &raw, &mask, &prompt, &q, full_res, &out)
         }
+        Command::Heal { src, mask, no_auto, full_res, out } => heal_cmd(&src, mask, no_auto, full_res, out),
         Command::Serve { dir, port } => serve::serve(&dir, port),
         Command::RecipeSchema => {
             let template = EditRecipe::default();
@@ -400,6 +424,35 @@ fn denoise_cmd(
         denoise::denoise_file(&opts, input, &out)?;
         println!("denoised -> {}", out.display());
     }
+    Ok(())
+}
+
+/// OPTIONAL pixel-retouch (heal) mode: AI auto-detects and/or a painted mask, and
+/// the deterministic engine heals each spot from surrounding real pixels. Writes
+/// a pixel master to ./out — non-XMP (pixel edits don't serialise to ACR).
+fn heal_cmd(
+    src: &Path,
+    mask: Option<PathBuf>,
+    no_auto: bool,
+    full_res: bool,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    let cfg = Config::load();
+    let out = out.unwrap_or_else(|| default_out(src, "heal", "png"));
+    pipeline::guard_readonly(&out, src)?;
+    println!(
+        "pixel retouch (heal) — {}{} ...",
+        if no_auto { "painted mask only" } else { "AI auto-detect" },
+        if mask.is_some() && !no_auto { " + painted mask" } else { "" }
+    );
+    let report = retouch::heal(&cfg, src, mask.as_deref(), !no_auto, full_res, &out)?;
+    if !report.rationale.is_empty() {
+        println!("  {}", report.rationale);
+    }
+    println!(
+        "healed {} spot(s) -> {} ({} x {})",
+        report.spots, out.display(), report.dims.0, report.dims.1
+    );
     Ok(())
 }
 

@@ -24,7 +24,14 @@
   select, .toolbar select { background:#101113; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; font-size:12px; }
 
   .layout { display:grid; grid-template-columns:280px 1fr; height:calc(100vh - 46px); }
-  .grid { overflow-y:auto; border-right:1px solid var(--line); padding:8px; }
+  .sidebar { display:flex; flex-direction:column; border-right:1px solid var(--line); overflow:hidden; }
+  .folderbar { display:flex; gap:6px; padding:8px; border-bottom:1px solid var(--line); align-items:center; }
+  .folderbar input { flex:1; min-width:0; background:#101113; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; font-size:11px; }
+  .folderbar button { padding:6px 9px; font-size:12px; white-space:nowrap; }
+  .pagebar { display:flex; gap:8px; align-items:center; justify-content:space-between; padding:6px 8px; border-bottom:1px solid var(--line); font-size:11px; color:var(--muted); }
+  .pagebar button { padding:4px 9px; font-size:11px; }
+  .pagebar button:disabled { opacity:.35; cursor:default; }
+  .grid { overflow-y:auto; padding:8px; }
   .grid .ghead { color:var(--muted); font-size:11px; padding:4px 6px 8px; text-transform:uppercase; letter-spacing:.05em; }
   .thumb { display:flex; gap:8px; padding:6px; border-radius:6px; cursor:pointer; align-items:center; }
   .thumb:hover { background:var(--panel); }
@@ -108,7 +115,18 @@
 </header>
 
 <div class="layout">
-  <div class="grid" id="grid"></div>
+  <div class="sidebar">
+    <div class="folderbar">
+      <input id="dir-path" placeholder="Working folder — paste a path, Enter to open…" title="List photos from this folder (replaces the gallery)" />
+      <button class="secondary" id="dir-set" title="Open this folder as the working directory">Open folder</button>
+    </div>
+    <div class="pagebar" id="pagebar" hidden>
+      <button class="secondary" id="page-prev" title="Previous page">‹ Prev</button>
+      <span id="page-info"></span>
+      <button class="secondary" id="page-next" title="Next page">Next ›</button>
+    </div>
+    <div class="grid" id="grid"></div>
+  </div>
   <div class="main" id="main">
     <p style="color:var(--muted)">Select a photo on the left, or import more above.</p>
   </div>
@@ -187,6 +205,16 @@
           <button class="fill-run" type="button">Remove / Fill</button>
         </div>
         <div class="hint">Paint the region, write what belongs there, then Remove/Fill. Only the painted area is regenerated; the rest is kept. Default composites onto the source preview (fast); Full-res keeps the untouched area at native resolution (slow, RAW only). Saved to ./out. Needs OPENAI_API_KEY (gpt-image), ~15-40s.</div>
+      </div>
+      <div class="panel heal-panel" style="margin-top:14px">
+        <h3>修图 · 去瑕疵 Heal（像素）</h3>
+        <div class="hint" style="margin-top:0">Direct pixel retouch — removes dust / blemishes / specks by healing from SURROUNDING REAL pixels. Retouch, <b>not</b> generative (invents nothing). Saved to ./out.</div>
+        <div class="row">
+          <button class="heal-auto" type="button" title="AI finds small defects and heals them from surrounding pixels">✦ AI 去瑕疵 (auto)</button>
+          <button class="secondary heal-painted" type="button" title="Heal the area you painted with the Paint-mask brush above">Heal painted area</button>
+          <label class="chk" title="Heal the full-sensor develop instead of the preview (slow, RAW only)."><input type="checkbox" class="heal-fullres" /> Full-res</label>
+        </div>
+        <div class="hint">AI auto-detects small spots; or tick <i>Paint mask</i> above, paint over a defect, then <i>Heal painted area</i>. Auto needs OPENAI_API_KEY (vision).</div>
       </div>
     </div>
   </div>
@@ -286,14 +314,31 @@ document.addEventListener("keydown", e => {
 });
 
 // --- gallery + import ------------------------------------------------------
-async function loadList() {
-  const r = await fetch("/api/list");
+const PAGE = 200;          // gallery page size (a folder can hold thousands)
+let pageOffset = 0;        // current page's first GLOBAL index
+
+async function loadList(offset) {
+  if (offset != null) pageOffset = Math.max(0, offset);
+  const r = await fetch(`/api/list?offset=${pageOffset}&limit=${PAGE}`);
   const data = await r.json();
   const grid = $("#grid");
-  grid.innerHTML = `<div class="ghead">${data.total} source${data.total===1?"":"s"}${data.shown<data.total?` · showing ${data.shown}`:""}</div>`;
+  // Reflect the authoritative working folder in the field (unless the user is typing).
+  const dp = $("#dir-path");
+  if (dp && document.activeElement !== dp) dp.value = data.dir || "";
+  // Prev/next pager — shown only when there's more than one page.
+  const pb = $("#pagebar"), total = data.total || 0;
+  if (total > PAGE) {
+    pb.hidden = false;
+    const from = total ? pageOffset + 1 : 0, to = pageOffset + data.shown;
+    $("#page-info").textContent = `${from}–${to} of ${total}`;
+    $("#page-prev").disabled = pageOffset <= 0;
+    $("#page-next").disabled = pageOffset + data.shown >= total;
+  } else { pb.hidden = true; }
+  grid.innerHTML = `<div class="ghead">${total} source${total===1?"":"s"}${total>PAGE?` · page from ${pageOffset+1}`:""}</div>`;
   for (const it of data.items) {
     const div = document.createElement("div");
     div.className = "thumb"; div.dataset.id = it.id;
+    if (it.id === state.id) div.classList.add("sel");   // keep the open photo highlighted across pages
     div.innerHTML = `<img loading="lazy" src="/api/thumb?id=${it.id}"/>
       <div><div class="name">${it.stem}</div>
         <div class="tags">${it.baked?'<span class="pill">PNG/TIFF</span>':''}${it.analyzed?'<span class="badge">● edited</span>':''}</div>
@@ -301,15 +346,22 @@ async function loadList() {
     div.onclick = () => selectPhoto(it.id, it.stem, div);
     grid.appendChild(div);
   }
+  grid.scrollTop = 0;
 }
+$("#page-prev").onclick = () => loadList(pageOffset - PAGE);
+$("#page-next").onclick = () => loadList(pageOffset + PAGE);
 
-// After import/upload, refresh the gallery and jump to the first new item so it's
-// obvious it worked (new items append at the end, which may be below the fold).
-async function revealNew(firstId) {
-  await loadList();
+// After import/upload, jump to the new item's PAGE, refresh, and OPEN it DIRECTLY
+// by id — never by finding+clicking its thumbnail (it may sit on another page).
+// `stem` comes from the upload response, else the thumb, else a harmless fallback.
+async function revealNew(firstId, firstStem) {
+  if (firstId != null) pageOffset = Math.floor(firstId / PAGE) * PAGE;
+  await loadList(pageOffset);
   if (firstId == null) return;
   const el = document.querySelector(`.thumb[data-id="${firstId}"]`);
-  if (el) { el.scrollIntoView({block:"center"}); el.click(); }
+  if (el) el.scrollIntoView({block:"center"});
+  const stem = firstStem || el?.querySelector(".name")?.textContent || "photo";
+  selectPhoto(firstId, stem, el || null);
 }
 
 $("#import-btn").onclick = async () => {
@@ -326,10 +378,28 @@ $("#import-btn").onclick = async () => {
 };
 $("#import-path").addEventListener("keydown", e => { if (e.key === "Enter") $("#import-btn").click(); });
 
+// Switch the working directory: re-scan a folder server-side and REPLACE the
+// gallery (path-based, like Import; a browser can't give a local server a picked
+// folder's real disk path). The current folder is echoed into the field on load.
+async function setWorkingDir() {
+  const path = $("#dir-path").value.trim().replace(/^"+|"+$/g, "").trim();
+  if (!path) { setStatus("paste a folder path to open"); return; }
+  setStatus("opening folder…");
+  const r = await fetch("/api/setdir", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({path})});
+  if (!r.ok) { setStatus("open folder failed: " + await r.text()); return; }
+  const d = await r.json();
+  state.id = null; state.stem = null; state.recipe = null;
+  $("#main").innerHTML = '<p style="color:var(--muted)">Select a photo on the left, or import more above.</p>';
+  await loadList(0);   // a new folder starts at page 1
+  setStatus(`working folder: ${d.dir} · ${d.total} source${d.total===1?"":"s"}`);
+}
+$("#dir-set").onclick = setWorkingDir;
+$("#dir-path").addEventListener("keydown", e => { if (e.key === "Enter") setWorkingDir(); });
+
 // Drag-drop + file picker. Browsers can't give a local server a dropped file's
 // disk PATH (security), so we upload the bytes (saved under ./out/imported).
 async function uploadFiles(files) {
-  let firstId = null, ok = 0; const failed = [];
+  let firstId = null, firstStem = null, ok = 0; const failed = [];
   for (const f of files) {
     setStatus(`uploading ${f.name}…`);
     try {
@@ -340,11 +410,11 @@ async function uploadFiles(files) {
       const r = await fetch("/api/upload", {method:"POST", headers:{"X-Filename": encodeURIComponent(f.name)}, body: buf});
       if (!r.ok) { failed.push(`${f.name}: ${await r.text()}`); continue; }
       const d = await r.json();
-      if (firstId == null) firstId = d.id;
+      if (firstId == null) { firstId = d.id; firstStem = d.stem; }
       ok++;
     } catch (e) { failed.push(`${f.name}: ${e.message || e}`); }
   }
-  if (ok) { setStatus(`opened ${ok} file${ok>1?"s":""}${failed.length?` · ${failed.length} failed`:""}`); revealNew(firstId); }
+  if (ok) { setStatus(`opened ${ok} file${ok>1?"s":""}${failed.length?` · ${failed.length} failed`:""}`); revealNew(firstId, firstStem); }
   else if (failed.length) { setStatus(`could not open: ${failed[0]}`); }
 }
 
@@ -362,6 +432,12 @@ window.addEventListener("drop", e => {
 });
 
 // --- sliders + live preview ------------------------------------------------
+// Show the value SHORT: integer for step≥1 sliders, ≤2 decimals for fine ones
+// (exposure). Raw recipe floats like 13.4849996… otherwise overflow the value box.
+function fmtVal(v, step) {
+  const n = +v || 0;
+  return step < 1 ? (Math.round(n * 100) / 100).toString() : Math.round(n).toString();
+}
 function buildSliders(container) {
   container.querySelectorAll(".slider").forEach(e=>e.remove());
   for (const [key,label,min,max,step] of SLIDERS) {
@@ -371,7 +447,7 @@ function buildSliders(container) {
       <input type="range" min="${min}" max="${max}" step="${step}" data-key="${key}"/>
       <span class="val"></span>`;
     const input = row.querySelector("input");
-    input.oninput = () => { state.recipe[key] = parseFloat(input.value); row.querySelector(".val").textContent = input.value; scheduleAfter(); };
+    input.oninput = () => { state.recipe[key] = parseFloat(input.value); row.querySelector(".val").textContent = fmtVal(input.value, step); scheduleAfter(); };
     input.onchange = () => pushHistory(state.recipe); // commit to history on release
     container.appendChild(row);
   }
@@ -380,7 +456,7 @@ function syncSliders() {
   document.querySelectorAll(".slider input").forEach(input=>{
     const k = input.dataset.key;
     input.value = state.recipe[k] ?? 0;
-    input.parentElement.querySelector(".val").textContent = (state.recipe[k] ?? 0);
+    input.parentElement.querySelector(".val").textContent = fmtVal(state.recipe[k] ?? 0, parseFloat(input.step));
   });
 }
 
@@ -429,13 +505,34 @@ async function selectPhoto(id, stem, el) {
     pop.hidden = false; pop.innerHTML = "Loading…";
     try {
       const d = await (await fetch("/api/style-info")).json();
-      if (!d.built) {
-        pop.innerHTML = `<h4>No style library yet</h4>The Style slider needs an index of your past edits. Build it once:<br><br><code>autoshop style-index "D:\\path\\to\\your\\library"</code><br><br>It scans your RAW + .xmp pairs (your Lightroom/ACR edits) so the AI can lean toward how you edited similar shots.`;
-      } else {
-        const scenes = (d.scenes||[]).map(s => `${escapeHtml(s.tag)} ×${s.n}`).join("  ·  ");
-        pop.innerHTML = `<h4>Style library: ${d.total} of your edits indexed</h4>The Style slider leans the AI toward how you edited <i>similar</i> shots (matched by EXIF + histogram). 0% ignores your library; higher pulls the recipe toward your historical look (capped so it never fully overrides the AI).<div class="scenes">Scenes it knows: ${scenes || "—"}</div>`;
-      }
-    } catch (e) { pop.innerHTML = "failed to load style info"; }
+      const s = d.style || {};
+      const styleHtml = !s.built
+        ? `<b>Style reference library:</b> <i>not built yet</i> — the Style slider needs an index of YOUR past edits.`
+        : `<b>Style reference library:</b> ${s.total} of your edits indexed${s.source_dir?` from <code>${escapeHtml(s.source_dir)}</code>`:""}.<div class="scenes">Scenes it knows: ${(s.scenes||[]).map(x=>`${escapeHtml(x.tag)} ×${x.n}`).join("  ·  ") || "—"}</div>`;
+      pop.innerHTML = `<h4>Library</h4>
+        <b>原图库 / Working folder:</b> <code>${escapeHtml(d.working_dir||"—")}</code> · ${d.working_count||0} source(s)<br>
+        <b>成片库 / Output:</b> <code>${escapeHtml(d.out_dir||"./out")}</code> — renders / heals / exports / XMP land here<br><br>
+        ${styleHtml}
+        <div class="srow" style="margin-top:8px; gap:6px; flex-wrap:nowrap">
+          <input class="sinput sb-dir" placeholder="Your library folder (RAW + .xmp pairs)…" style="font-size:11px" />
+          <button class="sb-build" type="button" style="white-space:nowrap">Build index</button>
+        </div>
+        <div class="scenes" style="margin-top:6px">Other users: point this at YOUR own folder of edited RAWs (each RAW with its Lightroom <code>.xmp</code> beside it) and Build — the Style slider then leans the AI toward how YOU edit (0% ignores it). Equivalent CLI: <code>autoshop style-index &lt;dir&gt;</code>.</div>`;
+      const sbDir = pop.querySelector(".sb-dir"), sbBuild = pop.querySelector(".sb-build");
+      sbDir.value = s.source_dir || d.working_dir || "";
+      sbBuild.onclick = async () => {
+        const dir = sbDir.value.trim().replace(/^"+|"+$/g, "").trim();
+        if (!dir) { sbBuild.textContent = "need a folder"; return; }
+        sbBuild.disabled = true; sbBuild.textContent = "building… (decodes your RAWs, can take minutes)";
+        try {
+          const rr = await fetch("/api/style-build", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({dir})});
+          if (!rr.ok) { sbBuild.textContent = "failed: " + (await rr.text()).slice(0,30); sbBuild.disabled = false; return; }
+          const j = await rr.json();
+          sbBuild.textContent = `built ${j.total} ✓`;
+          setStatus(`style index built: ${j.total} edits from ${j.source_dir}`);
+        } catch (e) { sbBuild.textContent = "error"; sbBuild.disabled = false; }
+      };
+    } catch (e) { pop.innerHTML = "failed to load library info"; }
   };
   // region box-select wiring (the window-level move/up handlers live at module top)
   state.region = null;
@@ -511,6 +608,37 @@ async function selectPhoto(id, stem, el) {
       setStatus("filled" + (saved ? " → " + saved : "") + " (saved to ./out; separate from the develop recipe)");
     } finally { btn.disabled = false; }
   };
+
+  // Pixel-retouch (heal): AI auto-detect and/or reuse the painted mask above; the
+  // deterministic engine heals each spot from SURROUNDING REAL pixels (no generation).
+  async function runHeal(useMask) {
+    let mask = null;
+    if (useMask) {
+      const src = fctx.getImageData(0, 0, fc.width, fc.height).data;
+      let any = false; for (let i = 3; i < src.length; i += 4) { if (src[i] > 10) { any = true; break; } }
+      if (!any) { setStatus("tick Paint mask above and paint the spots, then Heal painted area"); return; }
+      const m = document.createElement("canvas"); m.width = fc.width; m.height = fc.height;
+      const mctx = m.getContext("2d"), md = mctx.createImageData(fc.width, fc.height);
+      for (let i = 0; i < src.length; i += 4) { md.data[i + 3] = src[i + 3] > 10 ? 0 : 255; }
+      mctx.putImageData(md, 0, 0); mask = m.toDataURL("image/png");
+    }
+    const fullRes = main.querySelector(".heal-fullres").checked;
+    setStatus(fullRes ? "healing (full-res render)… (slow)" : (useMask ? "healing painted area…" : "AI 去瑕疵中… (~10-30s)"));
+    const btnA = main.querySelector(".heal-auto"), btnP = main.querySelector(".heal-painted");
+    btnA.disabled = true; btnP.disabled = true;
+    try {
+      const r = await fetch("/api/heal", {method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ id: state.id, mask, auto: !useMask, full_res: fullRes })});
+      if (!r.ok) { setStatus("heal failed: " + await r.text()); return; }
+      const blob = await r.blob();
+      afterImg.src = URL.createObjectURL(blob);
+      if (useMask) fctx.clearRect(0, 0, fc.width, fc.height);
+      const saved = r.headers.get("X-Output-Path"), n = r.headers.get("X-Heal-Spots");
+      setStatus(`healed ${n || "?"} spot(s)${saved ? " → " + saved : ""} (saved to ./out; pixel retouch, not the develop recipe)`);
+    } finally { btnA.disabled = false; btnP.disabled = false; }
+  }
+  main.querySelector(".heal-auto").onclick = () => runHeal(false);
+  main.querySelector(".heal-painted").onclick = () => runHeal(true);
 }
 
 function showVerdict(v) {

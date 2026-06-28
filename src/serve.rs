@@ -31,8 +31,10 @@ const INDEX_HTML: &str = include_str!("web/index.html");
 const LIST_CAP: usize = 1000; // cap thumbnails shown
 
 struct AppState {
-    dir: PathBuf,
-    /// The source list, mutable so the UI can import more at runtime.
+    /// The working directory the gallery lists from. Behind a lock so the UI can
+    /// switch folders at runtime (POST /api/setdir re-scans and swaps it + `raws`).
+    dir: RwLock<PathBuf>,
+    /// The source list, mutable so the UI can import more / switch folders at runtime.
     raws: RwLock<Vec<PathBuf>>,
     /// Config behind a lock so the Settings panel can hot-reload it (POST
     /// /api/settings rewrites the local file, then swaps in a fresh `Config`).
@@ -47,6 +49,10 @@ impl AppState {
     fn count(&self) -> usize {
         self.raws.read().map(|r| r.len()).unwrap_or(0)
     }
+    /// Current working-directory path as a display string (recovers from poison).
+    fn dir_display(&self) -> String {
+        self.dir.read().unwrap_or_else(|e| e.into_inner()).display().to_string()
+    }
     /// Current config snapshot (read guard; recovers from a poisoned lock).
     fn config(&self) -> std::sync::RwLockReadGuard<'_, Config> {
         self.cfg.read().unwrap_or_else(|e| e.into_inner())
@@ -58,7 +64,7 @@ pub fn serve(dir: &Path, port: u16) -> Result<()> {
     let raws = pipeline::find_sources(dir)?;
     let n = raws.len();
     let state = Arc::new(AppState {
-        dir: dir.to_path_buf(),
+        dir: RwLock::new(dir.to_path_buf()),
         raws: RwLock::new(raws),
         cfg: RwLock::new(Config::load()),
     });
@@ -94,13 +100,16 @@ fn handle(request: Request, state: &AppState) -> Result<()> {
         (false, "/api/preview") => api_image(request, state, 1200),
         (false, "/api/recipe") => api_recipe(request, state),
         (false, "/api/style-info") => api_style_info(request, state),
+        (true, "/api/style-build") => api_style_build(request, state),
         (false, "/api/settings") => api_settings_get(request, state),
         (true, "/api/settings") => api_settings_post(request, state),
+        (true, "/api/setdir") => api_setdir(request, state),
         (true, "/api/import") => api_import(request, state),
         (true, "/api/upload") => api_upload(request, state),
         (true, "/api/analyze") => api_analyze(request, state),
         (true, "/api/develop") => api_develop(request, state),
         (true, "/api/retouch") => api_retouch(request, state),
+        (true, "/api/heal") => api_heal(request, state),
         (true, "/api/export") => api_export(request, state),
         (true, "/api/download") => api_download(request, state),
         (true, "/api/xmp") => api_xmp(request, state),
@@ -111,11 +120,24 @@ fn handle(request: Request, state: &AppState) -> Result<()> {
 // --- handlers --------------------------------------------------------------
 
 fn api_list(request: Request, state: &AppState) -> Result<()> {
+    // Pagination: `?offset=&limit=` page through the full list (a folder can hold
+    // thousands). `id` stays the GLOBAL index (enumerate BEFORE skip), so
+    // selecting / previewing by id works across pages. `limit` is capped at
+    // LIST_CAP to bound the per-request decode/JSON work.
+    let offset = query_param(request.url(), "offset")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let limit = query_param(request.url(), "limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(LIST_CAP)
+        .clamp(1, LIST_CAP);
     let raws = state.raws.read().map_err(|_| anyhow!("lock poisoned"))?;
+    let total = raws.len();
     let items: Vec<_> = raws
         .iter()
-        .take(LIST_CAP)
         .enumerate()
+        .skip(offset)
+        .take(limit)
         .map(|(id, raw)| {
             let analyzed = pipeline::default_out(raw, "recipe", "json").exists()
                 || pipeline::xmp_target(raw).exists();
@@ -128,12 +150,45 @@ fn api_list(request: Request, state: &AppState) -> Result<()> {
         })
         .collect();
     let body = json!({
-        "dir": state.dir.display().to_string(),
-        "total": raws.len(),
+        "dir": state.dir_display(),
+        "total": total,
+        "offset": offset,
+        "limit": limit,
         "shown": items.len(),
         "items": items,
     });
     respond_json(request, &body)
+}
+
+#[derive(Deserialize)]
+struct SetDirReq {
+    /// A folder path on disk to make the new working directory.
+    path: String,
+}
+
+/// Switch the working directory at runtime: re-scan `path` for sources and
+/// replace the gallery. Path-based (a browser can't hand a local server a picked
+/// folder's real disk path), mirroring the Import field. Any files uploaded into
+/// ./out/imported drop out of the view but stay on disk.
+fn api_setdir(mut request: Request, state: &AppState) -> Result<()> {
+    let req: SetDirReq = read_json(&mut request)?;
+    // Tolerate Windows "Copy as path" (quotes) + stray whitespace, like Import.
+    let cleaned = req.path.trim().trim_matches('"').trim();
+    let p = PathBuf::from(cleaned);
+    if !p.is_dir() {
+        return respond_status(request, 400, &format!("not a folder: {cleaned}"));
+    }
+    let found = pipeline::find_sources(&p)?;
+    let total = found.len();
+    {
+        let mut raws = state.raws.write().map_err(|_| anyhow!("lock poisoned"))?;
+        *raws = found;
+    }
+    {
+        let mut dir = state.dir.write().map_err(|_| anyhow!("lock poisoned"))?;
+        *dir = p.clone();
+    }
+    respond_json(request, &json!({ "dir": p.display().to_string(), "total": total }))
 }
 
 #[derive(Deserialize)]
@@ -238,8 +293,13 @@ fn api_recipe(request: Request, state: &AppState) -> Result<()> {
 /// Style-library info for the UI's info box: is an index built, how many of the
 /// user's edits it holds, and the scene "tags" it covers. Instant (just reads the
 /// JSON; no per-photo decode).
-fn api_style_info(request: Request, _state: &AppState) -> Result<()> {
-    match crate::style::StyleIndex::load(Path::new("out/style-index.json")) {
+fn api_style_info(request: Request, state: &AppState) -> Result<()> {
+    let abs = |p: &str| {
+        std::path::absolute(p).map(|x| x.display().to_string()).unwrap_or_else(|_| p.to_string())
+    };
+    // Style reference library status (built? how many edits? scene tags?). The
+    // index doesn't record the folder it was built from, so we don't claim one.
+    let style = match crate::style::StyleIndex::load(Path::new("out/style-index.json")) {
         Ok(ix) => {
             let mut tags: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
             for e in &ix.exemplars {
@@ -249,13 +309,53 @@ fn api_style_info(request: Request, _state: &AppState) -> Result<()> {
             top.sort_by(|a, b| b.1.cmp(&a.1));
             top.truncate(6);
             let scenes: Vec<_> = top.into_iter().map(|(t, n)| json!({ "tag": t, "n": n })).collect();
-            respond_json(
-                request,
-                &json!({ "built": true, "total": ix.exemplars.len(), "scenes": scenes }),
-            )
+            json!({ "built": true, "total": ix.exemplars.len(), "scenes": scenes,
+                    "index_file": abs("out/style-index.json"), "source_dir": ix.source_dir })
         }
-        Err(_) => respond_json(request, &json!({ "built": false })),
+        Err(_) => json!({ "built": false }),
+    };
+    respond_json(
+        request,
+        &json!({
+            // Where the photos being browsed live (the "原图库"), where outputs
+            // land (the "成片库" = ./out), and the style-library status.
+            "working_dir": state.dir_display(),
+            "working_count": state.count(),
+            "out_dir": abs("out"),
+            "style": style,
+        }),
+    )
+}
+
+#[derive(Deserialize)]
+struct StyleBuildReq {
+    /// Folder of the user's edited RAWs (each RAW with its Lightroom .xmp beside it).
+    dir: String,
+}
+
+/// Build the style reference index from a folder of the user's RAW+.xmp pairs, so
+/// non-CLI users can point the app at THEIR OWN library from the info panel. Writes
+/// out/style-index.json (same as `autoshop style-index <dir>`). Decodes every RAW,
+/// so it can take minutes on a large library.
+fn api_style_build(mut request: Request, _state: &AppState) -> Result<()> {
+    let req: StyleBuildReq = read_json(&mut request)?;
+    let cleaned = req.dir.trim().trim_matches('"').trim();
+    let p = PathBuf::from(cleaned);
+    if !p.is_dir() {
+        return respond_status(request, 400, &format!("not a folder: {cleaned}"));
     }
+    let index = match crate::style::StyleIndex::build(&p) {
+        Ok(ix) => ix,
+        Err(e) => return respond_status(request, 500, &format!("build failed: {e}")),
+    };
+    let total = index.exemplars.len();
+    if let Err(e) = index.save(Path::new("out/style-index.json")) {
+        return respond_status(request, 500, &format!("save index: {e}"));
+    }
+    respond_json(
+        request,
+        &json!({ "ok": true, "total": total, "source_dir": p.display().to_string() }),
+    )
 }
 
 #[derive(Deserialize)]
@@ -470,6 +570,80 @@ fn api_retouch(mut request: Request, state: &AppState) -> Result<()> {
     }
 }
 
+#[derive(Deserialize)]
+struct HealReq {
+    id: usize,
+    /// Optional painted RGBA PNG mask (data URL or bare base64); transparent = heal here.
+    #[serde(default)]
+    mask: Option<String>,
+    /// Auto-detect spots with the vision model (default true).
+    #[serde(default = "default_true")]
+    auto: bool,
+    #[serde(default)]
+    full_res: bool,
+}
+fn default_true() -> bool {
+    true
+}
+
+/// Pixel-retouch (heal) mode: the vision model auto-detects small defects and/or
+/// the browser posts a painted mask; the deterministic engine heals each from
+/// SURROUNDING REAL pixels (no generation). Saves a pixel master to ./out and
+/// returns a JPEG of the result for inline display, path in `X-Output-Path`.
+fn api_heal(mut request: Request, state: &AppState) -> Result<()> {
+    let req: HealReq = read_json(&mut request)?;
+    let raw = match state.at(req.id) {
+        Some(r) => r,
+        None => return respond_status(request, 400, "bad id"),
+    };
+    // Stage the optional painted mask (data URL or bare base64) to a temp PNG.
+    let mask_tmp = match &req.mask {
+        Some(m) if !m.trim().is_empty() => {
+            let b64 = m.rsplit(',').next().unwrap_or(m).trim();
+            match base64::engine::general_purpose::STANDARD.decode(b64) {
+                Ok(bytes) => {
+                    let t = std::env::temp_dir().join(format!(
+                        "autoshop_heal_{}_{}.png",
+                        std::process::id(),
+                        DL_SEQ.fetch_add(1, Ordering::Relaxed)
+                    ));
+                    if let Err(e) = std::fs::write(&t, &bytes) {
+                        return respond_status(request, 500, &format!("stage mask: {e}"));
+                    }
+                    Some(t)
+                }
+                Err(e) => return respond_status(request, 400, &format!("bad mask base64: {e}")),
+            }
+        }
+        _ => None,
+    };
+    let out = pipeline::default_out(&raw, "heal", "png");
+    let cfg = state.config();
+    let result = crate::retouch::heal(&cfg, &raw, mask_tmp.as_deref(), req.auto, req.full_res, &out);
+    drop(cfg);
+    if let Some(t) = &mask_tmp {
+        let _ = std::fs::remove_file(t);
+    }
+    match result {
+        Ok(rep) => {
+            let img =
+                decode::load_image(&out)?.resize(1400, 1400, image::imageops::FilterType::Triangle);
+            let mut buf = Vec::new();
+            img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Jpeg)
+                .context("encode jpeg")?;
+            let ct = Header::from_bytes(&b"Content-Type"[..], &b"image/jpeg"[..]).unwrap();
+            let xp = Header::from_bytes(&b"X-Output-Path"[..], out.display().to_string().as_bytes())
+                .unwrap();
+            let xs =
+                Header::from_bytes(&b"X-Heal-Spots"[..], rep.spots.to_string().as_bytes()).unwrap();
+            request
+                .respond(Response::from_data(buf).with_header(ct).with_header(xp).with_header(xs))
+                .map_err(Into::into)
+        }
+        Err(e) => respond_status(request, 500, &format!("heal failed: {e}")),
+    }
+}
+
 /// Current provider/model settings for the Settings panel. Never returns the raw
 /// API keys — only whether each is present.
 fn api_settings_get(request: Request, state: &AppState) -> Result<()> {
@@ -593,9 +767,17 @@ fn respond_json(request: Request, v: &serde_json::Value) -> Result<()> {
 }
 
 fn respond_html(request: Request, html: &str) -> Result<()> {
-    let header = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
+    let ct = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
+    // No-cache: the UI HTML is embedded in the binary and changes on every rebuild,
+    // so the browser MUST re-fetch it after a restart — otherwise a stale cached
+    // page hides fixes/features until a manual Ctrl+F5.
+    let cc = Header::from_bytes(
+        &b"Cache-Control"[..],
+        &b"no-cache, no-store, must-revalidate"[..],
+    )
+    .unwrap();
     request
-        .respond(Response::from_string(html).with_header(header))
+        .respond(Response::from_string(html).with_header(ct).with_header(cc))
         .map_err(Into::into)
 }
 
