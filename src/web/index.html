@@ -76,6 +76,8 @@
 
   /* Settings modal */
   .modal-bg { position:fixed; inset:0; z-index:60; background:rgba(0,0,0,.6); display:flex; align-items:flex-start; justify-content:center; padding:5vh 16px; overflow:auto; }
+  /* author display:flex above outranks the UA [hidden]{display:none} (author origin wins), so the hidden attr alone never hides the modal — restore it explicitly at higher specificity */
+  .modal-bg[hidden] { display:none; }
   .modal-card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:18px 20px; width:580px; max-width:100%; box-shadow:0 20px 60px rgba(0,0,0,.55); }
   .modal-card h2 { font-size:16px; margin:0 0 6px; display:flex; justify-content:space-between; align-items:center; }
   .modal-x { background:#2b2e31; border:1px solid var(--line); color:var(--muted); border-radius:6px; padding:2px 9px; cursor:pointer; font-size:13px; }
