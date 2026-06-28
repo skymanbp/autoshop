@@ -166,6 +166,19 @@ fn curve_rmse(a: &[f32; 256], b: &[f32; 256]) -> f64 {
     (s / 256.0).sqrt()
 }
 
+/// The user's master tone-curve SHAPE from an XMP, summarised as
+/// `(black_lift, s_strength)` for the style library — `None` if they drew no
+/// curve. Stores the shape, not the raw point list (averaging point lists is
+/// mush). Reused by `style.rs` so the curve metric has one definition.
+pub(crate) fn user_curve_shape(xmp: &str) -> Option<(f32, f32)> {
+    let pts = parse_tone_curve(xmp, "ToneCurvePV2012");
+    if pts.len() < 2 {
+        return None;
+    }
+    let lut = curve_lut(&pts);
+    Some((curve_black_lift(&lut), curve_s_strength(&lut)))
+}
+
 #[derive(Default, Clone, Copy)]
 struct Acc {
     sum_abs: f64,

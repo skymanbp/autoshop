@@ -25,8 +25,9 @@ const ZSCORE_DIMS: [usize; 4] = [0, 1, 2, 10];
 const WEIGHTS: [f32; NDIM] = [
     1.5, 1.0, 1.0, 0.5, 0.5, 1.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.5,
 ];
-/// Slider keys shown as the reference (crs key → label).
-const REF_KEYS: [(&str, &str); 9] = [
+/// Slider keys shown as the reference (crs key → label). Tint/Saturation/Dehaze
+/// were added in index v2 so the style blend captures the user's colour habits.
+const REF_KEYS: [(&str, &str); 12] = [
     ("Exposure2012", "exposure"),
     ("Contrast2012", "contrast"),
     ("Highlights2012", "highlights"),
@@ -36,6 +37,9 @@ const REF_KEYS: [(&str, &str); 9] = [
     ("Vibrance", "vibrance"),
     ("Clarity2012", "clarity"),
     ("Temperature", "temperature_K"),
+    ("Tint", "tint"),
+    ("Saturation", "saturation"),
+    ("Dehaze", "dehaze"),
 ];
 
 /// 14-dim feature vector from capture metadata + histogram.
@@ -114,6 +118,11 @@ pub struct StyleExemplar {
     pub feat: Vec<f32>,
     pub tag: String,
     pub settings: BTreeMap<String, f32>,
+    /// The user's master tone-curve shape `[black_lift, s_strength]` (0..255
+    /// scale), if they drew one — the curve "habit" the flat sliders can't carry.
+    /// `#[serde(default)]` keeps v1 index files loadable.
+    #[serde(default)]
+    pub curve: Option<[f32; 2]>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -151,6 +160,7 @@ impl StyleIndex {
                 tag: derive_tag(&feat),
                 feat: feat.to_vec(),
                 settings: read_settings(&xmp),
+                curve: crate::eval::user_curve_shape(&xmp).map(|(b, s)| [b, s]),
             });
             if (i + 1) % 20 == 0 {
                 println!("  {} / {}", i + 1, pairs.len());
@@ -159,7 +169,8 @@ impl StyleIndex {
         let (mean, std) = compute_norm(&exemplars);
         // Record where this index was built from, for UI provenance / other users.
         let source_dir = std::path::absolute(dir).map(|p| p.display().to_string()).ok();
-        Ok(StyleIndex { version: 1, mean, std, exemplars, source_dir })
+        // v2: exemplars now carry tint/saturation/dehaze + tone-curve shape.
+        Ok(StyleIndex { version: 2, mean, std, exemplars, source_dir })
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -211,10 +222,25 @@ impl StyleIndex {
                 format!("[{}] {}", e.tag, s.join(", "))
             })
             .collect();
+        // Average the retrieved exemplars' tone-curve SHAPE (those who drew one),
+        // so the AI shapes its tone_curve the way this user habitually does.
+        let curves: Vec<[f32; 2]> = ex.iter().filter_map(|e| e.curve).collect();
+        let curve_note = if !curves.is_empty() {
+            let n = curves.len() as f32;
+            let bl = curves.iter().map(|c| c[0]).sum::<f32>() / n;
+            let ss = curves.iter().map(|c| c[1]).sum::<f32>() / n;
+            format!(
+                "  THEIR TYPICAL MASTER TONE CURVE: black-lift {bl:+.0}, S-strength {ss:+.0} \
+(0..255 scale) — shape your `tone_curve` to a similar gentleness, not stronger."
+            )
+        } else {
+            String::new()
+        };
         Some(format!(
             "STYLE REFERENCE — how this user edited SIMILAR past shots (for consistency with their \
-taste; reference, do NOT copy verbatim, the scene differs): {}",
-            lines.join("  |  ")
+taste; reference, do NOT copy verbatim, the scene differs): {}{}",
+            lines.join("  |  "),
+            curve_note
         ))
     }
 }
@@ -225,7 +251,7 @@ taste; reference, do NOT copy verbatim, the scene differs): {}",
 /// override (per the user's "use as reference, not a target" decision).
 pub fn style_targets(ex: &[&StyleExemplar]) -> BTreeMap<&'static str, f32> {
     // (xmp settings label from REF_KEYS) → (EditRecipe field name)
-    const MAP: [(&str, &str); 9] = [
+    const MAP: [(&str, &str); 12] = [
         ("exposure", "exposure_ev"),
         ("contrast", "contrast"),
         ("highlights", "highlights"),
@@ -235,6 +261,9 @@ pub fn style_targets(ex: &[&StyleExemplar]) -> BTreeMap<&'static str, f32> {
         ("vibrance", "vibrance"),
         ("clarity", "clarity"),
         ("temperature_K", "temperature_k"),
+        ("tint", "tint"),
+        ("saturation", "saturation"),
+        ("dehaze", "dehaze"),
     ];
     let mut out = BTreeMap::new();
     for (label, field) in MAP {
@@ -265,6 +294,9 @@ pub fn blend_toward(recipe: &mut EditRecipe, targets: &BTreeMap<&'static str, f3
             "blacks" => recipe.blacks = lerp(recipe.blacks, target),
             "vibrance" => recipe.vibrance = lerp(recipe.vibrance, target),
             "clarity" => recipe.clarity = lerp(recipe.clarity, target),
+            "tint" => recipe.tint = lerp(recipe.tint, target),
+            "saturation" => recipe.saturation = lerp(recipe.saturation, target),
+            "dehaze" => recipe.dehaze = lerp(recipe.dehaze, target),
             "temperature_k" => {
                 let cur = recipe.temperature_k.unwrap_or(target);
                 recipe.temperature_k = Some(lerp(cur, target));
@@ -323,27 +355,55 @@ mod tests {
 
     #[test]
     fn style_blend_pulls_toward_historical_mean() {
-        let mk = |exp: f32, con: f32| StyleExemplar {
+        let mk = |exp: f32, con: f32, sat: f32| StyleExemplar {
             stem: "x".into(),
             feat: vec![0.0; NDIM],
             tag: "t".into(),
             settings: BTreeMap::from([
                 ("exposure".to_string(), exp),
                 ("contrast".to_string(), con),
+                ("saturation".to_string(), sat),
+                ("dehaze".to_string(), 8.0),
             ]),
+            curve: Some([5.0, 12.0]),
         };
-        let (a, b) = (mk(0.4, 20.0), mk(0.6, 40.0));
+        let (a, b) = (mk(0.4, 20.0, 10.0), mk(0.6, 40.0, 30.0));
         let targets = style_targets(&[&a, &b]);
         assert_eq!(targets.get("exposure_ev").copied(), Some(0.5)); // mean(0.4,0.6)
         assert_eq!(targets.get("contrast").copied(), Some(30.0)); // mean(20,40)
+        assert_eq!(targets.get("saturation").copied(), Some(20.0)); // mean(10,30) — v2 field
+        assert_eq!(targets.get("dehaze").copied(), Some(8.0)); // v2 field
 
         let mut r = EditRecipe::default();
         blend_toward(&mut r, &targets, 0.5); // pull halfway from 0
         assert!((r.exposure_ev - 0.25).abs() < 1e-5, "{}", r.exposure_ev);
         assert!((r.contrast - 15.0).abs() < 1e-4, "{}", r.contrast);
+        assert!((r.saturation - 10.0).abs() < 1e-4, "{}", r.saturation); // halfway to 20
+        assert!((r.dehaze - 4.0).abs() < 1e-4, "{}", r.dehaze); // halfway to 8
 
         let before = r.clone();
         blend_toward(&mut r, &targets, 0.0); // strength 0 = no-op
         assert_eq!(r, before);
+    }
+
+    #[test]
+    fn reference_surfaces_the_users_curve_habit() {
+        let ex = StyleExemplar {
+            stem: "x".into(),
+            feat: vec![0.0; NDIM],
+            tag: "wide/mid/midday/landscape".into(),
+            settings: BTreeMap::from([("contrast".to_string(), 15.0)]),
+            curve: Some([6.0, 20.0]),
+        };
+        let idx = StyleIndex {
+            version: 2,
+            mean: vec![0.0; NDIM],
+            std: vec![1.0; NDIM],
+            exemplars: vec![],
+            source_dir: None,
+        };
+        let r = idx.render_reference(&[&ex]).unwrap();
+        assert!(r.contains("TYPICAL MASTER TONE CURVE"), "{r}");
+        assert!(r.contains("S-strength +20"), "{r}");
     }
 }
