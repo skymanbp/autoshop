@@ -711,12 +711,16 @@ fn apply_hsl(data: &mut [[f32; 3]], hsl: &crate::recipe::Hsl) {
     const CENTERS: [f32; 8] = [0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 270.0, 300.0];
     for px in data.iter_mut() {
         let (h, s, l) = rgb_to_hsl(px[0], px[1], px[2]);
-        // Fade the WHOLE HSL effect out on near-grey pixels. Their hue is
-        // numerically unstable — a hair of sensor noise flips a pixel between
-        // bands (e.g. blue↔aqua), so band-adjusting a smooth low-saturation area
-        // like an overcast sky mottles it into blotches. smoothstep ≈ 0 below 4%
-        // saturation, full above 18%, so genuinely-coloured areas are unaffected.
-        let satw = smoothstep(0.04, 0.18, s);
+        // Fade the WHOLE HSL effect out on low-CHROMA pixels. Gate on chroma
+        // (max−min), NOT HSL saturation: HSL `s` is ill-conditioned near white and
+        // black — a bright, faintly-blue sea-foam pixel has chroma ≈ 0.12 yet HSL
+        // s ≈ 1.0, so an HSL-`s` gate hits specular highlights at FULL strength and
+        // a Blue-band luminance push crushes white foam to grey. Chroma is a true
+        // colourfulness measure: ≈0 for near-grey (the overcast-sky blotch case)
+        // AND for near-white foam, ramping to full only on genuinely saturated
+        // colour, so both are protected while real colours are still adjusted.
+        let chroma = px[0].max(px[1]).max(px[2]) - px[0].min(px[1]).min(px[2]);
+        let satw = smoothstep(0.05, 0.22, chroma);
         if satw <= 0.0 {
             continue;
         }
@@ -936,6 +940,50 @@ mod tests {
         // Neutral (same K, no tint) ⇒ all gains ~1.
         let n = wb_gains(5500.0, 5500.0, 0.0);
         assert!((n[0] - 1.0).abs() < 1e-3 && (n[2] - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn specular_white_handling_diagnosis() {
+        // Push one pixel through the full per-pixel develop (1x1 → spatial ops are
+        // no-ops) to learn: is bright near-white "foam" greyed by a render BUG, or
+        // only by aggressive recipe values? Run with `--nocapture` to read numbers.
+        fn run(px: [f32; 3], r: &EditRecipe) -> [f32; 3] {
+            let mut d = vec![px];
+            apply_develop(&mut d, 1, 1, r);
+            d[0]
+        }
+        let white = [1.0_f32, 1.0, 1.0];
+        let foam = [0.88_f32, 0.93, 1.00]; // sky-lit foam: bright, slightly blue
+        let lum = |p: [f32; 3]| 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
+        let hsv_sat = |p: [f32; 3]| {
+            let mx = p[0].max(p[1]).max(p[2]);
+            let mn = p[0].min(p[1]).min(p[2]);
+            if mx > 1e-4 { (mx - mn) / mx } else { 0.0 }
+        };
+
+        // (1) NEUTRAL must preserve white — guards against a standalone render bug.
+        let wn = run(white, &EditRecipe::default());
+        eprintln!("neutral white -> {wn:?}");
+        assert!(wn[0] > 0.99 && wn[1] > 0.99 && wn[2] > 0.99, "neutral greyed white: {wn:?}");
+
+        let (_h, hsl_s, _l) = rgb_to_hsl(foam[0], foam[1], foam[2]);
+        eprintln!("foam HSL-sat={hsl_s:.3}  HSV-sat={:.3}", hsv_sat(foam));
+
+        let mut hsl_lum = crate::recipe::Hsl::default();
+        hsl_lum.luminance[5] = -60.0; // Blue band
+        let blue_lum = EditRecipe { hsl: hsl_lum, ..Default::default() };
+
+        // THE FIX: a Blue-band luminance push must NOT crush near-white foam to
+        // grey (chroma ≈ 0.12 → gate ≈ 0.37), yet MUST still darken a genuinely
+        // vivid blue (chroma ≈ 0.65 → gate ≈ 1.0). Pre-fix the HSL-`s` gate (s≈1.0)
+        // hit foam at full strength and it landed at luma 0.71 (a blue-grey).
+        let foam_out = run(foam, &blue_lum);
+        let vivid = [0.20_f32, 0.45, 0.85];
+        let vivid_out = run(vivid, &blue_lum);
+        eprintln!("foam  + blue lum-60 -> {foam_out:?} luma {:.2}", lum(foam_out));
+        eprintln!("vivid + blue lum-60 -> {vivid_out:?} luma {:.2}", lum(vivid_out));
+        assert!(lum(foam_out) > 0.80, "near-white foam must stay bright, got luma {:.2}", lum(foam_out));
+        assert!(lum(vivid_out) < 0.90 * lum(vivid), "vivid blue must still darken (HSL still works)");
     }
 
     #[test]
