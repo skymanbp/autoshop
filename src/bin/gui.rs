@@ -11,6 +11,7 @@
 //!
 //! Build/run: `cargo run --release --features gui --bin autoshop-gui`
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -20,16 +21,29 @@ use egui::load::SizedTexture;
 use autoshop::recipe::{EditRecipe, Hsl, ColorGrade};
 
 const PREVIEW_EDGE: u32 = 1280; // working preview size for fast live develop
+const THUMB_EDGE: u32 = 160; // decoded gallery-thumbnail long edge
+const THUMB_W: f32 = 56.0; // displayed thumbnail size in the gallery
+const THUMB_H: f32 = 40.0;
+const GALLERY_ROW_H: f32 = 50.0; // fixed row height for ScrollArea::show_rows
+const MAX_THUMB_INFLIGHT: usize = 6; // cap concurrent thumbnail decodes
 const HSL_BANDS: [&str; 8] = ["Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta"];
 const GRADE_REGIONS: [&str; 4] = ["shadow", "midtone", "highlight", "global"];
 
-/// Messages from worker threads back to the UI. The `Analyzed` payload is boxed
-/// because `(EditRecipe, Verdict)` is large; boxing keeps the channel message
-/// small (clippy::large_enum_variant).
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x4c, 0x8b, 0xf5);
+const SEL_BG: egui::Color32 = egui::Color32::from_rgb(0x26, 0x41, 0x7a);
+const PILL: egui::Color32 = egui::Color32::from_rgb(0xc9, 0xa1, 0x4a);
+
+/// Messages from worker threads back to the UI. The large payloads are boxed so
+/// the channel message stays small (clippy::large_enum_variant).
 enum Msg {
     Opened(Box<anyhow::Result<image::DynamicImage>>),
     Analyzed(Box<anyhow::Result<(EditRecipe, autoshop::advisor::Verdict)>>),
     Exported(anyhow::Result<String>),
+    /// A folder scan finished: (folder, sorted source paths).
+    Folder(Box<anyhow::Result<(PathBuf, Vec<PathBuf>)>>),
+    /// A gallery thumbnail decoded. `generation` tags the folder generation so a
+    /// folder switch can't insert a stale thumbnail under a reused index.
+    Thumb { generation: u64, idx: usize, img: Box<anyhow::Result<image::DynamicImage>> },
 }
 
 struct AutoshopApp {
@@ -51,6 +65,14 @@ struct AutoshopApp {
     guidance: String, // free-text direction for the AI ("warmer, moodier")
     refine: bool,     // adjust the CURRENT recipe vs propose from scratch
     save_jpeg: bool,  // export/download as JPEG instead of 16-bit TIFF
+    // --- library / gallery ---
+    gallery: Vec<PathBuf>,          // sources in the working folder (sorted)
+    gallery_dir: Option<PathBuf>,   // the working folder
+    gallery_gen: u64,               // bumped on every folder load (thumb invalidation)
+    selected: Option<usize>,        // index of the open gallery photo (for highlight)
+    thumbs: HashMap<usize, egui::TextureHandle>, // decoded thumbnails by index
+    thumb_requested: HashSet<usize>,             // indices already queued/decoded
+    thumb_inflight: usize,                       // live thumbnail-decode threads
 }
 
 impl Default for AutoshopApp {
@@ -63,7 +85,7 @@ impl Default for AutoshopApp {
             after_tex: None,
             recipe: EditRecipe::default(),
             dirty: false,
-            status: "Open a RAW or image to begin.".into(),
+            status: "Open a photo, or open a folder to browse your library.".into(),
             busy: false,
             rx: Some(rx),
             tx,
@@ -75,6 +97,13 @@ impl Default for AutoshopApp {
             guidance: String::new(),
             refine: false,
             save_jpeg: false,
+            gallery: Vec::new(),
+            gallery_dir: None,
+            gallery_gen: 0,
+            selected: None,
+            thumbs: HashMap::new(),
+            thumb_requested: HashSet::new(),
+            thumb_inflight: 0,
         }
     }
 }
@@ -111,6 +140,54 @@ impl AutoshopApp {
                 Ok(full.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE))
             })();
             let _ = tx.send(Msg::Opened(Box::new(res)));
+        });
+    }
+
+    /// Open one of the gallery photos by index (keeps the thumbnail highlighted).
+    fn open_gallery_index(&mut self, idx: usize) {
+        if self.busy {
+            return;
+        }
+        let Some(path) = self.gallery.get(idx).cloned() else { return };
+        self.selected = Some(idx);
+        self.open_path(path);
+    }
+
+    /// Scan `dir` (recursively) for sources off the UI thread and replace the
+    /// gallery — folders can hold thousands of RAWs, so this never blocks paint.
+    fn open_folder(&mut self, dir: PathBuf) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        self.status = format!("scanning {} …", dir.display());
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let res = autoshop::pipeline::find_sources(&dir).map(|list| (dir, list));
+            let _ = tx.send(Msg::Folder(Box::new(res)));
+        });
+    }
+
+    /// Queue a thumbnail decode for `idx` if it isn't cached/queued and we're
+    /// under the concurrency cap. Uses the camera's embedded preview (fast) — the
+    /// double-processing concern only applies to the develop base, not a 56px chip.
+    fn request_thumb(&mut self, idx: usize) {
+        if self.thumbs.contains_key(&idx) || self.thumb_requested.contains(&idx) {
+            return;
+        }
+        if self.thumb_inflight >= MAX_THUMB_INFLIGHT {
+            return;
+        }
+        let Some(path) = self.gallery.get(idx).cloned() else { return };
+        self.thumb_requested.insert(idx);
+        self.thumb_inflight += 1;
+        let tx = self.tx.clone();
+        let generation = self.gallery_gen;
+        std::thread::spawn(move || {
+            let res = (|| -> anyhow::Result<image::DynamicImage> {
+                Ok(autoshop::decode::preview_only(&path)?.thumbnail(THUMB_EDGE, THUMB_EDGE))
+            })();
+            let _ = tx.send(Msg::Thumb { generation, idx, img: Box::new(res) });
         });
     }
 
@@ -214,64 +291,198 @@ impl AutoshopApp {
     }
 
     fn poll_workers(&mut self, ctx: &egui::Context) {
-        let mut got = None;
-        if let Some(rx) = &self.rx {
-            if let Ok(msg) = rx.try_recv() {
-                got = Some(msg);
-            } else if self.busy {
-                ctx.request_repaint(); // keep polling while a thread runs
+        // Drain a bounded batch each frame so a burst of thumbnails doesn't take
+        // one-per-frame to land (try_recv borrow is released before we mutate).
+        for _ in 0..64 {
+            let Some(msg) = self.rx.as_ref().and_then(|rx| rx.try_recv().ok()) else { break };
+            match msg {
+                Msg::Opened(boxed) => match *boxed {
+                    Ok(base) => {
+                        self.before_tex = Some(ctx.load_texture(
+                            "before",
+                            to_color_image(&base),
+                            egui::TextureOptions::LINEAR,
+                        ));
+                        self.base_preview = Some(base);
+                        self.recipe = EditRecipe::default();
+                        self.verdict = None;
+                        self.rationale.clear();
+                        self.dirty = true; // render the (neutral) after
+                        self.busy = false;
+                        self.status = "ready — adjust sliders or run AI Analyze".into();
+                    }
+                    Err(e) => {
+                        self.busy = false;
+                        self.status = format!("could not open: {e}");
+                    }
+                },
+                Msg::Analyzed(boxed) => match *boxed {
+                    Ok((recipe, verdict)) => {
+                        self.recipe = recipe;
+                        self.verdict = Some(format!("{:?} — {}", verdict.decision, verdict.reasons.join("; ")));
+                        self.rationale = self.recipe.rationale.clone();
+                        self.dirty = true;
+                        self.busy = false;
+                        self.status = "AI develop applied".into();
+                    }
+                    Err(e) => {
+                        self.busy = false;
+                        self.status = format!("analyze failed: {e}");
+                    }
+                },
+                Msg::Exported(Ok(p)) => {
+                    self.busy = false;
+                    self.status = format!("exported → {p}");
+                }
+                Msg::Exported(Err(e)) => {
+                    self.busy = false;
+                    self.status = format!("export failed: {e}");
+                }
+                Msg::Folder(boxed) => match *boxed {
+                    Ok((dir, list)) => {
+                        let n = list.len();
+                        self.gallery = list;
+                        self.gallery_dir = Some(dir);
+                        self.gallery_gen += 1; // invalidate any in-flight old thumbs
+                        self.thumbs.clear();
+                        self.thumb_requested.clear();
+                        self.thumb_inflight = 0;
+                        self.selected = None;
+                        self.busy = false;
+                        self.status = format!("{n} photo{} — click a thumbnail to open", if n == 1 { "" } else { "s" });
+                    }
+                    Err(e) => {
+                        self.busy = false;
+                        self.status = format!("scan failed: {e}");
+                    }
+                },
+                Msg::Thumb { generation, idx, img } => {
+                    // Ignore thumbnails from a previous folder generation (their
+                    // inflight count was already discarded when the folder changed).
+                    if generation == self.gallery_gen {
+                        self.thumb_inflight = self.thumb_inflight.saturating_sub(1);
+                        if let Ok(im) = *img {
+                            let tex = ctx.load_texture(
+                                format!("thumb{idx}"),
+                                to_color_image(&im),
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.thumbs.insert(idx, tex);
+                        }
+                    }
+                }
             }
         }
-        match got {
-            Some(Msg::Opened(boxed)) => match *boxed {
-                Ok(base) => {
-                    self.before_tex = Some(ctx.load_texture(
-                        "before",
-                        to_color_image(&base),
-                        egui::TextureOptions::LINEAR,
-                    ));
-                    self.base_preview = Some(base);
-                    self.recipe = EditRecipe::default();
-                    self.verdict = None;
-                    self.rationale.clear();
-                    self.dirty = true; // render the (neutral) after
-                    self.busy = false;
-                    self.status = "ready — adjust sliders or run AI Analyze".into();
-                }
-                Err(e) => {
-                    self.busy = false;
-                    self.status = format!("could not open: {e}");
-                }
-            },
-            Some(Msg::Analyzed(boxed)) => match *boxed {
-                Ok((recipe, verdict)) => {
-                    self.recipe = recipe;
-                    self.verdict = Some(format!("{:?} — {}", verdict.decision, verdict.reasons.join("; ")));
-                    self.rationale = self.recipe.rationale.clone();
-                    self.dirty = true;
-                    self.busy = false;
-                    self.status = "AI develop applied".into();
-                }
-                Err(e) => {
-                    self.busy = false;
-                    self.status = format!("analyze failed: {e}");
-                }
-            },
-            Some(Msg::Exported(Ok(p))) => {
-                self.busy = false;
-                self.status = format!("exported → {p}");
-            }
-            Some(Msg::Exported(Err(e))) => {
-                self.busy = false;
-                self.status = format!("export failed: {e}");
-            }
-            None => {}
+        // Keep the frame loop alive while any worker (analyze/export/thumbs) runs.
+        if self.busy || self.thumb_inflight > 0 {
+            ctx.request_repaint();
         }
     }
 
     /// One labelled slider; returns true if the value changed this frame.
     fn slider(ui: &mut egui::Ui, label: &str, value: &mut f32, min: f32, max: f32) -> bool {
         ui.add(egui::Slider::new(value, min..=max).text(label)).changed()
+    }
+
+    /// Left-most panel: the working-folder thumbnail gallery. Only visible rows
+    /// are laid out (show_rows) and only their thumbnails are queued to decode.
+    fn gallery_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Library");
+            if ui.button("Open folder…").clicked()
+                && let Some(dir) = rfd::FileDialog::new().pick_folder()
+            {
+                self.open_folder(dir);
+            }
+        });
+        if let Some(d) = &self.gallery_dir {
+            ui.label(
+                egui::RichText::new(format!("{} · {} photos", d.display(), self.gallery.len()))
+                    .weak()
+                    .small(),
+            );
+        }
+        ui.separator();
+        if self.gallery.is_empty() {
+            ui.label(egui::RichText::new("Open a folder to browse your photos here.").weak());
+            return;
+        }
+
+        let count = self.gallery.len();
+        // Borrow only the fields the row closure reads; collect actions to apply
+        // after (request_thumb / open_gallery_index both need &mut self).
+        let thumbs = &self.thumbs;
+        let gallery = &self.gallery;
+        let selected = self.selected;
+        let mut to_open: Option<usize> = None;
+        let mut to_request: Vec<usize> = Vec::new();
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show_rows(ui, GALLERY_ROW_H, count, |ui, range| {
+                for i in range {
+                    let path = &gallery[i];
+                    let is_sel = selected == Some(i);
+                    let fill = if is_sel { SEL_BG } else { egui::Color32::TRANSPARENT };
+                    let resp = egui::Frame::none()
+                        .fill(fill)
+                        .inner_margin(egui::Margin::same(3.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                if let Some(t) = thumbs.get(&i) {
+                                    ui.add(
+                                        egui::Image::new(SizedTexture::new(
+                                            t.id(),
+                                            egui::vec2(THUMB_W, THUMB_H),
+                                        ))
+                                        .rounding(3.0),
+                                    );
+                                } else {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(THUMB_W, THUMB_H),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(rect, 3.0, egui::Color32::from_gray(24));
+                                    to_request.push(i);
+                                }
+                                ui.vertical(|ui| {
+                                    let mut name = egui::RichText::new(autoshop::pipeline::stem(path)).small();
+                                    if is_sel {
+                                        name = name.strong().color(ACCENT);
+                                    }
+                                    ui.label(name);
+                                    let edited = autoshop::pipeline::default_out(path, "recipe", "json").exists()
+                                        || autoshop::pipeline::xmp_target(path).exists();
+                                    let baked = !autoshop::decode::is_raw(path);
+                                    ui.horizontal(|ui| {
+                                        if baked {
+                                            ui.label(egui::RichText::new("PNG/TIFF").color(PILL).small());
+                                        }
+                                        if edited {
+                                            ui.label(egui::RichText::new("● edited").color(ACCENT).small());
+                                        }
+                                    });
+                                });
+                            });
+                        })
+                        .response
+                        .interact(egui::Sense::click());
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() {
+                        to_open = Some(i);
+                    }
+                }
+            });
+
+        for i in to_request {
+            self.request_thumb(i);
+        }
+        if let Some(i) = to_open {
+            self.open_gallery_index(i);
+        }
     }
 
     fn develop_panel(&mut self, ui: &mut egui::Ui) {
@@ -385,6 +596,7 @@ impl eframe::App for AutoshopApp {
                         .add_filter("Photos", &["arw", "dng", "raf", "nef", "cr2", "cr3", "png", "tif", "tiff", "jpg", "jpeg"])
                         .pick_file()
                 {
+                    self.selected = None; // a one-off file isn't a gallery selection
                     self.open_path(path);
                 }
                 let ready = self.src_path.is_some() && !self.busy;
@@ -457,6 +669,11 @@ impl eframe::App for AutoshopApp {
             });
         });
 
+        // Left-most: the library gallery (folder browse + thumbnails).
+        egui::SidePanel::left("gallery").default_width(240.0).show(ctx, |ui| {
+            self.gallery_panel(ui);
+        });
+
         egui::SidePanel::left("controls").default_width(320.0).show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if self.src_path.is_some() {
@@ -514,7 +731,7 @@ fn app_icon() -> egui::IconData {
 fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 860.0])
+            .with_inner_size([1400.0, 880.0])
             .with_title("Autoshop")
             .with_icon(std::sync::Arc::new(app_icon())),
         ..Default::default()
