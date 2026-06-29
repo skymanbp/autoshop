@@ -48,6 +48,9 @@ struct AutoshopApp {
     style_strength: f32,
     hsl_band: usize,
     grade_region: usize,
+    guidance: String, // free-text direction for the AI ("warmer, moodier")
+    refine: bool,     // adjust the CURRENT recipe vs propose from scratch
+    save_jpeg: bool,  // export/download as JPEG instead of 16-bit TIFF
 }
 
 impl Default for AutoshopApp {
@@ -69,6 +72,9 @@ impl Default for AutoshopApp {
             style_strength: 0.30,
             hsl_band: 0,
             grade_region: 0,
+            guidance: String::new(),
+            refine: false,
+            save_jpeg: false,
         }
     }
 }
@@ -123,29 +129,61 @@ impl AutoshopApp {
             return;
         }
         self.busy = true;
-        self.status = "analyzing with AI (GPT + Claude)…".into();
+        self.status = if self.refine {
+            "refining your current edit with AI…".into()
+        } else {
+            "analyzing with AI (GPT + Claude)…".into()
+        };
         let tx = self.tx.clone();
         let style = self.style_strength;
+        // Free-text direction ("warmer, moodier") steers the proposal; when
+        // `refine` is on, the AI ADJUSTS the current recipe instead of starting
+        // from scratch.
+        let guidance = {
+            let g = self.guidance.trim();
+            (!g.is_empty()).then(|| g.to_string())
+        };
+        let base = self.refine.then(|| self.recipe.clone());
         std::thread::spawn(move || {
             // Config is reloaded in-thread (cheap) so we don't need it to be Clone.
             let cfg = autoshop::config::Config::load();
-            let res = autoshop::pipeline::produce_recipe(&path, &cfg, false, None, None, style);
+            let res = autoshop::pipeline::produce_recipe(
+                &path,
+                &cfg,
+                false,
+                guidance.as_deref(),
+                base.as_ref(),
+                style,
+            );
             let _ = tx.send(Msg::Analyzed(Box::new(res)));
         });
     }
 
-    fn start_export(&mut self) {
+    /// `./out/<stem>.developed.{tif|jpg}` — the default export target.
+    fn default_out(&self) -> PathBuf {
+        let stem = self
+            .src_path
+            .as_deref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("out")
+            .to_string();
+        let ext = if self.save_jpeg { "jpg" } else { "tif" };
+        PathBuf::from("out").join(format!("{stem}.developed.{ext}"))
+    }
+
+    /// Render the full-resolution develop to `out` on a worker thread (16-bit
+    /// TIFF, or 8-bit JPEG when the path ends in .jpg).
+    fn start_render_to(&mut self, out: PathBuf) {
         let Some(path) = self.src_path.clone() else { return };
         if self.busy {
             return;
         }
         self.busy = true;
-        self.status = "rendering full-resolution export…".into();
+        self.status = format!("rendering full-resolution → {} …", out.display());
         let tx = self.tx.clone();
         let recipe = self.recipe.clone();
         std::thread::spawn(move || {
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
-            let out = PathBuf::from("out").join(format!("{stem}.developed.tif"));
             let res = (|| {
                 if let Some(p) = out.parent() {
                     std::fs::create_dir_all(p)?;
@@ -155,6 +193,24 @@ impl AutoshopApp {
             })();
             let _ = tx.send(Msg::Exported(res));
         });
+    }
+
+    fn start_export(&mut self) {
+        let out = self.default_out();
+        self.start_render_to(out);
+    }
+
+    /// Write the Lightroom / Camera-Raw XMP sidecar to ./out (RAW sources only).
+    fn save_xmp(&mut self) {
+        let Some(path) = self.src_path.clone() else { return };
+        if !autoshop::decode::is_raw(&path) {
+            self.status = "XMP applies to RAW files only".into();
+            return;
+        }
+        match autoshop::pipeline::write_xmp(&path, &self.recipe) {
+            Ok(p) => self.status = format!("XMP saved → {}", p.display()),
+            Err(e) => self.status = format!("XMP save failed: {e}"),
+        }
     }
 
     fn poll_workers(&mut self, ctx: &egui::Context) {
@@ -331,22 +387,64 @@ impl eframe::App for AutoshopApp {
                 {
                     self.open_path(path);
                 }
-                let has = self.src_path.is_some();
-                ui.add_enabled_ui(has && !self.busy, |ui| {
+                let ready = self.src_path.is_some() && !self.busy;
+                ui.add_enabled_ui(ready, |ui| {
                     if ui.button("✨ AI Analyze").clicked() {
                         self.start_analyze();
                     }
-                    if ui.button("Export → ./out").clicked() {
-                        self.start_export();
-                    }
+                    ui.checkbox(&mut self.refine, "Refine")
+                        .on_hover_text("Adjust the CURRENT edit instead of proposing from scratch");
                     if ui.button("Reset").clicked() {
                         self.recipe = EditRecipe::default();
                         self.dirty = true;
                     }
                 });
+                ui.separator();
                 ui.label("Style");
                 ui.add(egui::Slider::new(&mut self.style_strength, 0.0..=1.0).show_value(false));
                 ui.label(format!("{:.0}%", self.style_strength * 100.0));
+            });
+            // AI direction (free text) + save options.
+            ui.horizontal(|ui| {
+                ui.label("Direction:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.guidance)
+                        .desired_width(340.0)
+                        .hint_text("e.g. warmer and moodier, lift the shadows"),
+                );
+                let ready = self.src_path.is_some() && !self.busy;
+                ui.add_enabled_ui(ready, |ui| {
+                    ui.separator();
+                    egui::ComboBox::from_id_salt("save_fmt")
+                        .selected_text(if self.save_jpeg { "JPEG" } else { "16-bit TIFF" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.save_jpeg, false, "16-bit TIFF");
+                            ui.selectable_value(&mut self.save_jpeg, true, "JPEG");
+                        });
+                    if ui.button("Export → ./out").clicked() {
+                        self.start_export();
+                    }
+                    if ui.button("Download…").clicked() {
+                        let ext = if self.save_jpeg { "jpg" } else { "tif" };
+                        let stem = self
+                            .src_path
+                            .as_deref()
+                            .and_then(|p| p.file_stem())
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("photo")
+                            .to_string();
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter(ext, &[ext])
+                            .set_file_name(format!("{stem}.developed.{ext}"))
+                            .save_file()
+                        {
+                            self.start_render_to(p);
+                        }
+                    }
+                    if ui.button("Save XMP").clicked() {
+                        self.save_xmp();
+                    }
+                });
             });
         });
 
