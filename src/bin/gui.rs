@@ -46,6 +46,24 @@ enum Msg {
     Thumb { generation: u64, idx: usize, img: Box<anyhow::Result<image::DynamicImage>> },
 }
 
+/// Editable buffers for the in-app Settings window. Key fields stay blank on
+/// load and only overwrite the stored key when non-empty (the form never shows
+/// an existing secret) — mirroring the web `/api/settings` contract.
+#[derive(Default)]
+struct SettingsForm {
+    analysis_provider_api: bool, // false = OAuth (claude CLI), true = OpenAI-compatible API
+    analysis_model: String,
+    analysis_base_url: String,
+    analysis_api_key: String,
+    analysis_key_present: bool,
+    image_model: String,
+    image_base_url: String,
+    image_gen_model: String,
+    image_api_key: String,
+    image_key_present: bool,
+    status: String,
+}
+
 struct AutoshopApp {
     src_path: Option<PathBuf>,
     base_preview: Option<image::DynamicImage>, // decoded source preview (re-developed on edit)
@@ -69,6 +87,10 @@ struct AutoshopApp {
     committed: EditRecipe,        // current history head (last committed state)
     undo_stack: Vec<EditRecipe>,  // prior states, most recent last
     redo_stack: Vec<EditRecipe>,  // states undone away (cleared on a new edit)
+    // --- settings / denoise ---
+    save_denoise: bool,     // run SCUNet AI denoise before the full-res render
+    show_settings: bool,    // the Settings window is open
+    settings: SettingsForm, // editable buffers for that window
     // --- library / gallery ---
     gallery: Vec<PathBuf>,          // sources in the working folder (sorted)
     gallery_dir: Option<PathBuf>,   // the working folder
@@ -104,6 +126,9 @@ impl Default for AutoshopApp {
             committed: EditRecipe::default(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            save_denoise: false,
+            show_settings: false,
+            settings: SettingsForm::default(),
             gallery: Vec::new(),
             gallery_dir: None,
             gallery_gen: 0,
@@ -215,6 +240,125 @@ impl AutoshopApp {
         }
     }
 
+    /// Populate the Settings form from the resolved config (keys are shown only as
+    /// "present", never revealed). Called when the window opens.
+    fn load_settings_form(&mut self) {
+        let cfg = autoshop::config::Config::load();
+        self.settings = SettingsForm {
+            analysis_provider_api: cfg.analysis_is_api(),
+            analysis_model: cfg.analysis_model.clone(),
+            analysis_base_url: cfg.analysis_base_url.clone(),
+            analysis_api_key: String::new(),
+            analysis_key_present: cfg.analysis_api_key.is_some(),
+            image_model: cfg.openai_model.clone(),
+            image_base_url: cfg.openai_base_url.clone(),
+            image_gen_model: cfg.openai_image_model.clone(),
+            image_api_key: String::new(),
+            image_key_present: cfg.openai_api_key.is_some(),
+            status: String::new(),
+        };
+    }
+
+    /// Persist the Settings form to autoshop.local.json (gitignored). A blank key
+    /// keeps the stored one. The next Analyze/Export reloads Config, so it applies.
+    fn save_settings_form(&mut self) {
+        let mut cur = autoshop::config::load_local_settings();
+        cur.analysis_provider =
+            Some(if self.settings.analysis_provider_api { "api" } else { "oauth" }.to_string());
+        cur.analysis_model = Some(self.settings.analysis_model.trim().to_string());
+        cur.analysis_base_url = Some(self.settings.analysis_base_url.trim().to_string());
+        cur.image_model = Some(self.settings.image_model.trim().to_string());
+        cur.image_base_url = Some(self.settings.image_base_url.trim().to_string());
+        cur.image_gen_model = Some(self.settings.image_gen_model.trim().to_string());
+        // Secrets: only overwrite when a non-empty value was actually typed.
+        let ak = self.settings.analysis_api_key.trim().to_string();
+        let ik = self.settings.image_api_key.trim().to_string();
+        if !ak.is_empty() {
+            cur.analysis_api_key = Some(ak);
+        }
+        if !ik.is_empty() {
+            cur.image_api_key = Some(ik);
+        }
+        match autoshop::config::save_local_settings(&cur) {
+            Ok(p) => {
+                self.settings.analysis_api_key.clear();
+                self.settings.image_api_key.clear();
+                self.settings.analysis_key_present = cur.analysis_api_key.is_some();
+                self.settings.image_key_present = cur.image_api_key.is_some();
+                self.settings.status = format!("saved → {}", p.display());
+                self.status = "settings saved — applies to the next Analyze".into();
+            }
+            Err(e) => self.settings.status = format!("save failed: {e}"),
+        }
+    }
+
+    fn settings_ui(&mut self, ui: &mut egui::Ui) {
+        let mut do_save = false;
+        ui.label(
+            egui::RichText::new(
+                "Saved to autoshop.local.json (gitignored, stays on this machine). Applies to the next Analyze.",
+            )
+            .weak()
+            .small(),
+        );
+        {
+            let f = &mut self.settings;
+            ui.separator();
+            ui.heading("Analysis — the verifier");
+            ui.horizontal(|ui| {
+                ui.label("Provider");
+                ui.radio_value(&mut f.analysis_provider_api, false, "OAuth (Claude CLI)");
+                ui.radio_value(&mut f.analysis_provider_api, true, "API (OpenAI-compatible)");
+            });
+            ui.horizontal(|ui| {
+                ui.label("Model");
+                ui.text_edit_singleline(&mut f.analysis_model);
+            });
+            if f.analysis_provider_api {
+                ui.horizontal(|ui| {
+                    ui.label("Base URL");
+                    ui.text_edit_singleline(&mut f.analysis_base_url);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("API Key");
+                    let hint = if f.analysis_key_present { "key set — blank keeps it" } else { "no key set" };
+                    ui.add(egui::TextEdit::singleline(&mut f.analysis_api_key).password(true).hint_text(hint));
+                });
+            }
+            ui.separator();
+            ui.heading("Image — the vision proposer (API only)");
+            ui.horizontal(|ui| {
+                ui.label("Vision model");
+                ui.text_edit_singleline(&mut f.image_model);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Base URL");
+                ui.text_edit_singleline(&mut f.image_base_url);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Image-gen model");
+                ui.text_edit_singleline(&mut f.image_gen_model);
+            });
+            ui.horizontal(|ui| {
+                ui.label("API Key");
+                let hint = if f.image_key_present { "key set — blank keeps it" } else { "no key set" };
+                ui.add(egui::TextEdit::singleline(&mut f.image_api_key).password(true).hint_text(hint));
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Save settings").clicked() {
+                    do_save = true;
+                }
+                if !f.status.is_empty() {
+                    ui.label(egui::RichText::new(&f.status).weak().small());
+                }
+            });
+        }
+        if do_save {
+            self.save_settings_form();
+        }
+    }
+
     /// Queue a thumbnail decode for `idx` if it isn't cached/queued and we're
     /// under the concurrency cap. Uses the camera's embedded preview (fast) — the
     /// double-processing concern only applies to the develop base, not a 56px chip.
@@ -304,15 +448,24 @@ impl AutoshopApp {
             return;
         }
         self.busy = true;
-        self.status = format!("rendering full-resolution → {} …", out.display());
+        self.status = if self.save_denoise {
+            format!("rendering + AI denoise → {} … (GPU sidecar, can take minutes)", out.display())
+        } else {
+            format!("rendering full-resolution → {} …", out.display())
+        };
         let tx = self.tx.clone();
         let recipe = self.recipe.clone();
+        let denoise = self.save_denoise;
         std::thread::spawn(move || {
             let res = (|| {
                 if let Some(p) = out.parent() {
                     std::fs::create_dir_all(p)?;
                 }
-                autoshop::render::render_to_file(&path, &recipe, &out, None)?;
+                // SCUNet AI denoise (python sidecar) runs before the develop when on.
+                let opts = denoise.then(|| {
+                    autoshop::denoise::DenoiseOpts::from_config(&autoshop::config::Config::load(), None, 1.0)
+                });
+                autoshop::render::render_to_file(&path, &recipe, &out, opts.as_ref())?;
                 Ok::<String, anyhow::Error>(out.display().to_string())
             })();
             let _ = tx.send(Msg::Exported(res));
@@ -687,6 +840,11 @@ impl eframe::App for AutoshopApp {
                 ui.label("Style");
                 ui.add(egui::Slider::new(&mut self.style_strength, 0.0..=1.0).show_value(false));
                 ui.label(format!("{:.0}%", self.style_strength * 100.0));
+                ui.separator();
+                if ui.button("⚙ Settings").on_hover_text("AI provider / model / API key").clicked() {
+                    self.show_settings = true;
+                    self.load_settings_form();
+                }
             });
             // AI direction (free text) + save options.
             ui.horizontal(|ui| {
@@ -705,6 +863,9 @@ impl eframe::App for AutoshopApp {
                             ui.selectable_value(&mut self.save_jpeg, false, "16-bit TIFF");
                             ui.selectable_value(&mut self.save_jpeg, true, "JPEG");
                         });
+                    ui.checkbox(&mut self.save_denoise, "AI Denoise").on_hover_text(
+                        "SCUNet AI denoise before developing — high-ISO / astro (slow, GPU; needs the python sidecar)",
+                    );
                     if ui.button("Export → ./out").clicked() {
                         self.start_export();
                     }
@@ -788,6 +949,21 @@ impl eframe::App for AutoshopApp {
                 });
             });
         });
+
+        // Settings window (provider / model / API keys). A local `open` avoids a
+        // double &mut self borrow (Window::open vs the closure that reads self).
+        if self.show_settings {
+            let mut open = true;
+            egui::Window::new("⚙ Settings")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(480.0)
+                .open(&mut open)
+                .show(ctx, |ui| self.settings_ui(ui));
+            if !open {
+                self.show_settings = false;
+            }
+        }
 
         // Land a finished edit gesture (slider release, AI Analyze, Reset) into
         // the undo history — once per gesture, after all controls are read.
