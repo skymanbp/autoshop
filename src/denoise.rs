@@ -112,8 +112,8 @@ fn run_sidecar(opts: &DenoiseOpts, input: &Path, output: &Path) -> Result<()> {
             opts.script.display()
         );
     }
-    let status = Command::new(&opts.python_bin)
-        .arg(&opts.script)
+    let mut cmd = Command::new(&opts.python_bin);
+    cmd.arg(&opts.script)
         .arg("--input")
         .arg(input)
         .arg("--output")
@@ -125,7 +125,11 @@ fn run_sidecar(opts: &DenoiseOpts, input: &Path, output: &Path) -> Result<()> {
         .arg("--cache")
         .arg(&opts.cache)
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    // Don't flash a console window when the windowed GUI spawns the sidecar; the
+    // CLI still sees its output via the inherited handles.
+    crate::hide_child_console(&mut cmd);
+    let status = cmd
         .status()
         .with_context(|| {
             format!(

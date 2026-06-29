@@ -43,17 +43,19 @@ impl Advisor for ClaudeProvider {
     ) -> Result<Verdict, AdvisorError> {
         let prompt = build_verify_prompt(recipe, meta, hist)?;
 
-        let output = Command::new(&self.bin)
-            .args([
-                "-p",
-                "--bare",
-                "--model",
-                &self.model,
-                "--output-format",
-                "json",
-            ])
-            .arg(&prompt)
-            .output()?;
+        let mut cmd = Command::new(&self.bin);
+        cmd.args([
+            "-p",
+            "--bare",
+            "--model",
+            &self.model,
+            "--output-format",
+            "json",
+        ])
+        .arg(&prompt);
+        // Don't flash a console window when the windowed GUI spawns this CLI child.
+        crate::hide_child_console(&mut cmd);
+        let output = cmd.output()?;
 
         if !output.status.success() {
             return Err(AdvisorError::CliFailed {
