@@ -99,6 +99,9 @@ struct AutoshopApp {
     thumbs: HashMap<usize, egui::TextureHandle>, // decoded thumbnails by index
     thumb_requested: HashSet<usize>,             // indices already queued/decoded
     thumb_inflight: usize,                       // live thumbnail-decode threads
+    // --- region box-select (local-edit target on the After image) ---
+    region: Option<[f32; 4]>,                      // normalized [left, top, right, bottom]
+    region_drag: Option<(egui::Pos2, egui::Pos2)>, // transient drag (start, current) in screen px
 }
 
 impl Default for AutoshopApp {
@@ -136,6 +139,8 @@ impl Default for AutoshopApp {
             thumbs: HashMap::new(),
             thumb_requested: HashSet::new(),
             thumb_inflight: 0,
+            region: None,
+            region_drag: None,
         }
     }
 }
@@ -406,10 +411,21 @@ impl AutoshopApp {
         let style = self.style_strength;
         // Free-text direction ("warmer, moodier") steers the proposal; when
         // `refine` is on, the AI ADJUSTS the current recipe instead of starting
-        // from scratch.
+        // from scratch. A box-selected region (if any) folds into the direction so
+        // the AI masks exactly there — same prompt the web UI sends.
         let guidance = {
             let g = self.guidance.trim();
-            (!g.is_empty()).then(|| g.to_string())
+            match self.region {
+                Some([l, t, r, b]) => Some(format!(
+                    "The user SELECTED a target region (normalized 0..1 frame coords): \
+                     left={l:.3} top={t:.3} right={r:.3} bottom={b:.3}. Apply the direction ONLY to \
+                     that region — emit a mask covering it (a radial mask with those exact \
+                     left/top/right/bottom bounds and feather ~0.4 is ideal, or a linear gradient \
+                     for a thin edge band). Direction: {}",
+                    if g.is_empty() { "make a tasteful local improvement" } else { g }
+                )),
+                None => (!g.is_empty()).then(|| g.to_string()),
+            }
         };
         let base = self.refine.then(|| self.recipe.clone());
         std::thread::spawn(move || {
@@ -506,6 +522,8 @@ impl AutoshopApp {
                         self.base_preview = Some(base);
                         self.recipe = EditRecipe::default();
                         self.reset_history(); // a new photo starts a fresh undo history
+                        self.region = None; // and a fresh local-edit selection
+                        self.region_drag = None;
                         self.verdict = None;
                         self.rationale.clear();
                         self.dirty = true; // render the (neutral) after
@@ -782,6 +800,57 @@ impl AutoshopApp {
             self.dirty = true;
         }
     }
+
+    /// Box-select on the After image: drag a rectangle to target a local edit;
+    /// the normalized box is folded into the AI direction so it masks exactly
+    /// there (mirrors the web region→mask prompt). A plain click — or a tiny
+    /// drag — clears the selection.
+    fn handle_region_select(&mut self, ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect) {
+        if resp.drag_started() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                self.region_drag = Some((p, p));
+            }
+        } else if resp.dragged() {
+            if let (Some(p), Some((s, _))) = (resp.interact_pointer_pos(), self.region_drag) {
+                self.region_drag = Some((s, p));
+            }
+        } else if resp.drag_stopped() {
+            if let Some((s, e)) = self.region_drag.take() {
+                let nx = |x: f32| ((x - rect.min.x) / rect.width().max(1.0)).clamp(0.0, 1.0);
+                let ny = |y: f32| ((y - rect.min.y) / rect.height().max(1.0)).clamp(0.0, 1.0);
+                let (l, r) = (nx(s.x).min(nx(e.x)), nx(s.x).max(nx(e.x)));
+                let (t, b) = (ny(s.y).min(ny(e.y)), ny(s.y).max(ny(e.y)));
+                if r - l > 0.02 && b - t > 0.02 {
+                    self.region = Some([l, t, r, b]);
+                    self.status = format!(
+                        "region {}×{}% — type a direction, then AI Analyze (click to clear)",
+                        ((r - l) * 100.0).round() as i32,
+                        ((b - t) * 100.0).round() as i32
+                    );
+                } else {
+                    self.region = None; // a tiny drag clears the selection
+                }
+            }
+        } else if resp.clicked() {
+            self.region = None; // a plain click clears the region
+        }
+
+        // Draw the live drag box, else the committed region outline.
+        let stroke = egui::Stroke::new(2.0, ACCENT);
+        let fill = egui::Color32::from_rgba_unmultiplied(0x4c, 0x8b, 0xf5, 40);
+        let draw = |r: egui::Rect| {
+            ui.painter().rect_filled(r, 0.0, fill);
+            ui.painter().rect_stroke(r, 0.0, stroke);
+        };
+        if let Some((s, e)) = self.region_drag {
+            draw(egui::Rect::from_two_pos(s, e).intersect(rect));
+        } else if let Some([l, t, rr, bb]) = self.region {
+            draw(egui::Rect::from_min_max(
+                egui::pos2(rect.min.x + l * rect.width(), rect.min.y + t * rect.height()),
+                egui::pos2(rect.min.x + rr * rect.width(), rect.min.y + bb * rect.height()),
+            ));
+        }
+    }
 }
 
 impl eframe::App for AutoshopApp {
@@ -822,6 +891,7 @@ impl eframe::App for AutoshopApp {
                         .on_hover_text("Adjust the CURRENT edit instead of proposing from scratch");
                     if ui.button("Reset").clicked() {
                         self.recipe = EditRecipe::default();
+                        self.region = None;
                         self.dirty = true;
                     }
                     ui.separator();
@@ -942,9 +1012,17 @@ impl eframe::App for AutoshopApp {
                 });
                 ui.separator();
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new("After (edit)").weak());
-                    if let Some(t) = &self.after_tex {
-                        ui.add(egui::Image::new(SizedTexture::new(t.id(), t.size_vec2())).max_width(half));
+                    ui.label(egui::RichText::new("After (edit) — drag a box to target a local edit").weak());
+                    // Copy id/size out so we don't hold a borrow of self.after_tex
+                    // while handle_region_select mutates self.region.
+                    if let Some((id, size)) = self.after_tex.as_ref().map(|t| (t.id(), t.size_vec2())) {
+                        let resp = ui.add(
+                            egui::Image::new(SizedTexture::new(id, size))
+                                .max_width(half)
+                                .sense(egui::Sense::click_and_drag()),
+                        );
+                        let rect = resp.rect;
+                        self.handle_region_select(ui, &resp, rect);
                     }
                 });
             });
