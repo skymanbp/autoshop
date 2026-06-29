@@ -1,3 +1,7 @@
+// Release builds run WITHOUT a console window — a GUI app shouldn't flash a
+// terminal on launch. Debug keeps the console so panics/logs stay visible.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! Autoshop — native desktop GUI (egui/eframe).
 //!
 //! A real native window (no localhost server, no webview): it links the
@@ -373,9 +377,21 @@ impl eframe::App for AutoshopApp {
     }
 }
 
+/// Decode the embedded Autoshop icon for the window title bar / taskbar.
+fn app_icon() -> egui::IconData {
+    let img = image::load_from_memory(include_bytes!("../../assets/icon_256.png"))
+        .expect("embedded icon decodes")
+        .to_rgba8();
+    let (width, height) = img.dimensions();
+    egui::IconData { rgba: img.into_raw(), width, height }
+}
+
 fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 860.0]).with_title("Autoshop"),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 860.0])
+            .with_title("Autoshop")
+            .with_icon(std::sync::Arc::new(app_icon())),
         ..Default::default()
     };
     eframe::run_native("Autoshop", opts, Box::new(|_cc| Ok(Box::new(AutoshopApp::default()))))

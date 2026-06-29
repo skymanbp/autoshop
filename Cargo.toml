@@ -1,6 +1,6 @@
 [package]
 name = "autoshop"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "AI-assisted automatic development of RAW photographs (EditRecipe + deterministic Rust render, XMP sidecar, AI denoise)"
 license = "MIT"
@@ -45,3 +45,7 @@ ureq = { version = "2", features = ["json"] }
 eframe = { version = "0.29", optional = true }
 egui = { version = "0.29", optional = true }
 rfd = { version = "0.15", optional = true }
+
+# Embeds the Windows app icon into the executables (see build.rs).
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
