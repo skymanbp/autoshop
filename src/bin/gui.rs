@@ -19,6 +19,7 @@ use eframe::egui;
 use egui::load::SizedTexture;
 
 use autoshop::recipe::{EditRecipe, Hsl, ColorGrade};
+use image::GenericImageView;
 
 const PREVIEW_EDGE: u32 = 1280; // working preview size for fast live develop
 const THUMB_EDGE: u32 = 160; // decoded gallery-thumbnail long edge
@@ -44,6 +45,8 @@ enum Msg {
     /// A gallery thumbnail decoded. `generation` tags the folder generation so a
     /// folder switch can't insert a stale thumbnail under a reused index.
     Thumb { generation: u64, idx: usize, img: Box<anyhow::Result<image::DynamicImage>> },
+    /// A generative-fill / heal result: (preview of the saved ./out master, status).
+    Retouched(Box<anyhow::Result<(image::DynamicImage, String)>>),
 }
 
 /// Editable buffers for the in-app Settings window. Key fields stay blank on
@@ -102,6 +105,17 @@ struct AutoshopApp {
     // --- region box-select (local-edit target on the After image) ---
     region: Option<[f32; 4]>,                      // normalized [left, top, right, bottom]
     region_drag: Option<(egui::Pos2, egui::Pos2)>, // transient drag (start, current) in screen px
+    // --- retouch: mask painting + generative fill + heal ---
+    paint_mode: bool,                      // brush-paint a mask (pauses box-select)
+    brush: f32,                            // brush radius in After-image display px
+    mask_paint: Option<image::RgbaImage>,  // painted overlay (red where painted), at preview res
+    mask_tex: Option<egui::TextureHandle>, // overlay texture
+    mask_dirty: bool,                      // re-upload the overlay
+    paint_last: Option<(f32, f32)>,        // last brush point in mask px (line fill)
+    fill_prompt: String,                   // generative-fill instruction
+    fill_quality: usize,                   // 0=high 1=medium 2=low
+    fill_fullres: bool,                    // composite onto the full-res develop
+    heal_fullres: bool,                    // heal the full-res develop
 }
 
 impl Default for AutoshopApp {
@@ -141,16 +155,54 @@ impl Default for AutoshopApp {
             thumb_inflight: 0,
             region: None,
             region_drag: None,
+            paint_mode: false,
+            brush: 30.0,
+            mask_paint: None,
+            mask_tex: None,
+            mask_dirty: false,
+            paint_last: None,
+            fill_prompt: String::new(),
+            fill_quality: 0,
+            fill_fullres: false,
+            heal_fullres: false,
         }
     }
 }
 
 /// `image::DynamicImage` → egui texture-ready colour image.
 fn to_color_image(img: &image::DynamicImage) -> egui::ColorImage {
-    use image::GenericImageView;
     let rgba = img.to_rgba8();
     let (w, h) = img.dimensions();
     egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw())
+}
+
+/// Stamp a filled brush dot into the paint mask (painted = translucent red).
+fn stamp_dot(m: &mut image::RgbaImage, c: (f32, f32), r: f32) {
+    let (w, h) = (m.width() as i32, m.height() as i32);
+    let (cx, cy) = c;
+    let r2 = r * r;
+    let x0 = (cx - r).floor().max(0.0) as i32;
+    let x1 = ((cx + r).ceil() as i32).min(w - 1);
+    let y0 = (cy - r).floor().max(0.0) as i32;
+    let y1 = ((cy + r).ceil() as i32).min(h - 1);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let (dx, dy) = (x as f32 - cx, y as f32 - cy);
+            if dx * dx + dy * dy <= r2 {
+                m.put_pixel(x as u32, y as u32, image::Rgba([255, 64, 64, 160]));
+            }
+        }
+    }
+}
+
+/// Stamp a brush stroke between two points (interpolated dots — no gaps).
+fn stamp_line(m: &mut image::RgbaImage, a: (f32, f32), b: (f32, f32), r: f32) {
+    let dist = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+    let steps = (dist / (r * 0.5).max(1.0)).ceil().max(1.0) as i32;
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        stamp_dot(m, (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t), r);
+    }
 }
 
 impl AutoshopApp {
@@ -519,7 +571,14 @@ impl AutoshopApp {
                             to_color_image(&base),
                             egui::TextureOptions::LINEAR,
                         ));
+                        let (mw, mh) = base.dimensions();
                         self.base_preview = Some(base);
+                        // A fresh, fully-transparent paint mask sized to the preview.
+                        self.mask_paint = Some(image::RgbaImage::new(mw, mh));
+                        self.mask_tex = None;
+                        self.mask_dirty = false;
+                        self.paint_last = None;
+                        self.paint_mode = false;
                         self.recipe = EditRecipe::default();
                         self.reset_history(); // a new photo starts a fresh undo history
                         self.region = None; // and a fresh local-edit selection
@@ -590,6 +649,25 @@ impl AutoshopApp {
                         }
                     }
                 }
+                Msg::Retouched(boxed) => match *boxed {
+                    Ok((img, msg)) => {
+                        // Show the saved master in the After pane (it's a separate
+                        // ./out artifact, not the develop recipe — a slider edit
+                        // re-develops over it, exactly like the web UI).
+                        self.after_tex = Some(ctx.load_texture(
+                            "after",
+                            to_color_image(&img),
+                            egui::TextureOptions::LINEAR,
+                        ));
+                        self.clear_mask();
+                        self.busy = false;
+                        self.status = msg;
+                    }
+                    Err(e) => {
+                        self.busy = false;
+                        self.status = format!("retouch failed: {e}");
+                    }
+                },
             }
         }
         // Keep the frame loop alive while any worker (analyze/export/thumbs) runs.
@@ -851,6 +929,232 @@ impl AutoshopApp {
             ));
         }
     }
+
+    /// PNG bytes of the EXPORT mask: painted → transparent (regenerate / heal
+    /// here), unpainted → opaque. None if nothing is painted — mirrors the web.
+    fn export_mask_png(&self) -> Option<Vec<u8>> {
+        let m = self.mask_paint.as_ref()?;
+        let (w, h) = (m.width(), m.height());
+        let mut out = image::RgbaImage::new(w, h);
+        let mut any = false;
+        for (x, y, p) in m.enumerate_pixels() {
+            let painted = p.0[3] > 10;
+            any |= painted;
+            out.put_pixel(x, y, image::Rgba([0, 0, 0, if painted { 0 } else { 255 }]));
+        }
+        if !any {
+            return None;
+        }
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgba8(out)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .ok()?;
+        Some(buf)
+    }
+
+    fn clear_mask(&mut self) {
+        if let Some(m) = &mut self.mask_paint {
+            for p in m.pixels_mut() {
+                *p = image::Rgba([0, 0, 0, 0]);
+            }
+            self.mask_dirty = true;
+        }
+        self.paint_last = None;
+    }
+
+    fn ensure_mask_tex(&mut self, ctx: &egui::Context) {
+        if self.mask_dirty {
+            if let Some(m) = &self.mask_paint {
+                let ci = egui::ColorImage::from_rgba_unmultiplied(
+                    [m.width() as usize, m.height() as usize],
+                    m.as_raw(),
+                );
+                self.mask_tex = Some(ctx.load_texture("paintmask", ci, egui::TextureOptions::LINEAR));
+            }
+            self.mask_dirty = false;
+        }
+    }
+
+    /// Brush-paint into the mask while dragging on the After image.
+    fn handle_paint(&mut self, resp: &egui::Response, rect: egui::Rect) {
+        let brush = self.brush;
+        let Some(m) = self.mask_paint.as_mut() else { return };
+        let (mw, mh) = (m.width() as f32, m.height() as f32);
+        let to_mask = |p: egui::Pos2| {
+            (
+                (p.x - rect.min.x) / rect.width().max(1.0) * mw,
+                (p.y - rect.min.y) / rect.height().max(1.0) * mh,
+            )
+        };
+        let brush_mask = (brush * mw / rect.width().max(1.0)).max(1.0);
+        if resp.dragged() || resp.drag_started() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let cur = to_mask(p);
+                match self.paint_last {
+                    Some(prev) => stamp_line(m, prev, cur, brush_mask),
+                    None => stamp_dot(m, cur, brush_mask),
+                }
+                self.paint_last = Some(cur);
+                self.mask_dirty = true;
+            }
+        } else if resp.drag_stopped() {
+            self.paint_last = None;
+        }
+    }
+
+    /// Generative fill: regenerate the painted area (gpt-image), composite onto
+    /// the source, save to ./out. Runs on a worker thread.
+    fn start_fill(&mut self) {
+        let Some(path) = self.src_path.clone() else { return };
+        if self.busy {
+            return;
+        }
+        let prompt = self.fill_prompt.trim().to_string();
+        if prompt.is_empty() {
+            self.status = "write what should fill the painted area".into();
+            return;
+        }
+        let Some(mask_png) = self.export_mask_png() else {
+            self.status = "paint the area to remove/fill first (tick Paint mask)".into();
+            return;
+        };
+        self.busy = true;
+        self.status = if self.fill_fullres {
+            "generative fill (full-res render)… (slow, minutes)".into()
+        } else {
+            "generative fill via gpt-image… (~15-40s)".into()
+        };
+        let tx = self.tx.clone();
+        let quality = ["high", "medium", "low"][self.fill_quality.min(2)].to_string();
+        let full_res = self.fill_fullres;
+        std::thread::spawn(move || {
+            let res = (|| -> anyhow::Result<(image::DynamicImage, String)> {
+                let cfg = autoshop::config::Config::load();
+                let out = autoshop::pipeline::default_out(&path, "retouch", "png");
+                let mask_tmp =
+                    std::env::temp_dir().join(format!("autoshop_gui_fill_{}.png", std::process::id()));
+                std::fs::write(&mask_tmp, &mask_png)?;
+                let r = autoshop::generative::retouch(&cfg, &path, &mask_tmp, &prompt, &quality, full_res, &out);
+                let _ = std::fs::remove_file(&mask_tmp);
+                r?;
+                let img = autoshop::decode::load_image(&out)?.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE);
+                Ok((img, format!("filled → {} (saved to ./out)", out.display())))
+            })();
+            let _ = tx.send(Msg::Retouched(Box::new(res)));
+        });
+    }
+
+    /// Heal: AI auto-detect (use_mask=false) or the painted mask (use_mask=true).
+    /// Pixel retouch from surrounding real pixels; saves to ./out.
+    fn start_heal(&mut self, use_mask: bool) {
+        let Some(path) = self.src_path.clone() else { return };
+        if self.busy {
+            return;
+        }
+        let mask_png = if use_mask {
+            match self.export_mask_png() {
+                Some(b) => Some(b),
+                None => {
+                    self.status = "tick Paint mask and paint the spots, then Heal painted area".into();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        self.busy = true;
+        self.status = if use_mask {
+            "healing painted area…".into()
+        } else {
+            "AI 去瑕疵中… (~10-30s)".into()
+        };
+        let tx = self.tx.clone();
+        let full_res = self.heal_fullres;
+        std::thread::spawn(move || {
+            let res = (|| -> anyhow::Result<(image::DynamicImage, String)> {
+                let cfg = autoshop::config::Config::load();
+                let out = autoshop::pipeline::default_out(&path, "heal", "png");
+                let mask_tmp = match mask_png {
+                    Some(bytes) => {
+                        let t = std::env::temp_dir()
+                            .join(format!("autoshop_gui_heal_{}.png", std::process::id()));
+                        std::fs::write(&t, &bytes)?;
+                        Some(t)
+                    }
+                    None => None,
+                };
+                let rep = autoshop::retouch::heal(&cfg, &path, mask_tmp.as_deref(), !use_mask, full_res, &out);
+                if let Some(t) = &mask_tmp {
+                    let _ = std::fs::remove_file(t);
+                }
+                let rep = rep?;
+                let img = autoshop::decode::load_image(&out)?.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE);
+                Ok((img, format!("healed {} spot(s) → {}", rep.spots, out.display())))
+            })();
+            let _ = tx.send(Msg::Retouched(Box::new(res)));
+        });
+    }
+
+    fn retouch_panel(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.heading("Retouch");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.paint_mode, "Paint mask")
+                .on_hover_text("Brush over the area; box-select is paused while on");
+            if ui.button("Clear").clicked() {
+                self.clear_mask();
+            }
+        });
+        ui.add(egui::Slider::new(&mut self.brush, 4.0..=80.0).text("brush"));
+
+        ui.label(egui::RichText::new("Generative Fill · 实验").strong());
+        ui.add(
+            egui::TextEdit::singleline(&mut self.fill_prompt)
+                .desired_width(f32::INFINITY)
+                .hint_text("what belongs there, e.g. remove the trash can, extend the sky"),
+        );
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("fill_quality")
+                .selected_text(["high", "medium", "low"][self.fill_quality.min(2)])
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.fill_quality, 0, "high");
+                    ui.selectable_value(&mut self.fill_quality, 1, "medium");
+                    ui.selectable_value(&mut self.fill_quality, 2, "low");
+                });
+            ui.checkbox(&mut self.fill_fullres, "Full-res")
+                .on_hover_text("Composite onto the full-sensor develop (slow, RAW only)");
+        });
+        ui.add_enabled_ui(!self.busy, |ui| {
+            if ui.button("Remove / Fill").clicked() {
+                self.start_fill();
+            }
+        });
+        ui.label(
+            egui::RichText::new("Paint the area, write what belongs there, then Remove/Fill. Needs OPENAI_API_KEY.")
+                .weak()
+                .small(),
+        );
+
+        ui.label(egui::RichText::new("修图 · 去瑕疵 Heal（像素）").strong());
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!self.busy, |ui| {
+                if ui.button("✦ AI 去瑕疵 (auto)").clicked() {
+                    self.start_heal(false);
+                }
+                if ui.button("Heal painted area").clicked() {
+                    self.start_heal(true);
+                }
+            });
+            ui.checkbox(&mut self.heal_fullres, "Full-res");
+        });
+        ui.label(
+            egui::RichText::new(
+                "AI auto-detects dust / blemishes, or paint a mask and Heal it. Pixel retouch from surrounding pixels; saved to ./out.",
+            )
+            .weak()
+            .small(),
+        );
+    }
 }
 
 impl eframe::App for AutoshopApp {
@@ -981,6 +1285,7 @@ impl eframe::App for AutoshopApp {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if self.src_path.is_some() {
                     self.develop_panel(ui);
+                    self.retouch_panel(ui);
                     if let Some(v) = &self.verdict {
                         ui.separator();
                         ui.label(egui::RichText::new("Verdict").strong());
@@ -1012,9 +1317,14 @@ impl eframe::App for AutoshopApp {
                 });
                 ui.separator();
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new("After (edit) — drag a box to target a local edit").weak());
+                    let hint = if self.paint_mode {
+                        "After (edit) — paint over the area to fill / heal"
+                    } else {
+                        "After (edit) — drag a box to target a local edit"
+                    };
+                    ui.label(egui::RichText::new(hint).weak());
                     // Copy id/size out so we don't hold a borrow of self.after_tex
-                    // while handle_region_select mutates self.region.
+                    // while the handlers mutate self.region / self.mask_paint.
                     if let Some((id, size)) = self.after_tex.as_ref().map(|t| (t.id(), t.size_vec2())) {
                         let resp = ui.add(
                             egui::Image::new(SizedTexture::new(id, size))
@@ -1022,7 +1332,16 @@ impl eframe::App for AutoshopApp {
                                 .sense(egui::Sense::click_and_drag()),
                         );
                         let rect = resp.rect;
-                        self.handle_region_select(ui, &resp, rect);
+                        if self.paint_mode {
+                            self.handle_paint(&resp, rect);
+                            self.ensure_mask_tex(ui.ctx());
+                            if let Some(t) = &self.mask_tex {
+                                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                                ui.painter().image(t.id(), rect, uv, egui::Color32::WHITE);
+                            }
+                        } else {
+                            self.handle_region_select(ui, &resp, rect);
+                        }
                     }
                 });
             });
