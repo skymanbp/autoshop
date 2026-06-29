@@ -65,6 +65,10 @@ struct AutoshopApp {
     guidance: String, // free-text direction for the AI ("warmer, moodier")
     refine: bool,     // adjust the CURRENT recipe vs propose from scratch
     save_jpeg: bool,  // export/download as JPEG instead of 16-bit TIFF
+    // --- undo / redo (recipe snapshots; a drag is one step, committed on release) ---
+    committed: EditRecipe,        // current history head (last committed state)
+    undo_stack: Vec<EditRecipe>,  // prior states, most recent last
+    redo_stack: Vec<EditRecipe>,  // states undone away (cleared on a new edit)
     // --- library / gallery ---
     gallery: Vec<PathBuf>,          // sources in the working folder (sorted)
     gallery_dir: Option<PathBuf>,   // the working folder
@@ -97,6 +101,9 @@ impl Default for AutoshopApp {
             guidance: String::new(),
             refine: false,
             save_jpeg: false,
+            committed: EditRecipe::default(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             gallery: Vec::new(),
             gallery_dir: None,
             gallery_gen: 0,
@@ -166,6 +173,46 @@ impl AutoshopApp {
             let res = autoshop::pipeline::find_sources(&dir).map(|list| (dir, list));
             let _ = tx.send(Msg::Folder(Box::new(res)));
         });
+    }
+
+    /// Reset undo history — call when a brand-new photo opens (you can't undo
+    /// across photos). `committed` becomes the current head.
+    fn reset_history(&mut self) {
+        self.committed = self.recipe.clone();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+    }
+
+    /// Commit the current recipe as ONE undo step once the edit gesture settles
+    /// (pointer released) — dragging a slider is one step, not one per frame.
+    /// Programmatic edits (Analyze, Reset) also land here on the next frame.
+    fn commit_if_settled(&mut self, ctx: &egui::Context) {
+        if self.recipe != self.committed && !ctx.input(|i| i.pointer.any_down()) {
+            self.undo_stack.push(self.committed.clone());
+            if self.undo_stack.len() > 100 {
+                self.undo_stack.remove(0); // cap history memory
+            }
+            self.committed = self.recipe.clone();
+            self.redo_stack.clear();
+        }
+    }
+
+    fn undo(&mut self) {
+        if let Some(prev) = self.undo_stack.pop() {
+            self.redo_stack.push(self.committed.clone());
+            self.committed = prev.clone();
+            self.recipe = prev;
+            self.dirty = true;
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.redo_stack.pop() {
+            self.undo_stack.push(self.committed.clone());
+            self.committed = next.clone();
+            self.recipe = next;
+            self.dirty = true;
+        }
     }
 
     /// Queue a thumbnail decode for `idx` if it isn't cached/queued and we're
@@ -305,6 +352,7 @@ impl AutoshopApp {
                         ));
                         self.base_preview = Some(base);
                         self.recipe = EditRecipe::default();
+                        self.reset_history(); // a new photo starts a fresh undo history
                         self.verdict = None;
                         self.rationale.clear();
                         self.dirty = true; // render the (neutral) after
@@ -587,6 +635,19 @@ impl eframe::App for AutoshopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_workers(ctx);
 
+        // Global undo/redo keys. Skip while a widget is focused so the Direction
+        // text field keeps its own text undo. Ctrl+Z = undo; Ctrl+Y / Ctrl+Shift+Z = redo.
+        if ctx.memory(|m| m.focused()).is_none() {
+            let (mut do_undo, mut do_redo) = (false, false);
+            ctx.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z) { do_redo = true; }
+                if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y) { do_redo = true; }
+                if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z) { do_undo = true; }
+            });
+            if do_undo { self.undo(); }
+            if do_redo { self.redo(); }
+        }
+
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Autoshop");
@@ -610,6 +671,17 @@ impl eframe::App for AutoshopApp {
                         self.recipe = EditRecipe::default();
                         self.dirty = true;
                     }
+                    ui.separator();
+                    ui.add_enabled_ui(!self.undo_stack.is_empty(), |ui| {
+                        if ui.button("↶ Undo").on_hover_text("Ctrl+Z").clicked() {
+                            self.undo();
+                        }
+                    });
+                    ui.add_enabled_ui(!self.redo_stack.is_empty(), |ui| {
+                        if ui.button("↷ Redo").on_hover_text("Ctrl+Y").clicked() {
+                            self.redo();
+                        }
+                    });
                 });
                 ui.separator();
                 ui.label("Style");
@@ -716,6 +788,10 @@ impl eframe::App for AutoshopApp {
                 });
             });
         });
+
+        // Land a finished edit gesture (slider release, AI Analyze, Reset) into
+        // the undo history — once per gesture, after all controls are read.
+        self.commit_if_settled(ctx);
     }
 }
 
