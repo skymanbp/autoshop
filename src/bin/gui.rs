@@ -27,6 +27,7 @@ const GRADE_REGIONS: [&str; 4] = ["shadow", "midtone", "highlight", "global"];
 /// because `(EditRecipe, Verdict)` is large; boxing keeps the channel message
 /// small (clippy::large_enum_variant).
 enum Msg {
+    Opened(Box<anyhow::Result<image::DynamicImage>>),
     Analyzed(Box<anyhow::Result<(EditRecipe, autoshop::advisor::Verdict)>>),
     Exported(anyhow::Result<String>),
 }
@@ -81,24 +82,30 @@ fn to_color_image(img: &image::DynamicImage) -> egui::ColorImage {
 }
 
 impl AutoshopApp {
-    fn open_path(&mut self, ctx: &egui::Context, path: PathBuf) {
-        self.status = format!("decoding {} …", path.display());
-        match autoshop::decode::decode_any(&path) {
-            Ok(decoded) => {
-                let preview = decoded.preview_resized(PREVIEW_EDGE);
-                self.before_tex = Some(ctx.load_texture("before", to_color_image(&preview), egui::TextureOptions::LINEAR));
-                self.base_preview = Some(preview);
-                self.recipe = EditRecipe::default();
-                self.verdict = None;
-                self.rationale.clear();
-                self.src_path = Some(path);
-                self.dirty = true; // render the (neutral) after
-                self.status = "ready — adjust sliders or run AI Analyze".into();
-            }
-            Err(e) => {
-                self.status = format!("could not open: {e}");
-            }
+    fn open_path(&mut self, path: PathBuf) {
+        if self.busy {
+            return;
         }
+        self.busy = true;
+        self.src_path = Some(path.clone());
+        self.status = format!("decoding {} …", path.display());
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            // Build a CLEAN preview base by developing the RAW sensor data
+            // (downscaled), NOT the camera's already-baked 8-bit JPEG preview:
+            // re-developing that double-processes it and amplifies its grain when
+            // you push tone/clarity. Baked images (PNG/TIFF/JPEG) are their own
+            // source. Demosaic is slow, so this runs off the UI thread.
+            let res = (|| -> anyhow::Result<image::DynamicImage> {
+                let full = if autoshop::decode::is_raw(&path) {
+                    autoshop::render::render_to_image(&path, &EditRecipe::default(), None)?
+                } else {
+                    autoshop::decode::load_image(&path)?
+                };
+                Ok(full.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE))
+            })();
+            let _ = tx.send(Msg::Opened(Box::new(res)));
+        });
     }
 
     /// Re-develop the working preview through the current recipe.
@@ -160,6 +167,26 @@ impl AutoshopApp {
             }
         }
         match got {
+            Some(Msg::Opened(boxed)) => match *boxed {
+                Ok(base) => {
+                    self.before_tex = Some(ctx.load_texture(
+                        "before",
+                        to_color_image(&base),
+                        egui::TextureOptions::LINEAR,
+                    ));
+                    self.base_preview = Some(base);
+                    self.recipe = EditRecipe::default();
+                    self.verdict = None;
+                    self.rationale.clear();
+                    self.dirty = true; // render the (neutral) after
+                    self.busy = false;
+                    self.status = "ready — adjust sliders or run AI Analyze".into();
+                }
+                Err(e) => {
+                    self.busy = false;
+                    self.status = format!("could not open: {e}");
+                }
+            },
             Some(Msg::Analyzed(boxed)) => match *boxed {
                 Ok((recipe, verdict)) => {
                     self.recipe = recipe;
@@ -302,7 +329,7 @@ impl eframe::App for AutoshopApp {
                         .add_filter("Photos", &["arw", "dng", "raf", "nef", "cr2", "cr3", "png", "tif", "tiff", "jpg", "jpeg"])
                         .pick_file()
                 {
-                    self.open_path(ctx, path);
+                    self.open_path(path);
                 }
                 let has = self.src_path.is_some();
                 ui.add_enabled_ui(has && !self.busy, |ui| {

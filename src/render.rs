@@ -711,14 +711,20 @@ fn apply_hsl(data: &mut [[f32; 3]], hsl: &crate::recipe::Hsl) {
     const CENTERS: [f32; 8] = [0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 270.0, 300.0];
     for px in data.iter_mut() {
         let (h, s, l) = rgb_to_hsl(px[0], px[1], px[2]);
-        if s < 1e-4 {
-            continue; // grey: no colour band applies
+        // Fade the WHOLE HSL effect out on near-grey pixels. Their hue is
+        // numerically unstable — a hair of sensor noise flips a pixel between
+        // bands (e.g. blue↔aqua), so band-adjusting a smooth low-saturation area
+        // like an overcast sky mottles it into blotches. smoothstep ≈ 0 below 4%
+        // saturation, full above 18%, so genuinely-coloured areas are unaffected.
+        let satw = smoothstep(0.04, 0.18, s);
+        if satw <= 0.0 {
+            continue;
         }
         let (b0, b1, w1) = bracket_bands(h * 360.0, &CENTERS);
         let w0 = 1.0 - w1;
-        let hue_adj = w0 * hsl.hue[b0] + w1 * hsl.hue[b1];
-        let sat_adj = w0 * hsl.saturation[b0] + w1 * hsl.saturation[b1];
-        let lum_adj = w0 * hsl.luminance[b0] + w1 * hsl.luminance[b1];
+        let hue_adj = (w0 * hsl.hue[b0] + w1 * hsl.hue[b1]) * satw;
+        let sat_adj = (w0 * hsl.saturation[b0] + w1 * hsl.saturation[b1]) * satw;
+        let lum_adj = (w0 * hsl.luminance[b0] + w1 * hsl.luminance[b1]) * satw;
         // hue: ±100 → ±30° rotation; sat: ±100 → ±100%; lum gentler (×0.5).
         let new_h = (h + (hue_adj / 100.0) * (30.0 / 360.0)).rem_euclid(1.0);
         let new_s = (s * (1.0 + sat_adj / 100.0)).clamp(0.0, 1.0);
@@ -1043,6 +1049,25 @@ mod tests {
             "grey untouched: {:?}",
             grey[0]
         );
+    }
+
+    #[test]
+    fn hsl_does_not_blotch_a_near_grey_sky() {
+        use crate::recipe::Hsl;
+        // A near-grey overcast "sky": alternating pixels lean faintly blue vs
+        // faintly aqua (s ≈ 3%), the way real demosaiced sky noise does. With
+        // OPPOSITE luminance on the blue and aqua bands, the un-weighted code
+        // would slam adjacent pixels to wildly different luma (a checkerboard
+        // blotch). The saturation fade must keep the patch smooth.
+        let mut data: Vec<[f32; 3]> = (0..64)
+            .map(|i| if i % 2 == 0 { [0.71, 0.715, 0.726] } else { [0.71, 0.726, 0.722] })
+            .collect();
+        let hsl = Hsl { luminance: [0.0, 0.0, 0.0, 0.0, 60.0, -80.0, 0.0, 0.0], ..Hsl::default() };
+        apply_hsl(&mut data, &hsl);
+        let lumas: Vec<f32> = data.iter().map(luma601).collect();
+        let spread = lumas.iter().cloned().fold(f32::MIN, f32::max)
+            - lumas.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(spread < 0.04, "near-grey sky must not blotch — luma spread {spread}");
     }
 
     #[test]
