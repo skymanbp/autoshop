@@ -1368,6 +1368,37 @@ impl eframe::App for AutoshopApp {
     }
 }
 
+/// Register a system CJK font so Chinese / Japanese UI text renders — egui ships
+/// no CJK glyphs, so without this every non-Latin character is a tofu box (□).
+///
+/// Reads the user's installed font at runtime (no ~16 MB binary bloat) and
+/// pre-validates it with `ab_glyph` (egui's own backend) before handing it over —
+/// egui PANICS on a font it can't parse, so a missing/odd font must be skipped,
+/// not registered. Appended as a FALLBACK so Latin keeps egui's default look.
+fn install_cjk_font(ctx: &egui::Context) {
+    // Single-face TTFs first (always parse); TTC collections (face 0) last.
+    const CANDIDATES: &[&str] = &[
+        r"C:\Windows\Fonts\Deng.ttf",   // DengXian — clean modern UI face
+        r"C:\Windows\Fonts\simhei.ttf", // SimHei
+        r"C:\Windows\Fonts\msyh.ttc",   // Microsoft YaHei (collection, face 0)
+        r"C:\Windows\Fonts\simsun.ttc", // SimSun (collection, face 0)
+    ];
+    let Some(bytes) = CANDIDATES.iter().find_map(|p| {
+        let b = std::fs::read(p).ok()?;
+        // Only accept it if egui's backend can actually parse face 0 (no panic).
+        ab_glyph::FontVec::try_from_vec_and_index(b.clone(), 0).ok()?;
+        Some(b)
+    }) else {
+        return; // no usable CJK font found — Latin text still renders fine
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert("cjk".to_owned(), egui::FontData::from_owned(bytes));
+    for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts.families.entry(fam).or_default().push("cjk".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
 /// Decode the embedded Autoshop icon for the window title bar / taskbar.
 fn app_icon() -> egui::IconData {
     let img = image::load_from_memory(include_bytes!("../../assets/icon_256.png"))
@@ -1385,5 +1416,12 @@ fn main() -> eframe::Result<()> {
             .with_icon(std::sync::Arc::new(app_icon())),
         ..Default::default()
     };
-    eframe::run_native("Autoshop", opts, Box::new(|_cc| Ok(Box::new(AutoshopApp::default()))))
+    eframe::run_native(
+        "Autoshop",
+        opts,
+        Box::new(|cc| {
+            install_cjk_font(&cc.egui_ctx); // CJK glyphs so Chinese labels aren't tofu
+            Ok(Box::new(AutoshopApp::default()))
+        }),
+    )
 }

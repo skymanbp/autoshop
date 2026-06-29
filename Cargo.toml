@@ -26,7 +26,7 @@ path = "src/bin/gui.rs"
 required-features = ["gui"]
 
 [features]
-gui = ["dep:eframe", "dep:egui", "dep:rfd"]
+gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:ab_glyph"]
 
 [dependencies]
 anyhow = "1.0.103"
@@ -45,6 +45,9 @@ ureq = { version = "2", features = ["json"] }
 eframe = { version = "0.29", optional = true }
 egui = { version = "0.29", optional = true }
 rfd = { version = "0.15", optional = true }
+# Same version egui pulls in — used to pre-validate a CJK font before handing it
+# to egui (egui panics on an unparseable font), so font loading degrades safely.
+ab_glyph = { version = "0.2", optional = true }
 
 # Embeds the Windows app icon into the executables (see build.rs).
 [target.'cfg(windows)'.build-dependencies]
