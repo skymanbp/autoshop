@@ -383,6 +383,48 @@ impl EditRecipe {
         }
     }
 
+    /// Taste guardrail for **AI-proposed** recipes (never manual edits): keep a
+    /// finished develop from over-cooking the tone. Two rules:
+    ///  1. **Couple highlight recovery to the white point.** Pulling Highlights
+    ///     negative without raising Whites drags specular whites (sea foam, clouds,
+    ///     sun glints) to grey — so recovery lifts Whites proportionally. This is the
+    ///     principled "keep whites white", at the recipe layer (the renderer stays
+    ///     faithful; it does not override the recipe).
+    ///  2. **Soft-cap over-aggressive tone moves** toward a tasteful ceiling with a
+    ///     smooth knee (not a hard clip), so Highlights/Shadows asymptote near ±70
+    ///     and Whites/Blacks near ±45 instead of slamming to the ±100 schema bound.
+    pub fn temper(&mut self) {
+        // Smoothly compress a magnitude past `knee` toward `ceil` (C1-continuous at
+        // the knee; asymptotes to `ceil`, so |out| < ceil always). Identity below knee.
+        fn soft_cap(v: f32, knee: f32, ceil: f32) -> f32 {
+            let a = v.abs();
+            if a <= knee {
+                return v;
+            }
+            let span = ceil - knee;
+            let excess = a - knee;
+            v.signum() * (knee + span * (excess / (excess + span)))
+        }
+        // Couple recovery to whites BEFORE soft-capping (uses the original strength).
+        if self.highlights < 0.0 {
+            self.whites = self.whites.max((-self.highlights * 0.3).min(50.0));
+        }
+        self.highlights = soft_cap(self.highlights, 50.0, 70.0);
+        self.shadows = soft_cap(self.shadows, 50.0, 70.0);
+        self.whites = soft_cap(self.whites, 30.0, 45.0);
+        self.blacks = soft_cap(self.blacks, 30.0, 45.0);
+        // Same restraint on each local mask's tone sliders.
+        for m in self.masks.iter_mut() {
+            if m.highlights < 0.0 {
+                m.whites = m.whites.max((-m.highlights * 0.3).min(50.0));
+            }
+            m.highlights = soft_cap(m.highlights, 50.0, 70.0);
+            m.shadows = soft_cap(m.shadows, 50.0, 70.0);
+            m.whites = soft_cap(m.whites, 30.0, 45.0);
+            m.blacks = soft_cap(m.blacks, 30.0, 45.0);
+        }
+    }
+
     /// Returns true if the recipe leaves the image essentially untouched —
     /// useful to detect a "the AI declined to edit" no-op result.
     pub fn is_noop(&self) -> bool {
@@ -399,6 +441,26 @@ impl EditRecipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temper_lifts_white_point_and_soft_caps_extremes() {
+        // The reported over-cooked recipe: strong −Highlights with low Whites greys
+        // the foam. temper() lifts the white point and softens the extremes, WITHOUT
+        // touching a modest recipe's committed tone moves.
+        let mut hot = EditRecipe { highlights: -78.81, whites: 10.27, shadows: 95.0, ..Default::default() };
+        hot.temper();
+        assert!(hot.whites >= 23.0, "recovery must lift the white point: whites={}", hot.whites);
+        assert!(hot.highlights >= -65.0, "highlights not tempered: {}", hot.highlights);
+        assert!(hot.highlights <= -55.0, "highlights over-tempered (lost commitment): {}", hot.highlights);
+        assert!(hot.shadows >= 55.0 && hot.shadows < 70.0, "shadows soft-cap off: {}", hot.shadows);
+
+        // A modest recipe keeps its tone moves; recovery still nudges whites a touch.
+        let mut mild = EditRecipe { highlights: -30.0, shadows: 20.0, whites: 5.0, ..Default::default() };
+        mild.temper();
+        assert_eq!(mild.highlights, -30.0, "modest highlights must pass through");
+        assert_eq!(mild.shadows, 20.0, "modest shadows must pass through");
+        assert!(mild.whites >= 9.0, "modest recovery still protects speculars: {}", mild.whites);
+    }
 
     #[test]
     fn masks_round_trip_and_v1_compatible() {

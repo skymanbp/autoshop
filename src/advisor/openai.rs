@@ -71,6 +71,10 @@ black and white points deliberately but do NOT slam them (avoid crushing blacks 
 past the reference habit), and use vibrance, saturation and clarity SPARINGLY — only as much as the \
 reference shows; stacked vibrance+saturation+clarity reads as over-processed. Stay well inside the \
 documented ranges (they are safety bounds, not a target). \
+Concretely keep Highlights and Shadows within about ±50 and Whites/Blacks within ±35; reserve larger \
+moves only for a genuinely blown or blocked histogram. CRITICAL: recovering highlights must NOT grey \
+out specular whites (sea foam, clouds, sun glints) — if you pull Highlights strongly negative, RAISE \
+Whites enough to keep the white point bright. \
 For deeper LOOK shaping, you may use the colour-mixer controls — but the SAME restraint applies: \
 use them the way the photographer does (sparingly, to MATCH the reference), never to over-saturate. \
 `hsl` is the 8-band HSL mixer: each of `hue`, `saturation`, `luminance` MUST be an array of EXACTLY \
@@ -151,6 +155,7 @@ follow it closely): ");
         ))?;
         let mut recipe: EditRecipe = serde_json::from_str(strip_code_fence(&recipe_json))?;
         recipe.clamp(); // never trust the model's ranges
+        recipe.temper(); // taste guardrail: couple highlight-recovery to the white point, soft-cap extremes
         Ok(recipe)
     }
 }

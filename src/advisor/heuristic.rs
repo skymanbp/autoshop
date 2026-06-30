@@ -70,6 +70,7 @@ impl Advisor for HeuristicProposer {
         );
         r.confidence = 0.4;
         r.clamp();
+        r.temper(); // same taste guardrail as the AI path
         Ok(r)
     }
 }
