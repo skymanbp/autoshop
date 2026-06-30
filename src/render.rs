@@ -223,8 +223,9 @@ fn apply_develop(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
     //    ratio (scale_chroma) so hue + saturation are preserved — NOT per-channel.
     //    Running each channel through the curve independently lets opposing pushes
     //    (e.g. strong −highlights + +shadows) converge the channels, desaturating
-    //    saturated colour to grey (the reported "turquoise water went flat grey").
-    //    ACR-like tone operators act on luminance, which is the documented intent.
+    //    saturated colour to grey. The LUT itself is monotone with a pinned white
+    //    point (see build_tone_lut), so no per-channel greying and no flat/inverted
+    //    midtones — the tone model is correct by construction, not patched.
     let lut = build_tone_lut(r);
     for px in data.iter_mut() {
         let l_old = luma601(px);
@@ -542,64 +543,154 @@ fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Build a 1-D tone curve combining exposure (in linear light), contrast,
-/// whites/blacks/highlights/shadows (region-weighted), and the recipe's tone
-/// curve, over input gamma values [0,1].
+/// Build the develop tone curve as a [`LUT_N`]-entry LUT over input gamma [0,1].
+///
+/// It is an 8-knot control-point curve fit by a MONOTONE cubic Hermite spline
+/// (Fritsch–Carlson), so it is monotone *by construction* (no post-hoc clamp) and
+/// the endpoints are pinned. Exposure is a linear-light gain applied before the
+/// curve; contrast is an antisymmetric S; shadows/highlights shape the toe/shoulder
+/// WITHOUT reaching the midtones or the white point (so a strong −Highlights can't
+/// drag specular foam to grey — that is the white point's job, owned by whites);
+/// whites/blacks move the end knots. The recipe's own `tone_curve` is composed on
+/// top. This replaces a summed-region-hump model that could go non-monotonic and
+/// crush mid-bright water / near-white foam (which had needed ad-hoc patches).
 fn build_tone_lut(r: &EditRecipe) -> Vec<f32> {
+    // Knot inputs. 0.66 is an explicit vertex so mid-bright water (≈0.66) stays
+    // separated from the midtone (0.50) under a strong −Highlights; 0.82 shapes the
+    // highlight shoulder; 0.92 is where whites concentrate.
+    const KNOTS_X: [f32; 8] = [0.0, 0.10, 0.25, 0.50, 0.66, 0.82, 0.92, 1.0];
+    // Authority: how far a fully-pushed ±100 slider moves its knot(s).
+    const A_SHADOW: f32 = 0.33;
+    const A_HIGHLIGHT: f32 = 0.34;
+    const A_CONTRAST: f32 = 0.20;
+    const A_WB: f32 = 0.32; // whites & blacks share it
+
     let gain = 2.0_f32.powf(r.exposure_ev);
-    // Clamp to [-1,1] so the S-curve below stays monotonic even if an
-    // un-clamped recipe (preview / mask-local) carries an out-of-range value.
     let contrast = (r.contrast / 100.0).clamp(-1.0, 1.0);
-    let (whites, blacks) = (r.whites / 100.0, r.blacks / 100.0);
-    let (highlights, shadows) = (r.highlights / 100.0, r.shadows / 100.0);
-    // Pre-build the user tone curve as a 256-entry LUT (identity if empty).
-    let curve = tone_curve_lut(r);
+    let highlights = (r.highlights / 100.0).clamp(-1.0, 1.0);
+    let shadows = (r.shadows / 100.0).clamp(-1.0, 1.0);
+    let whites = (r.whites / 100.0).clamp(-1.0, 1.0);
+    let blacks = (r.blacks / 100.0).clamp(-1.0, 1.0);
 
-    // Per-region authority: how far (in output units) a fully-pushed slider may
-    // move its zone. Raised from the old gentle ±0.15 to ±0.30 so highlight
-    // recovery / shadow lift are actually visible in a finished look (plan T1.B).
-    const REGION_AUTH: f32 = 0.30;
-    use std::f32::consts::PI;
+    // Region basis functions over knot input x (each ∈ [0,1]).
+    let w_shadow = |x: f32| smoothstep(0.0, 0.25, x) * (1.0 - smoothstep(0.25, 0.50, x));
+    // highlights: peak 0.82, ZERO at 0.50 and PINNED to 0 at 1.0 — so highlights can
+    // never move the white point; specular foam near white is never dragged down.
+    let w_high = |x: f32| smoothstep(0.60, 0.82, x) * (1.0 - smoothstep(0.82, 1.0, x));
+    // contrast: shoulder lobe minus toe lobe → antisymmetric, 0 at the ends and 0.50.
+    let w_contrast =
+        |x: f32| smoothstep(0.50, 0.75, x) * (1.0 - smoothstep(0.75, 1.0, x)) - w_shadow(x);
+    // whites/blacks own the literal end knots (+ a touch of the adjacent knot).
+    let w_white = |x: f32| {
+        if x >= 0.999 {
+            1.0
+        } else if (x - 0.92).abs() < 1e-3 {
+            0.45
+        } else {
+            0.0
+        }
+    };
+    let w_black = |x: f32| {
+        if x <= 0.001 {
+            1.0
+        } else if (x - 0.10).abs() < 1e-3 {
+            0.45
+        } else {
+            0.0
+        }
+    };
 
+    // Knot OUTPUTS: exposure-mapped identity, then the slider offsets.
+    let mut ys = [0.0f32; 8];
+    for (idx, &x) in KNOTS_X.iter().enumerate() {
+        let mut y = linear_to_srgb((srgb_to_linear(x) * gain).clamp(0.0, 1.0));
+        y += A_CONTRAST * contrast * w_contrast(x);
+        y += A_SHADOW * shadows * w_shadow(x);
+        y += A_HIGHLIGHT * highlights * w_high(x);
+        y += A_WB * whites * w_white(x);
+        y += A_WB * blacks * w_black(x);
+        ys[idx] = y;
+    }
+    // Force the knot outputs non-decreasing (a tone curve cannot invert) then clamp.
+    // Fritsch–Carlson on monotone data ⇒ the whole spline is monotone, so there is
+    // NO running-max pass over the sampled LUT — monotonicity is structural.
+    const EPS: f32 = 1e-4;
+    for i in 1..ys.len() {
+        if ys[i] < ys[i - 1] + EPS {
+            ys[i] = ys[i - 1] + EPS;
+        }
+    }
+    for v in &mut ys {
+        *v = v.clamp(0.0, 1.0);
+    }
+
+    let m = fc_tangents(&KNOTS_X, &ys);
+    let curve = tone_curve_lut(r); // the recipe's own tone_curve, composed on top
     (0..LUT_N)
         .map(|i| {
             let x = i as f32 / (LUT_N - 1) as f32;
-
-            // 1) exposure in linear light
-            let mut v = linear_to_srgb((srgb_to_linear(x) * gain).clamp(0.0, 1.0));
-
-            // 2) contrast as a real S-curve pinned at 0 and 1 (toe + shoulder),
-            //    NOT a clipping linear slope. With u = 2(v-0.5) ∈ [-1,1] and
-            //    k = contrast/π: f(v) = 0.5 + 0.5·(u + k·sin(πu)). Exact identity
-            //    at contrast=0, central slope 1+contrast, endpoint slope
-            //    1-|contrast| ≥ 0 — monotonic over the whole −100..100 range, so
-            //    shadows/highlights compress toward the pinned ends instead of
-            //    blocking up / clipping the way the old linear stretch did.
-            let u = 2.0 * (v - 0.5);
-            let k = contrast / PI;
-            v = (0.5 + 0.5 * (u + k * (PI * u).sin())).clamp(0.0, 1.0);
-
-            // 3) region tones — four DIFFERENTIATED zones (ACR-like): whites move
-            //    the white point, highlights the upper-mids, shadows the
-            //    lower-mids, blacks the black point. whites/blacks reach the
-            //    pinned endpoints; highlights/shadows are midtone humps that fade
-            //    to 0 at the extremes (so they recover detail without re-clipping).
-            let w_black = 1.0 - smoothstep(0.0, 0.5, v); // 1 @ black → 0 @ mid
-            let w_white = smoothstep(0.5, 1.0, v); // 0 @ mid → 1 @ white
-            let w_shadow = smoothstep(0.0, 0.35, v) * (1.0 - smoothstep(0.35, 0.7, v));
-            let w_highlight = smoothstep(0.3, 0.65, v) * (1.0 - smoothstep(0.65, 1.0, v));
-            v = (v
-                + REGION_AUTH
-                    * (whites * w_white
-                        + highlights * w_highlight
-                        + shadows * w_shadow
-                        + blacks * w_black))
-                .clamp(0.0, 1.0);
-
-            // 4) user tone curve
-            sample_lut(&curve, v)
+            sample_lut(&curve, hermite_eval(&KNOTS_X, &ys, &m, x))
         })
         .collect()
+}
+
+/// Monotone cubic Hermite tangents (Fritsch–Carlson). With `xs` strictly increasing
+/// and `ys` non-decreasing, the resulting Hermite spline is monotone everywhere.
+fn fc_tangents(xs: &[f32], ys: &[f32]) -> Vec<f32> {
+    let n = xs.len();
+    let d: Vec<f32> = (0..n - 1).map(|i| (ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i])).collect();
+    let mut m = vec![0.0f32; n];
+    m[0] = d[0];
+    m[n - 1] = d[n - 2];
+    for i in 1..n - 1 {
+        if d[i - 1] * d[i] <= 0.0 {
+            m[i] = 0.0; // local extremum → flat tangent (keeps monotonicity)
+        } else {
+            let w1 = 2.0 * (xs[i + 1] - xs[i]) + (xs[i] - xs[i - 1]);
+            let w2 = (xs[i + 1] - xs[i]) + 2.0 * (xs[i] - xs[i - 1]);
+            m[i] = (w1 + w2) / (w1 / d[i - 1] + w2 / d[i]); // weighted harmonic mean
+        }
+    }
+    // Monotonicity limiter: keep each (α,β) inside the circle α²+β² ≤ 9.
+    for i in 0..n - 1 {
+        if d[i] == 0.0 {
+            m[i] = 0.0;
+            m[i + 1] = 0.0;
+        } else {
+            let a = m[i] / d[i];
+            let b = m[i + 1] / d[i];
+            let s = a * a + b * b;
+            if s > 9.0 {
+                let t = 3.0 / s.sqrt();
+                m[i] = t * a * d[i];
+                m[i + 1] = t * b * d[i];
+            }
+        }
+    }
+    m
+}
+
+/// Evaluate the monotone cubic Hermite spline at `x` (clamped to the knot range).
+fn hermite_eval(xs: &[f32], ys: &[f32], m: &[f32], x: f32) -> f32 {
+    let n = xs.len();
+    if x <= xs[0] {
+        return ys[0];
+    }
+    if x >= xs[n - 1] {
+        return ys[n - 1];
+    }
+    let mut i = 0;
+    while i + 1 < n && x > xs[i + 1] {
+        i += 1;
+    }
+    let h = xs[i + 1] - xs[i];
+    let t = (x - xs[i]) / h;
+    let (t2, t3) = (t * t, t * t * t);
+    let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+    let h10 = t3 - 2.0 * t2 + t;
+    let h01 = -2.0 * t3 + 3.0 * t2;
+    let h11 = t3 - t2;
+    h00 * ys[i] + h10 * h * m[i] + h01 * ys[i + 1] + h11 * h * m[i + 1]
 }
 
 /// The recipe's tone curve as a 256-entry [0,1]→[0,1] LUT; identity if empty.
@@ -888,6 +979,99 @@ mod tests {
     use crate::recipe::{EditRecipe, LocalAdjustment};
 
     #[test]
+    fn white_point_is_invariant_to_highlights_and_bright_stays_bright() {
+        // The engine renders faithfully: Highlights shapes the shoulder but must NOT
+        // move the white point, so the brightest tone stays pinned at white. (Keeping
+        // bright FOAM bright under an over-cooked recipe is the recipe layer's job —
+        // EditRecipe::temper — not an engine override.)
+        for h in [-100.0, -78.81, -30.0, 30.0, 100.0] {
+            let lut = build_tone_lut(&EditRecipe { highlights: h, ..Default::default() });
+            assert!(
+                (sample_lut(&lut, 1.0) - 1.0).abs() < 1e-3,
+                "highlights {h} moved the white point: {}",
+                sample_lut(&lut, 1.0)
+            );
+        }
+        // A neutral recipe must leave bright near-white foam bright.
+        let mut foam = vec![[0.90_f32, 0.93, 0.96]];
+        apply_develop(&mut foam, 1, 1, &EditRecipe::default());
+        let lum = 0.299 * foam[0][0] + 0.587 * foam[0][1] + 0.114 * foam[0][2];
+        assert!(lum > 0.90, "neutral recipe dimmed bright foam: {lum}");
+    }
+
+    #[test]
+    fn tempered_recipe_renders_foam_light_and_water_saturated() {
+        // End-to-end: the over-cooked AI recipe (the one that greyed the foam),
+        // after clamp + temper, rendered through the monotone curve. Foam must be
+        // LIGHT (not crushed to the muddy ~0.6 grey it was) and water must stay
+        // turquoise — the engine + recipe layers compose, no engine override.
+        let mut r = EditRecipe {
+            highlights: -78.81,
+            shadows: 36.56,
+            whites: 10.27,
+            blacks: -14.59,
+            contrast: 4.68,
+            exposure_ev: -0.177,
+            vibrance: 11.19,
+            saturation: 2.9,
+            ..Default::default()
+        };
+        r.clamp();
+        r.temper();
+        let lum = |p: [f32; 3]| 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
+        let mut foam = vec![[0.90_f32, 0.93, 0.96]];
+        apply_develop(&mut foam, 1, 1, &r);
+        assert!(lum(foam[0]) > 0.80, "foam crushed (should stay light): luma {}", lum(foam[0]));
+        let mut water = vec![[0.35_f32, 0.62, 0.66]];
+        apply_develop(&mut water, 1, 1, &r);
+        let [rr, gg, bb] = water[0];
+        assert!(gg > rr + 0.10 && bb > rr + 0.10, "water lost its turquoise: [{rr}, {gg}, {bb}]");
+    }
+
+    #[test]
+    fn region_tones_pin_endpoints_and_stay_monotonic() {
+        // Highlights/shadows/contrast must never move the endpoints (only whites/
+        // blacks may), and the curve must stay monotone under any extreme combo.
+        let recipes = [
+            EditRecipe::default(),
+            EditRecipe { highlights: -100.0, shadows: 100.0, contrast: 100.0, ..Default::default() },
+            EditRecipe { highlights: 100.0, shadows: -100.0, contrast: -100.0, ..Default::default() },
+        ];
+        for r in recipes {
+            let lut = build_tone_lut(&r);
+            for i in 1..lut.len() {
+                assert!(lut[i] >= lut[i - 1] - 1e-6, "non-monotonic at {i}");
+            }
+            assert!(sample_lut(&lut, 0.0) < 1e-3, "black point moved by hi/sh/contrast");
+            assert!((sample_lut(&lut, 1.0) - 1.0).abs() < 1e-3, "white point moved by hi/sh/contrast");
+        }
+    }
+
+    #[test]
+    fn tone_lut_is_monotonic_and_keeps_midtone_separation() {
+        // The reported "flat muddy water": strong opposing highlights/shadows made
+        // the per-region tone curve non-monotonic and collapsed mid-bright tones
+        // into one dark band. The curve must stay monotonic and keep midtones apart.
+        let r = EditRecipe {
+            highlights: -73.89,
+            shadows: 33.28,
+            whites: 6.99,
+            blacks: -12.94,
+            contrast: 4.68,
+            ..Default::default()
+        };
+        let lut = build_tone_lut(&r);
+        for i in 1..lut.len() {
+            assert!(lut[i] >= lut[i - 1] - 1e-6, "tone LUT inverts at {i}: {} < {}", lut[i], lut[i - 1]);
+        }
+        // mid-bright water tones (0.50 vs 0.66) must NOT collapse to one value.
+        let (a, b) = (sample_lut(&lut, 0.50), sample_lut(&lut, 0.66));
+        assert!(b - a > 0.05, "midtone separation crushed flat: {a}..{b}");
+        // and a true midtone (0.5) is no longer crushed deep into shadow.
+        assert!(a > 0.45, "midtone water still crushed dark: {a}");
+    }
+
+    #[test]
     fn aggressive_highlights_keep_saturated_water_from_greying() {
         // Reported bug: strong −highlights + +shadows turned bright turquoise water
         // flat grey, because the tone LUT ran per-channel and the channels converged.
@@ -1061,21 +1245,28 @@ mod tests {
 
     #[test]
     fn region_tones_target_four_different_zones() {
-        // The old engine moved whites≡highlights and blacks≡shadows with the
-        // SAME weight; now each owns a distinct tonal zone. Gentle (±30) pushes
-        // keep every sample point unclamped so the comparison is clean.
+        // Each region owns a DISTINCT tonal zone, and — the muddy-water fix —
+        // highlights/shadows act on the UPPER/LOWER tones and leave the MIDTONES
+        // alone (the old wide bands gave highlights 0.6–1.0 authority at v≈0.5–0.65,
+        // crushing mid-bright water). Gentle ±30 pushes keep the curve unclamped
+        // except very near white.
         let base = build_tone_lut(&EditRecipe::default());
         let d = |r: &EditRecipe, x: f32| sample_lut(&build_tone_lut(r), x) - sample_lut(&base, x);
         let whites = EditRecipe { whites: 30.0, ..Default::default() };
         let highs = EditRecipe { highlights: 30.0, ..Default::default() };
         let shadows = EditRecipe { shadows: 30.0, ..Default::default() };
         let blacks = EditRecipe { blacks: 30.0, ..Default::default() };
-        // Bright side: upper-mid (0.6) belongs to highlights, white point (0.9) to whites.
-        assert!(d(&highs, 0.6) > d(&whites, 0.6) + 0.02, "highlights own the upper-mids");
-        assert!(d(&whites, 0.9) > d(&highs, 0.9) + 0.02, "whites own the white point");
-        // Dark side mirrors it: lower-mid (0.4) to shadows, black point (0.1) to blacks.
-        assert!(d(&shadows, 0.4) > d(&blacks, 0.4) + 0.02, "shadows own the lower-mids");
-        assert!(d(&blacks, 0.1) > d(&shadows, 0.1) + 0.02, "blacks own the black point");
+        // The fix: neither highlights nor shadows may touch the midtone (0.5).
+        assert!(d(&highs, 0.5).abs() < 0.01, "highlights must NOT touch the midtone: {}", d(&highs, 0.5));
+        assert!(d(&shadows, 0.5).abs() < 0.01, "shadows must NOT touch the midtone: {}", d(&shadows, 0.5));
+        // Each region still owns its zone (upper / white-point / lower / black-point).
+        assert!(d(&highs, 0.75) > 0.03, "highlights lift the upper tones: {}", d(&highs, 0.75));
+        assert!(d(&whites, 0.92) > 0.03, "whites lift the white point: {}", d(&whites, 0.92));
+        assert!(d(&shadows, 0.25) > 0.03, "shadows lift the lower tones: {}", d(&shadows, 0.25));
+        assert!(d(&blacks, 0.08) > 0.03, "blacks lift the black point: {}", d(&blacks, 0.08));
+        // Differentiation: highlights concentrate BELOW white; whites concentrate AT white.
+        assert!(d(&highs, 0.75) > d(&highs, 0.97), "highlights concentrate below the white point");
+        assert!(d(&whites, 0.95) > d(&whites, 0.70), "whites concentrate at the white point");
     }
 
     #[test]
