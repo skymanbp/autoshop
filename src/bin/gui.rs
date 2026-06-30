@@ -1095,9 +1095,68 @@ impl AutoshopApp {
         });
     }
 
+    /// Full-frame generative re-render via gpt-image — the OPTIONAL "let GPT
+    /// directly make the picture" path. Uses the Direction text as the look
+    /// prompt. Unlike Analyze (a faithful parametric recipe), this REGENERATES
+    /// pixels: non-faithful, ~1.5K px, no XMP — a creative restyle, not a master.
+    /// Saved to ./out, shown in the After pane. Hits the gpt-image (image) endpoint.
+    fn start_reimagine(&mut self) {
+        let Some(path) = self.src_path.clone() else { return };
+        if self.busy {
+            return;
+        }
+        let prompt = {
+            let g = self.guidance.trim();
+            if g.is_empty() {
+                "Develop this photo into a finished, natural-looking edit: balanced exposure and \
+                 contrast, pleasing realistic colour; keep the scene true to the original."
+                    .to_string()
+            } else {
+                g.to_string()
+            }
+        };
+        self.busy = true;
+        self.status = "AI 生成出片中… (gpt-image, ~15–40s)".into();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let res = (|| -> anyhow::Result<(image::DynamicImage, String)> {
+                let cfg = autoshop::config::Config::load();
+                let out = autoshop::pipeline::default_out(&path, "reimagine", "png");
+                // fidelity "high" keeps it recognisably the same photo.
+                autoshop::generative::reimagine(&cfg, &path, &prompt, "high", &cfg.openai_image_quality, &out)?;
+                let img = autoshop::decode::load_image(&out)?.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE);
+                Ok((img, format!("generated → {} (gpt-image; saved to ./out)", out.display())))
+            })();
+            let _ = tx.send(Msg::Retouched(Box::new(res)));
+        });
+    }
+
     fn retouch_panel(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.heading("Retouch");
+
+        // Whole-image generative re-render: let gpt-image DIRECTLY produce the
+        // picture (the optional "GPT makes the image" path). Distinct from
+        // AI Analyze, which emits a faithful parametric recipe.
+        ui.label(egui::RichText::new("整图 AI 生成 · Reimagine (gpt-image 直接出图)").strong());
+        ui.add_enabled_ui(!self.busy, |ui| {
+            if ui
+                .button("✨ AI 生成出片")
+                .on_hover_text(
+                    "用 gpt-image 直接重绘整张图（拿上方 Direction 文本当风格描述）。实验：重绘像素=非保真、约1.5K、无 XMP——创意改图，非精修。需 OPENAI_API_KEY",
+                )
+                .clicked()
+            {
+                self.start_reimagine();
+            }
+        });
+        ui.label(
+            egui::RichText::new("拿上方 Direction 当风格描述；重绘像素=非保真、低分辨率、无 XMP。需 OPENAI_API_KEY (gpt-image)。")
+                .weak()
+                .small(),
+        );
+        ui.separator();
+
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.paint_mode, "Paint mask")
                 .on_hover_text("Brush over the area; box-select is paused while on");
