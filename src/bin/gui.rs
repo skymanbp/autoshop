@@ -47,6 +47,8 @@ enum Msg {
     Thumb { generation: u64, idx: usize, img: Box<anyhow::Result<image::DynamicImage>> },
     /// A generative-fill / heal result: (preview of the saved ./out master, status).
     Retouched(Box<anyhow::Result<(image::DynamicImage, String)>>),
+    /// A `GET /models` fetch finished: the account's model ids (Settings pick-list).
+    Models(anyhow::Result<Vec<String>>),
 }
 
 /// Editable buffers for the in-app Settings window. Key fields stay blank on
@@ -65,6 +67,51 @@ struct SettingsForm {
     image_api_key: String,
     image_key_present: bool,
     status: String,
+    // --- live model pick-lists (populated by the "Fetch models" button) ---
+    chat_choices: Vec<String>,      // text/vision chat ids (proposer + api verifier)
+    image_gen_choices: Vec<String>, // gpt-image-* ids (generative edits)
+    fetching_models: bool,          // a GET /models worker is in flight
+}
+
+/// Build the option list for a model ComboBox: the live-fetched ids if we have
+/// them, else a grounded fallback; the current value is always included so a
+/// custom/manual id is never dropped from the menu.
+fn model_opts(fetched: &[String], fallback: &[&str], current: &str) -> Vec<String> {
+    let mut v: Vec<String> = if fetched.is_empty() {
+        fallback.iter().map(|s| s.to_string()).collect()
+    } else {
+        fetched.to_vec()
+    };
+    if !current.trim().is_empty() && !v.iter().any(|x| x == current) {
+        v.insert(0, current.to_string());
+    }
+    v
+}
+
+/// Two API base URLs are the "same endpoint" ignoring whitespace / a trailing slash.
+/// Used so model ids fetched with the image key are only offered to the analysis
+/// picker when both roles point at the same server.
+fn same_base(a: &str, b: &str) -> bool {
+    a.trim().trim_end_matches('/') == b.trim().trim_end_matches('/')
+}
+
+/// A model picker: a dropdown of `options` that writes the chosen id into `value`,
+/// next to a text field so any custom id can still be typed. Both edit `value`.
+fn model_picker(ui: &mut egui::Ui, salt: &str, value: &mut String, options: &[String]) {
+    let sel = if value.trim().is_empty() { "选择… / pick".to_owned() } else { value.clone() };
+    egui::ComboBox::from_id_salt(salt)
+        .selected_text(sel)
+        .width(200.0)
+        .show_ui(ui, |ui| {
+            for opt in options {
+                ui.selectable_value(value, opt.clone(), opt.as_str());
+            }
+        });
+    ui.add(
+        egui::TextEdit::singleline(value)
+            .desired_width(170.0)
+            .hint_text("or type a custom id"),
+    );
 }
 
 struct AutoshopApp {
@@ -301,6 +348,10 @@ impl AutoshopApp {
     /// "present", never revealed). Called when the window opens.
     fn load_settings_form(&mut self) {
         let cfg = autoshop::config::Config::load();
+        // Keep any model lists already fetched this session so reopening Settings
+        // doesn't force a re-fetch.
+        let chat_choices = std::mem::take(&mut self.settings.chat_choices);
+        let image_gen_choices = std::mem::take(&mut self.settings.image_gen_choices);
         self.settings = SettingsForm {
             analysis_provider_api: cfg.analysis_is_api(),
             analysis_model: cfg.analysis_model.clone(),
@@ -313,6 +364,9 @@ impl AutoshopApp {
             image_api_key: String::new(),
             image_key_present: cfg.openai_api_key.is_some(),
             status: String::new(),
+            chat_choices,
+            image_gen_choices,
+            fetching_models: false,
         };
     }
 
@@ -349,8 +403,53 @@ impl AutoshopApp {
         }
     }
 
+    /// Fetch the account's model ids (`GET /models`) on a worker thread and fill the
+    /// Settings pick-lists. Uses the key/base typed in the form if present, else the
+    /// saved config — so it works whether or not the user has saved a key yet.
+    fn fetch_models(&mut self) {
+        if self.settings.fetching_models {
+            return;
+        }
+        self.settings.fetching_models = true;
+        self.settings.status = "fetching models…".into();
+        let form_key = self.settings.image_api_key.trim().to_string();
+        let form_base = self.settings.image_base_url.trim().to_string();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            // RAII: guarantee the UI's `fetching_models` flag is always cleared —
+            // if this thread panics before sending, the guard sends an Err on unwind
+            // so the button never stays stuck disabled.
+            struct Guard {
+                tx: Sender<Msg>,
+                armed: bool,
+            }
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    if self.armed {
+                        let _ = self
+                            .tx
+                            .send(Msg::Models(Err(anyhow::anyhow!("fetch worker ended unexpectedly"))));
+                    }
+                }
+            }
+            let mut guard = Guard { tx: tx.clone(), armed: true };
+
+            let cfg = autoshop::config::Config::load();
+            let base = if form_base.is_empty() { cfg.openai_base_url.clone() } else { form_base };
+            let key = if form_key.is_empty() {
+                cfg.openai_api_key.clone().unwrap_or_default()
+            } else {
+                form_key
+            };
+            let res = autoshop::openai_models::list_models(&base, &key);
+            guard.armed = false; // normal completion — don't double-send from Drop
+            let _ = tx.send(Msg::Models(res));
+        });
+    }
+
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
         let mut do_save = false;
+        let mut do_fetch = false;
         ui.label(
             egui::RichText::new(
                 "Saved to autoshop.local.json (gitignored, stays on this machine). Applies to the next Analyze.",
@@ -369,7 +468,20 @@ impl AutoshopApp {
             });
             ui.horizontal(|ui| {
                 ui.label("Model");
-                ui.text_edit_singleline(&mut f.analysis_model);
+                // OAuth uses Claude CLI aliases; API uses the fetched OpenAI chat ids,
+                // but only when the analysis endpoint matches the one we fetched from
+                // (the image key/base) — otherwise those ids may not exist there.
+                let opts = if f.analysis_provider_api {
+                    let fetched = if same_base(&f.analysis_base_url, &f.image_base_url) {
+                        f.chat_choices.as_slice()
+                    } else {
+                        &[]
+                    };
+                    model_opts(fetched, &["gpt-5.5", "gpt-4o"], &f.analysis_model)
+                } else {
+                    model_opts(&[], &["opus", "sonnet", "haiku"], &f.analysis_model)
+                };
+                model_picker(ui, "set_analysis_model", &mut f.analysis_model, &opts);
             });
             if f.analysis_provider_api {
                 ui.horizontal(|ui| {
@@ -383,10 +495,35 @@ impl AutoshopApp {
                 });
             }
             ui.separator();
-            ui.heading("Image — the vision proposer (API only)");
+            ui.heading("Image — the vision proposer + generative edits (API only)");
+            ui.horizontal(|ui| {
+                let label = if f.fetching_models { "拉取中… / fetching…" } else { "🔄 拉取可用模型 / Fetch models" };
+                let clicked = ui
+                    .add_enabled(!f.fetching_models, egui::Button::new(label))
+                    .on_hover_text(
+                        "List the models this API key can use (GET /models) so you can pick instead of guess. \
+                         Uses the key typed above, or the saved one if blank.",
+                    )
+                    .clicked();
+                if clicked {
+                    do_fetch = true;
+                }
+                if !f.chat_choices.is_empty() || !f.image_gen_choices.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} chat · {} image",
+                            f.chat_choices.len(),
+                            f.image_gen_choices.len()
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                }
+            });
             ui.horizontal(|ui| {
                 ui.label("Vision model");
-                ui.text_edit_singleline(&mut f.image_model);
+                let opts = model_opts(&f.chat_choices, &["gpt-5.5", "gpt-4o"], &f.image_model);
+                model_picker(ui, "set_vision_model", &mut f.image_model, &opts);
             });
             ui.horizontal(|ui| {
                 ui.label("Base URL");
@@ -394,8 +531,21 @@ impl AutoshopApp {
             });
             ui.horizontal(|ui| {
                 ui.label("Image-gen model");
-                ui.text_edit_singleline(&mut f.image_gen_model);
+                let opts = model_opts(
+                    &f.image_gen_choices,
+                    &["gpt-image-1.5", "gpt-image-2", "gpt-image-1", "gpt-image-1-mini", "chatgpt-image-latest"],
+                    &f.image_gen_model,
+                );
+                model_picker(ui, "set_imagegen_model", &mut f.image_gen_model, &opts);
             });
+            ui.label(
+                egui::RichText::new(
+                    "Tip: gpt-image-1.5 keeps the photo most faithful (input_fidelity); newer models \
+                     like gpt-image-2 ignore that lock and edit more freely.",
+                )
+                .weak()
+                .small(),
+            );
             ui.horizontal(|ui| {
                 ui.label("API Key");
                 let hint = if f.image_key_present { "key set — blank keeps it" } else { "no key set" };
@@ -413,6 +563,9 @@ impl AutoshopApp {
         }
         if do_save {
             self.save_settings_form();
+        }
+        if do_fetch {
+            self.fetch_models();
         }
     }
 
@@ -668,10 +821,33 @@ impl AutoshopApp {
                         self.status = format!("retouch failed: {e}");
                     }
                 },
+                Msg::Models(res) => match res {
+                    Ok(ids) => {
+                        let chat: Vec<String> = ids
+                            .iter()
+                            .filter(|s| autoshop::openai_models::is_chat_model(s))
+                            .cloned()
+                            .collect();
+                        let imgs: Vec<String> = ids
+                            .iter()
+                            .filter(|s| autoshop::openai_models::is_image_model(s))
+                            .cloned()
+                            .collect();
+                        self.settings.status =
+                            format!("fetched {} models ({} chat · {} image)", ids.len(), chat.len(), imgs.len());
+                        self.settings.chat_choices = chat;
+                        self.settings.image_gen_choices = imgs;
+                        self.settings.fetching_models = false;
+                    }
+                    Err(e) => {
+                        self.settings.fetching_models = false;
+                        self.settings.status = format!("fetch failed: {e}");
+                    }
+                },
             }
         }
-        // Keep the frame loop alive while any worker (analyze/export/thumbs) runs.
-        if self.busy || self.thumb_inflight > 0 {
+        // Keep the frame loop alive while any worker (analyze/export/thumbs/models) runs.
+        if self.busy || self.thumb_inflight > 0 || self.settings.fetching_models {
             ctx.request_repaint();
         }
     }

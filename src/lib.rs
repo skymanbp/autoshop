@@ -14,6 +14,7 @@ pub mod decode;
 pub mod denoise;
 pub mod eval;
 pub mod generative;
+pub mod openai_models;
 pub mod pipeline;
 pub mod recipe;
 pub mod render;
