@@ -218,13 +218,18 @@ pub fn develop_preview(preview: &DynamicImage, recipe: &EditRecipe) -> DynamicIm
 /// ACR: tone → clarity → saturation/vibrance → noise reduction → sharpening.
 /// Operates in place on sRGB-gamma RGB in [0,1].
 fn apply_develop(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
-    // 1) tonal ops via the per-channel LUT (exposure/contrast/whites/blacks/
-    //    highlights/shadows/tone-curve).
+    // 1) tonal ops via the LUT (exposure/contrast/whites/blacks/highlights/
+    //    shadows/tone-curve). Tone the pixel's LUMINANCE and scale RGB by the
+    //    ratio (scale_chroma) so hue + saturation are preserved — NOT per-channel.
+    //    Running each channel through the curve independently lets opposing pushes
+    //    (e.g. strong −highlights + +shadows) converge the channels, desaturating
+    //    saturated colour to grey (the reported "turquoise water went flat grey").
+    //    ACR-like tone operators act on luminance, which is the documented intent.
     let lut = build_tone_lut(r);
     for px in data.iter_mut() {
-        px[0] = sample_lut(&lut, px[0]);
-        px[1] = sample_lut(&lut, px[1]);
-        px[2] = sample_lut(&lut, px[2]);
+        let l_old = luma601(px);
+        let l_new = sample_lut(&lut, l_old);
+        scale_chroma(px, l_old, l_new);
     }
     // 1b) per-channel RGB curves (red/green/blue), right after the master curve.
     apply_rgb_curves(data, r);
@@ -302,7 +307,12 @@ fn apply_masks(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
                 }
                 let i = y * w + x;
                 let p = data[i];
-                let t = [sample_lut(&lut, p[0]), sample_lut(&lut, p[1]), sample_lut(&lut, p[2])];
+                // Luminance-preserving local tone (same anti-greying reason as the
+                // global pass), then local saturation.
+                let mut t = p;
+                let l_old = luma601(&p);
+                let l_new = sample_lut(&lut, l_old);
+                scale_chroma(&mut t, l_old, l_new);
                 let t = apply_sat_vibrance(t[0], t[1], t[2], sat, 0.0);
                 for c in 0..3 {
                     data[i][c] = p[c] * (1.0 - wgt) + t[c] * wgt;
@@ -876,6 +886,30 @@ fn oriented(img: DynamicImage, o: Orientation) -> DynamicImage {
 mod tests {
     use super::*;
     use crate::recipe::{EditRecipe, LocalAdjustment};
+
+    #[test]
+    fn aggressive_highlights_keep_saturated_water_from_greying() {
+        // Reported bug: strong −highlights + +shadows turned bright turquoise water
+        // flat grey, because the tone LUT ran per-channel and the channels converged.
+        // Luminance-preserving tone must keep the cyan recognizably cyan (just darker).
+        let r = EditRecipe {
+            highlights: -73.89,
+            shadows: 33.28,
+            whites: 6.99,
+            blacks: -12.94,
+            contrast: 4.68,
+            ..Default::default()
+        };
+        let cyan = [0.35_f32, 0.62, 0.66]; // mid-bright sunlit turquoise
+        let mut data = vec![cyan];
+        apply_develop(&mut data, 1, 1, &r);
+        let [rr, gg, bb] = data[0];
+        // green & blue stay clearly above red → still cyan, not neutral grey.
+        assert!(gg > rr + 0.08 && bb > rr + 0.08, "water greyed out: [{rr}, {gg}, {bb}]");
+        // channel spread preserved (not converged toward equal = grey).
+        let spread = rr.max(gg).max(bb) - rr.min(gg).min(bb);
+        assert!(spread > 0.12, "channels converged toward grey: spread {spread}");
+    }
 
     #[test]
     fn linear_mask_affects_only_the_full_end() {
