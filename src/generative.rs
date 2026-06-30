@@ -259,31 +259,54 @@ fn call_images_edit(
         .as_ref()
         .ok_or_else(|| anyhow!("OPENAI_API_KEY not set — generative editing needs the OpenAI API"))?;
 
-    let mut body = Vec::new();
-    part_text(&mut body, "model", &cfg.openai_image_model);
-    part_text(&mut body, "prompt", prompt);
-    part_text(&mut body, "input_fidelity", fidelity);
-    part_text(&mut body, "size", size);
-    part_text(&mut body, "quality", quality);
-    part_file(&mut body, "image", "image.png", image_png);
-    if let Some(m) = mask_png {
-        part_file(&mut body, "mask", "mask.png", m);
-    }
-    body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    // `input_fidelity` is a gpt-image-1.x parameter (keeps the edit recognizably the
+    // same photo). Newer models reject it — e.g. gpt-image-2 returns 400
+    // `invalid_input_fidelity_model`. We can't hard-code which models accept it
+    // (the list drifts), so send it and, if the model rejects *that specific
+    // parameter*, retry once without it instead of failing the whole edit.
+    let build_body = |include_fidelity: bool| -> Vec<u8> {
+        let mut body = Vec::new();
+        part_text(&mut body, "model", &cfg.openai_image_model);
+        part_text(&mut body, "prompt", prompt);
+        if include_fidelity {
+            part_text(&mut body, "input_fidelity", fidelity);
+        }
+        part_text(&mut body, "size", size);
+        part_text(&mut body, "quality", quality);
+        part_file(&mut body, "image", "image.png", image_png);
+        if let Some(m) = mask_png {
+            part_file(&mut body, "mask", "mask.png", m);
+        }
+        body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+        body
+    };
 
     let url = format!("{}/images/edits", cfg.openai_base_url.trim_end_matches('/'));
-    let resp = ureq::post(&url)
-        .set("Authorization", &format!("Bearer {key}"))
-        .set("Content-Type", &format!("multipart/form-data; boundary={BOUNDARY}"))
-        .send_bytes(&body);
-
-    let value: serde_json::Value = match resp {
-        Ok(r) => r.into_json().context("parse image API response")?,
-        Err(ureq::Error::Status(code, r)) => {
-            let b = r.into_string().unwrap_or_default();
-            return Err(anyhow!("image API {code}: {b}"));
+    let mut include_fidelity = true;
+    let value: serde_json::Value = loop {
+        let body = build_body(include_fidelity);
+        let resp = ureq::post(&url)
+            .set("Authorization", &format!("Bearer {key}"))
+            .set("Content-Type", &format!("multipart/form-data; boundary={BOUNDARY}"))
+            .send_bytes(&body);
+        match resp {
+            Ok(r) => break r.into_json().context("parse image API response")?,
+            Err(ureq::Error::Status(code, r)) => {
+                let b = r.into_string().unwrap_or_default();
+                // Retry once dropping the unsupported param; the guard flips
+                // `include_fidelity` to false so this can fire at most once.
+                if include_fidelity && b.contains("input_fidelity") {
+                    eprintln!(
+                        "  note: {} rejected input_fidelity — retrying without it",
+                        cfg.openai_image_model
+                    );
+                    include_fidelity = false;
+                    continue;
+                }
+                return Err(anyhow!("image API {code}: {b}"));
+            }
+            Err(ureq::Error::Transport(t)) => return Err(anyhow!("transport: {t}")),
         }
-        Err(ureq::Error::Transport(t)) => return Err(anyhow!("transport: {t}")),
     };
 
     if let Some(u) = value.get("usage") {
