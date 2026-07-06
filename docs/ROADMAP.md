@@ -20,11 +20,14 @@
   批量渲染 worker，61 lib 测试）。
 - **差距批次 E 高分预览已完成**（见 §E ✅ 小节：1280/2560/4096 预览分辨率
   下拉，切换保配方重解码）。
+- **差距批次 C 第一片 暗角补偿已完成**（见 §C ◐ 小节：线性光域径向增益 +
+  GUI 镜头校正区 + XMP VignetteAmount/Midpoint，63 lib 测试）。C 第二片
+  （k1/k2 畸变）牵动坐标空间约定，须整体设计。
 - 更早已上线：反推配方（`fit.rs` + CLI `match`）、gpt-image-2 弹性高分辨率
   （≤8.3MP + 400 回退）、风格提示词提取、GUI 生产化（直方图/toast/快捷键/
   拖拽/持久化/折叠分组/双击归零）。
-- **下一步按 §与 Photoshop 的核心差距 的顺序：C 镜头校正 → D 色管 →
-  G 版本（A② AI 分割可穿插）。**
+- **下一步按 §与 Photoshop 的核心差距 的顺序：C 第二片（畸变，需先做
+  坐标映射设计）或 D 色管 → G 版本（A② AI 分割可穿插）。**
 - 待用户真机验收：曲线拖拽/吸管/图章/拉直/范围蒙版手感；「以此母版继续
   修图」链路（修补→动滑杆→再修补→导出）；导出长边/锐化/质量 + 批量
   渲染选中；持久化"正常关闭→重启恢复"；范围蒙版 XMP 在真 Lightroom
@@ -153,11 +156,20 @@
   的 Lightroom 出口停在原 RAW 一侧，属定位内取舍。GUI 态逻辑无单测
   （egui app 态），入真机验收列表。
 
-### C. 镜头/几何校正
-- 现状：零实现（全库无 distortion/vignetting/CA/perspective 代码；EXIF 只存
-  镜头名 decode.rs:28）。
-- 路径：手动滑杆先行（k1/k2 径向畸变、暗角补偿、去紫边），透视 Upright 后置；
-  lensfun 数据库长期项。
+### C. 镜头/几何校正（◐ 第一片 暗角补偿 ✅ 2026-07-06）
+- **暗角补偿 ✅**：`recipe.lens_vignette / lens_vignette_mid`（-100..100 /
+  0..100，clamp 齐全）；引擎 `apply_vignette`（render.rs）——**线性光域**
+  径向增益 `1 + k·rⁿ`，midpoint 经指数 0.6..3.0 控制作用范围，apply_develop
+  第 0 步（tone 前），预览/导出/母版三路径共享；GUI「镜头校正 · Lens」区
+  两滑杆；XMP `VignetteAmount`（键名从用户 140 份真边车实证）+
+  `VignetteMidpoint`（ACR 文档配对键，用户边车中无非零实例，语义待真 LR
+  验证），amount=0 时零键写出（与旧 writer 字节兼容）。单测：中心不动/
+  径向单调/负值压暗/高中点收缩作用域；XMP 条件写出。
+- **未做（第二片）**：k1/k2 径向畸变——是**几何重映射**，会牵动 ④ 的坐标
+  空间约定（view_norm_to_orig 链需加去畸变项，波及 wb 吸管/画笔/mask 放置/
+  region 六处映射 + roundtrip 单测），须整体设计后动手，勿零敲碎打；
+  去紫边（需边缘邻近门控，防误伤紫色主体）；透视 Upright；lensfun 长期项。
+- AI advisor 暂不暴露镜头字段（校正是测量性操作，非审美建议；schema 未加）。
 
 ### D. 色彩管理
 - 现状：全程 sRGB gamma（render.rs 管线），导出不嵌 ICC，egui 显示端无色管

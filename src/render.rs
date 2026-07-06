@@ -283,6 +283,12 @@ pub fn develop_preview(preview: &DynamicImage, recipe: &EditRecipe) -> DynamicIm
 /// ACR: tone → clarity → saturation/vibrance → noise reduction → sharpening.
 /// Operates in place on sRGB-gamma RGB in [0,1].
 fn apply_develop(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
+    // 0) lens vignette compensation — a radial gain in LINEAR light (falloff is
+    //    multiplicative on sensor irradiance), before any tonal work so the tone
+    //    curve sees evenly-lit pixels. Preview and export share this stage.
+    if r.lens_vignette != 0.0 {
+        apply_vignette(data, w, h, r.lens_vignette, r.lens_vignette_mid);
+    }
     // 1) tonal ops via the LUT (exposure/contrast/whites/blacks/highlights/
     //    shadows/tone-curve). Tone the pixel's LUMINANCE and scale RGB by the
     //    ratio (scale_chroma) so hue + saturation are preserved — NOT per-channel.
@@ -332,6 +338,35 @@ fn apply_develop(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
 
 fn luma601(p: &[f32; 3]) -> f32 {
     0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]
+}
+
+/// Manual lens-vignette compensation: gain = 1 + k·rⁿ on the normalised
+/// corner-radius, applied in linear light. `amount` -100..=100 (positive
+/// brightens corners); `midpoint` 0..=100 shapes WHERE it lands via the radius
+/// exponent (0.6..3.0, ACR-default 50 → 1.8): low reaches toward the centre,
+/// high confines the correction to the corners. The exact LR falloff model is
+/// proprietary — this is our documented approximation (XMP carries the raw
+/// slider values, so Lightroom re-renders with its own model).
+fn apply_vignette(data: &mut [[f32; 3]], w: usize, h: usize, amount: f32, midpoint: f32) {
+    let (cx, cy) = ((w as f32 - 1.0) * 0.5, (h as f32 - 1.0) * 0.5);
+    let rmax = (cx * cx + cy * cy).sqrt().max(1.0);
+    let gamma = 0.6 + 2.4 * (midpoint.clamp(0.0, 100.0) / 100.0);
+    let k = amount.clamp(-100.0, 100.0) / 100.0;
+    for y in 0..h {
+        for x in 0..w {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let rn = ((dx * dx + dy * dy).sqrt() / rmax).clamp(0.0, 1.0);
+            let gain = 1.0 + k * rn.powf(gamma);
+            if (gain - 1.0).abs() < 1e-6 {
+                continue;
+            }
+            let px = &mut data[y * w + x];
+            for c in px.iter_mut() {
+                *c = linear_to_srgb((srgb_to_linear(*c) * gain).clamp(0.0, 1.0));
+            }
+        }
+    }
 }
 
 /// Apply each local masked adjustment: blend the masked region toward a locally
@@ -1446,6 +1481,33 @@ mod tests {
         assert!(spread(data[1]) < 0.05, "dark orange (same hue) must desaturate: {:?}", data[1]);
         assert_eq!(data[2], control[2], "opposite hue: the mask must skip it");
         assert_eq!(data[3], control[3], "neutral grey: the mask must skip it");
+    }
+
+    #[test]
+    fn vignette_gain_is_radial_and_linear_light() {
+        // A flat mid-grey field: +60 compensation must leave the exact centre
+        // untouched, brighten the corner the most, and increase monotonically
+        // with radius. Negative amount darkens the corner instead.
+        let (w, h) = (9usize, 9usize);
+        let flat = vec![[0.5_f32; 3]; w * h];
+        let mut up = flat.clone();
+        apply_vignette(&mut up, w, h, 60.0, 50.0);
+        let centre = up[4 * w + 4][0];
+        let mid = up[2 * w + 2][0]; // halfway toward the corner
+        let corner = up[0][0];
+        assert!((centre - 0.5).abs() < 1e-4, "centre must not move: {centre}");
+        assert!(corner > mid && mid > centre, "radial monotone: {centre} < {mid} < {corner}");
+        assert!(corner > 0.62, "corner must clearly brighten: {corner}");
+
+        let mut down = flat.clone();
+        apply_vignette(&mut down, w, h, -60.0, 50.0);
+        assert!(down[0][0] < 0.38, "negative amount darkens the corner: {}", down[0][0]);
+
+        // Higher midpoint confines the effect to the corners: the halfway
+        // pixel moves LESS than with the default midpoint.
+        let mut tight = flat.clone();
+        apply_vignette(&mut tight, w, h, 60.0, 100.0);
+        assert!(tight[2 * w + 2][0] < mid, "midpoint 100 must spare the mid-field");
     }
 
     #[test]

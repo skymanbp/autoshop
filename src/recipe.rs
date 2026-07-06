@@ -68,6 +68,16 @@ pub struct EditRecipe {
     /// 0..=100, luminance noise reduction.
     pub noise_reduction: f32,
 
+    // --- Lens corrections (manual) -------------------------------------------
+    /// Lens vignette compensation, -100..=100: positive brightens corners
+    /// (compensates falloff), negative darkens. Applied as a radial gain in
+    /// LINEAR light before any tonal work. → `crs:VignetteAmount`.
+    pub lens_vignette: f32,
+    /// Where the correction lands, 0..=100 (ACR Midpoint, default 50): lower
+    /// reaches toward the centre, higher confines it to the corners.
+    /// → `crs:VignetteMidpoint`.
+    pub lens_vignette_mid: f32,
+
     // --- Geometry (optional) ------------------------------------------------
     /// Clockwise straighten angle in degrees, e.g. -2.5..=2.5 for horizons.
     pub straighten_deg: f32,
@@ -119,6 +129,8 @@ impl Default for EditRecipe {
             color_grade: ColorGrade::default(),
             sharpening: 0.0,
             noise_reduction: 0.0,
+            lens_vignette: 0.0,
+            lens_vignette_mid: 50.0,
             straighten_deg: 0.0,
             crop: None,
             tone_curve: Vec::new(),
@@ -384,6 +396,8 @@ impl EditRecipe {
         self.color_grade.clamp();
         self.sharpening = c(self.sharpening, 0.0, 150.0);
         self.noise_reduction = c(self.noise_reduction, 0.0, 100.0);
+        self.lens_vignette = c(self.lens_vignette, -100.0, 100.0);
+        self.lens_vignette_mid = c(self.lens_vignette_mid, 0.0, 100.0);
         self.straighten_deg = c(self.straighten_deg, -45.0, 45.0);
         self.confidence = c(self.confidence, 0.0, 1.0);
         if let Some(k) = self.temperature_k {

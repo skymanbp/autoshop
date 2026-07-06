@@ -277,6 +277,15 @@ pub fn recipe_to_xmp(r: &EditRecipe) -> String {
     let nr = (r.noise_reduction.round() as i64).clamp(0, 100);
     attr(&mut a, "LuminanceSmoothing", &nr.to_string());
 
+    // Manual lens-vignette correction. `VignetteAmount` name verified against
+    // the user's sidecars (present, =0, in 140 of them); the Midpoint companion
+    // key follows the documented ACR pair and is only emitted when the amount
+    // is set — a zero-amount recipe stays byte-identical to the old writer.
+    if r.lens_vignette != 0.0 {
+        attr(&mut a, "VignetteAmount", &signed(r.lens_vignette));
+        attr(&mut a, "VignetteMidpoint", &(r.lens_vignette_mid.round() as i64).to_string());
+    }
+
     // Crop (normalised [0,1]); only applied by Lightroom when HasCrop is True.
     if let Some(c) = &r.crop {
         attr(&mut a, "HasCrop", "True");
@@ -383,6 +392,17 @@ mod tests {
         assert!(xmp.contains(r#"crs:Feather="0.5""#));
         // unset masks ⇒ no mask block (v1-compatible)
         assert!(!recipe_to_xmp(&EditRecipe::default()).contains("MaskGroupBasedCorrections"));
+    }
+
+    #[test]
+    fn renders_manual_vignette_only_when_set() {
+        let r = EditRecipe { lens_vignette: 35.0, lens_vignette_mid: 60.0, ..Default::default() };
+        let xmp = recipe_to_xmp(&r);
+        assert!(xmp.contains(r#"crs:VignetteAmount="+35""#));
+        assert!(xmp.contains(r#"crs:VignetteMidpoint="60""#));
+        // A neutral recipe emits neither key (byte-compatible with the old writer).
+        let neutral = recipe_to_xmp(&EditRecipe::default());
+        assert!(!neutral.contains("VignetteAmount") && !neutral.contains("VignetteMidpoint"));
     }
 
     #[test]

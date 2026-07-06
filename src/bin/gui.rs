@@ -2186,6 +2186,23 @@ impl AutoshopApp {
                 );
             });
 
+        // --- 镜头校正: manual lens corrections (gap batch C, 第一片) ----------
+        let lens_active = self.recipe.lens_vignette != 0.0;
+        egui::CollapsingHeader::new(section_title("镜头校正 · Lens", lens_active))
+            .id_salt("sec_lens")
+            .default_open(false)
+            .show(ui, |ui| {
+                changed |= Self::slider(ui, "暗角补偿 Vignette", &mut self.recipe.lens_vignette, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, "中点 Midpoint", &mut self.recipe.lens_vignette_mid, 0.0, 100.0, 50.0);
+                ui.label(
+                    egui::RichText::new(
+                        "正值提亮四角（补偿镜头失光），负值压暗。线性光域径向增益，预览/导出/XMP 一致。畸变/去紫边后续批次。",
+                    )
+                    .weak()
+                    .small(),
+                );
+            });
+
         // --- 局部调整: manual masks — the SAME recipe.masks the AI writes -----
         let n_masks = self.recipe.masks.len();
         egui::CollapsingHeader::new(section_title(
