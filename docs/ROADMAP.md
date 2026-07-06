@@ -95,6 +95,59 @@
 - 已知近似：拉直角≠0 时画笔 overlay 纹理按原始帧直贴（落点计算正确，
   显示未旋转）——heal/clone/fill 共同的显示级问题，engine 结果不受影响。
 
+## 与 Photoshop 的核心差距（2026-07-06 调查 · ①-⑤ 完成后）
+
+> 定位前提：目标是"日常出片替代"（LR/ACR + PS 修图子集），不是 PS 的
+> 设计/合成全集。按对日常出片的影响排序；「现状」均为当日代码实测。
+
+### A. 智能选区 / 范围蒙版（差距最大）
+- PS/LR：Select Subject / Sky、亮度/颜色范围蒙版。
+- 现状：mask 仅线性/径向两种几何（recipe.rs `MaskGeometry`；xmp.rs 只写
+  `Mask/Gradient` + `Mask/CircularGradient`，全库 grep 无 RangeMask 实现）；
+  画笔手涂只喂 fill/heal/clone，进不了 recipe。
+- 路径：① 亮度/颜色范围蒙版——`apply_masks` 加逐像素权重项，XMP 有
+  CorrectionRangeMask 约定，**低成本高价值，建议下一批第一项**；
+  ② 主体/天空 AI 分割（python sidecar 循 SCUNet 模式或云 API），前置是
+  引擎加位图 mask 通路。
+
+### B. 像素母版 ↔ 参数配方双轨打通
+- 现状：fill/heal/clone 输出 ./out 像素母版，仅在 After 显示一次；滑杆一动
+  即 redevelop 回配方渲染，母版脱链（继续编辑需手动打开 ./out png）。
+- 路径：「以此母版继续 develop」一键（母版设为新 base + src 重定向）。低成本。
+
+### C. 镜头/几何校正
+- 现状：零实现（全库无 distortion/vignetting/CA/perspective 代码；EXIF 只存
+  镜头名 decode.rs:28）。
+- 路径：手动滑杆先行（k1/k2 径向畸变、暗角补偿、去紫边），透视 Upright 后置；
+  lensfun 数据库长期项。
+
+### D. 色彩管理
+- 现状：全程 sRGB gamma（render.rs 管线），导出不嵌 ICC，egui 显示端无色管
+  （广色域屏会偏饱和）。
+- 路径：先导出嵌 sRGB profile，再谈 P3/AdobeRGB 输出选项；显示端受 egui 限制。
+
+### E. 1:1 真像素检查
+- 现状：预览 1280px（gui.rs `PREVIEW_EDGE`），「1:1」= 预览像素，查合焦/噪点
+  不够。
+- 路径：高分预览开关（2560/4096）成本最低；全分辨率 tile 金字塔是大工程。
+
+### F. 导出管线
+- 现状：`render_to_file` 只出全分辨率 16-bit TIFF / q95 JPEG，无重采样/输出
+  锐化/水印/预设；批量只同步配方不出图。
+- 路径：导出对话框（长边像素+锐化+质量）+ 批量渲染 worker。
+
+### G. 历史/版本
+- 现状：undo/redo 100 步（内存态，关会话即失）；./out recipe json 单份。
+- 路径：recipe 快照（`<stem>.v2.json`…）+ 版本切换 UI（≈LR 虚拟副本）。
+
+### 明确不追（定位外）
+- 图层/混合模式/智能对象、文字/矢量、设计合成——PS 的另一半；
+  reimagine/fill + 反推配方已覆盖摄影侧的"创意改图"。
+
+### 建议批次顺序（v0.3.x 起）
+A（范围蒙版）→ B（双轨打通）→ F（导出管线）→ E（高分预览）→
+C（镜头校正）→ D（色管）→ G（版本）。
+
 ## 完成每项后的例行动作
 
 1. `cargo clippy --features gui --all-targets`（零警告）+ `cargo test --lib`
