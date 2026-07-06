@@ -66,13 +66,7 @@ pub fn render_to_image(
     }
 
     // --- white balance (target Kelvin/tint) in linear light -------------------
-    // The buffer is already at as-shot WB. We anchor as-shot at 5500 K (daylight)
-    // and shift toward the target — a direction-correct approximation. A precise
-    // as-shot-K estimate needs the camera colour matrix (raw→XYZ), not a naive
-    // blackbody match; that's the future upgrade. develop_preview skips WB.
-    if let Some(target_k) = recipe.temperature_k {
-        apply_wb(&mut data, 5500.0, target_k, recipe.tint);
-    }
+    apply_recipe_wb(&mut data, recipe);
 
     // --- tone + clarity + sat/vibrance + NR + sharpen (shared pipeline) -------
     apply_develop(&mut data, w, h, recipe);
@@ -104,10 +98,11 @@ pub fn render_to_image(
 }
 
 /// Develop an already-baked image (the "PNG source" mode: edit an LR/PS-denoised
-/// export). Runs the SAME tonal/colour pipeline as the RAW engine on the loaded
-/// pixels — but no demosaic and no Kelvin white balance, since a baked sRGB image
-/// carries no raw WB coefficients (temperature_k is a no-op here; relative tweaks
-/// still apply). Optional AI denoise runs first; output is 16-bit.
+/// export). Runs the SAME pipeline as the RAW engine on the loaded pixels — no
+/// demosaic, and white balance is the same relative 5500 K-anchored shift the
+/// RAW path uses (a baked sRGB image carries no raw WB coefficients, but the
+/// anchor model never needed them — it's a relative move either way).
+/// Optional AI denoise runs first; output is 16-bit.
 pub fn render_baked_to_image(
     img: &DynamicImage,
     recipe: &EditRecipe,
@@ -125,6 +120,7 @@ pub fn render_baked_to_image(
         crate::denoise::denoise_buffer(opts, &mut data, w, h).context("AI denoise")?;
     }
 
+    apply_recipe_wb(&mut data, recipe);
     apply_develop(&mut data, w, h, recipe);
 
     let mut buf: Vec<u16> = Vec::with_capacity(w * h * 3);
@@ -192,10 +188,12 @@ pub fn render_to_file(
     Ok((w, h))
 }
 
-/// Fast "after" render for the UI: apply the recipe's tonal + colour ops to an
-/// already-demosaiced preview image (no full-res develop, no demosaic). Crop is
-/// intentionally NOT applied here so sliders give immediate full-frame feedback;
-/// the full-res `render_to_image` path applies crop on export.
+/// Fast "after" render for the UI: apply the recipe's WB + tonal + colour ops
+/// to an already-demosaiced preview image (no full-res develop, no demosaic).
+/// White balance runs through the SAME `apply_recipe_wb` stage as the exports,
+/// so the Temp/Tint sliders and the WB eyedropper are live in the preview.
+/// Crop is intentionally NOT applied here so sliders give immediate full-frame
+/// feedback; the full-res `render_to_image` path applies crop on export.
 pub fn develop_preview(preview: &DynamicImage, recipe: &EditRecipe) -> DynamicImage {
     let rgb = preview.to_rgb8();
     let (w, h) = rgb.dimensions();
@@ -203,6 +201,7 @@ pub fn develop_preview(preview: &DynamicImage, recipe: &EditRecipe) -> DynamicIm
         .pixels()
         .map(|p| [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0])
         .collect();
+    apply_recipe_wb(&mut data, recipe);
     apply_develop(&mut data, w as usize, h as usize, recipe);
     let mut buf = Vec::with_capacity((w * h * 3) as usize);
     for px in &data {
@@ -522,6 +521,51 @@ fn apply_wb(data: &mut [[f32; 3]], as_shot_k: f32, target_k: f32, tint: f32) {
             px[c] = linear_to_srgb(lin.clamp(0.0, 1.0));
         }
     }
+}
+
+/// The ONE recipe→WB stage, shared by the full-res render, the baked-image
+/// render and the UI preview so they can never disagree. The buffer is assumed
+/// to be at as-shot WB, anchored at 5500 K (daylight) and shifted toward the
+/// target — a direction-correct relative approximation (a precise as-shot-K
+/// needs the camera colour matrix; future upgrade). `temperature_k = None`
+/// only means "no Kelvin shift" — tint still applies on its own, matching the
+/// recipe contract (tint 0 = neutral) and what the GUI slider promises.
+fn apply_recipe_wb(data: &mut [[f32; 3]], r: &EditRecipe) {
+    if r.temperature_k.is_some() || r.tint != 0.0 {
+        apply_wb(data, 5500.0, r.temperature_k.unwrap_or(5500.0), r.tint);
+    }
+}
+
+/// Inverse white balance — the WB eyedropper's solver. Given an sRGB pixel the
+/// user says SHOULD be neutral, find the (target Kelvin, tint) whose
+/// [`wb_gains`] neutralise it, using the exact forward model (same 5500 K
+/// as-shot anchor) the render then applies. Target K is scanned on a log grid
+/// (400 steps over the recipe's legal 2000–40000 K) to equalise the red/blue
+/// channels; tint then falls analytically out of the green residual
+/// (gg = 1 − 0.20·tint/100). Returns (kelvin, tint clamped to ±100).
+pub fn solve_wb_from_neutral(px: [f32; 3]) -> (f32, f32) {
+    let lr = srgb_to_linear(px[0]).max(1e-5);
+    let lg = srgb_to_linear(px[1]).max(1e-5);
+    let lb = srgb_to_linear(px[2]).max(1e-5);
+    const N: usize = 400;
+    let (lo, hi) = ((2000.0f32).ln(), (40000.0f32).ln());
+    let mut best = (5500.0f32, f32::INFINITY);
+    for i in 0..=N {
+        let k = (lo + (hi - lo) * i as f32 / N as f32).exp();
+        let g = wb_gains(5500.0, k, 0.0);
+        let e = (lr * g[0] - lb * g[2]).abs();
+        if e < best.1 {
+            best = (k, e);
+        }
+    }
+    let k = best.0;
+    let g = wb_gains(5500.0, k, 0.0);
+    // Green gain that lands green on the (now equal) red/blue level → tint.
+    // Bounded to the gg range tint can actually express (tint ±100 ⇒ gg 0.8–1.2).
+    let level = 0.5 * (lr * g[0] + lb * g[2]);
+    let gg = (level / lg).clamp(0.8, 1.2);
+    let tint = ((1.0 - gg) / 0.20 * 100.0).clamp(-100.0, 100.0);
+    (k, tint)
 }
 
 fn srgb_to_linear(c: f32) -> f32 {
@@ -1158,6 +1202,60 @@ mod tests {
         // Neutral (same K, no tint) ⇒ all gains ~1.
         let n = wb_gains(5500.0, 5500.0, 0.0);
         assert!((n[0] - 1.0).abs() < 1e-3 && (n[2] - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn wb_eyedropper_neutralizes_a_synthetic_cast() {
+        // Build the pixel a grey card shows under a known wrong WB: linear grey
+        // L divided by the gains a (k0, tint0) correction WOULD apply — so that
+        // correction is exactly what neutralises it. The solver must recover a
+        // (k, tint) whose gains bring the pixel back to r≈g≈b, judged by the
+        // same forward model (parameter identity is NOT required — nearby K
+        // can neutralise equally well; neutrality is the contract).
+        for (k0, tint0) in [(3200.0f32, 12.0f32), (7500.0, -18.0), (5500.0, 0.0)] {
+            let g0 = wb_gains(5500.0, k0, tint0);
+            let l = 0.18f32;
+            let cast = [
+                linear_to_srgb(l / g0[0]),
+                linear_to_srgb(l / g0[1]),
+                linear_to_srgb(l / g0[2]),
+            ];
+            let (k, tint) = solve_wb_from_neutral(cast);
+            let g = wb_gains(5500.0, k, tint);
+            let out = [
+                srgb_to_linear(cast[0]) * g[0],
+                srgb_to_linear(cast[1]) * g[1],
+                srgb_to_linear(cast[2]) * g[2],
+            ];
+            let (mx, mn) = (
+                out[0].max(out[1]).max(out[2]),
+                out[0].min(out[1]).min(out[2]),
+            );
+            assert!(
+                (mx - mn) / mx < 0.02,
+                "cast for ({k0},{tint0}) not neutralised: solved ({k:.0},{tint:.1}) → {out:?}"
+            );
+        }
+        // An already-neutral pixel solves to ~as-shot, ~zero tint.
+        let (k, tint) = solve_wb_from_neutral([0.5, 0.5, 0.5]);
+        assert!((k - 5500.0).abs() < 300.0 && tint.abs() < 2.0, "neutral → ({k:.0},{tint:.1})");
+    }
+
+    #[test]
+    fn preview_wb_is_live_and_matches_the_shared_stage() {
+        // develop_preview must run the SAME apply_recipe_wb as the exports:
+        // a warmer Kelvin target raises red vs blue on a grey preview, and a
+        // tint-only recipe (temperature_k = None) is NOT a no-op.
+        let grey = DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, image::Rgb([128, 128, 128])));
+        let warm = EditRecipe { temperature_k: Some(8000.0), ..Default::default() };
+        let w = develop_preview(&grey, &warm).to_rgb8();
+        let p = w.get_pixel(0, 0);
+        assert!(p[0] > p[2] + 5, "warm target must warm the preview: {p:?}");
+
+        let tinted = EditRecipe { tint: 60.0, ..Default::default() };
+        let t = develop_preview(&grey, &tinted).to_rgb8();
+        let q = t.get_pixel(0, 0);
+        assert!(q[1] < 126, "positive (magenta) tint must cut green: {q:?}");
     }
 
     #[test]

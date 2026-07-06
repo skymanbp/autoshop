@@ -360,6 +360,8 @@ struct AutoshopApp {
     multi_sel: HashSet<usize>,             // Ctrl+click gallery multi-selection
     copied: Option<EditRecipe>,            // the recipe "clipboard" (in-app only)
     paste_geometry: bool,                  // keep crop/straighten when pasting
+    // --- WB eyedropper ---
+    wb_picking: bool,                      // next image click samples a neutral point
 }
 
 /// The two mask geometries a user can place by dragging.
@@ -474,6 +476,7 @@ impl Default for AutoshopApp {
             multi_sel: HashSet::new(),
             copied: None,
             paste_geometry: false,
+            wb_picking: false,
         }
     }
 }
@@ -1361,6 +1364,7 @@ impl AutoshopApp {
                         self.placing_mask = None;
                         self.place_start = None;
                         self.curve_drag = None; // curve_channel is a UI pref, keep it
+                        self.wb_picking = false;
                         self.verdict = None;
                         self.rationale.clear();
                         self.dirty = true; // render the (neutral) after
@@ -1710,11 +1714,30 @@ impl AutoshopApp {
             .id_salt("sec_tone")
             .default_open(true)
             .show(ui, |ui| {
-                let mut custom_wb = self.recipe.temperature_k.is_some();
-                if ui.checkbox(&mut custom_wb, "Custom white balance (off = as-shot)").changed() {
-                    self.recipe.temperature_k = if custom_wb { Some(5500.0) } else { None };
-                    changed = true;
-                }
+                ui.horizontal(|ui| {
+                    let mut custom_wb = self.recipe.temperature_k.is_some();
+                    if ui.checkbox(&mut custom_wb, "Custom white balance (off = as-shot)").changed() {
+                        self.recipe.temperature_k = if custom_wb { Some(5500.0) } else { None };
+                        changed = true;
+                    }
+                    let label = if self.wb_picking { "💧 点击图中…" } else { "💧 吸管" };
+                    if ui
+                        .small_button(label)
+                        .on_hover_text(
+                            "点击图上应为中性灰/白的位置，自动反解 Temp/Tint（与引擎同一正向模型）。再点一次取消",
+                        )
+                        .clicked()
+                    {
+                        self.wb_picking = !self.wb_picking;
+                        if self.wb_picking {
+                            // One canvas tool at a time.
+                            self.crop_mode = false;
+                            self.paint_mode = false;
+                            self.placing_mask = None;
+                            self.status = "WB 吸管：点击图中应为中性灰/白的位置".into();
+                        }
+                    }
+                });
                 if let Some(mut k) = self.recipe.temperature_k
                     && Self::slider(ui, "Temp (K)", &mut k, 2000.0, 40000.0, 5500.0)
                 {
@@ -1840,6 +1863,7 @@ impl AutoshopApp {
                             // One tool at a time on the canvas.
                             self.paint_mode = false;
                             self.placing_mask = None;
+                            self.wb_picking = false;
                         }
                     }
                     egui::ComboBox::from_id_salt("crop_aspect")
@@ -1877,12 +1901,14 @@ impl AutoshopApp {
                     self.placing_mask = Some((MaskKind::Linear, None));
                     self.paint_mode = false;
                     self.crop_mode = false;
+                    self.wb_picking = false;
                     self.status = "在图上拖拽画出线性渐变（起点不受影响 → 终点完全生效）".into();
                 }
                 if ui.button("＋ 径向").on_hover_text("在图上拖拽画出椭圆范围").clicked() {
                     self.placing_mask = Some((MaskKind::Radial, None));
                     self.paint_mode = false;
                     self.crop_mode = false;
+                    self.wb_picking = false;
                     self.status = "在图上拖拽画出径向（椭圆）范围".into();
                 }
             });
@@ -1927,6 +1953,7 @@ impl AutoshopApp {
                         self.placing_mask = Some((kind, Some(i)));
                         self.paint_mode = false;
                         self.crop_mode = false;
+                        self.wb_picking = false;
                     }
                     let m = &mut self.recipe.masks[i];
                     ui.checkbox(&mut m.inverted, "反转");
@@ -2022,6 +2049,8 @@ impl AutoshopApp {
             "裁剪 — 拖角柄调整，框内拖动移动"
         } else if self.placing_mask.is_some() {
             "局部调整 — 在图上拖拽画出渐变范围"
+        } else if self.wb_picking {
+            "WB 吸管 — 点击应为中性灰/白的位置"
         } else if self.paint_mode {
             "After — paint over the area to fill / heal"
         } else {
@@ -2098,6 +2127,8 @@ impl AutoshopApp {
             self.handle_crop(ui, &resp, xf, tex_size);
         } else if self.placing_mask.is_some() {
             self.handle_place_mask(ui, &resp, xf);
+        } else if self.wb_picking {
+            self.handle_wb_pick(ui, &resp, xf);
         } else if self.paint_mode {
             self.handle_paint(&resp, xf);
             self.ensure_mask_tex(ui.ctx());
@@ -2115,6 +2146,52 @@ impl AutoshopApp {
         {
             draw_mask_overlay(ui, xf, &m.mask);
         }
+    }
+
+    /// WB eyedropper: click a pixel that SHOULD be neutral and the engine's
+    /// inverse solver (`render::solve_wb_from_neutral` — the same 5500 K
+    /// anchored forward model the render applies) turns it into Temp + Tint.
+    /// Samples a 5×5 mean of the SOURCE preview: WB runs before develop, so
+    /// the solve must see pre-develop pixels, not the current edit.
+    fn handle_wb_pick(&mut self, ui: &egui::Ui, resp: &egui::Response, xf: ViewXform) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        if !resp.clicked() {
+            return;
+        }
+        let Some(q) = resp.interact_pointer_pos() else { return };
+        let (nx, ny) = xf.to_norm(q);
+        let px = {
+            let Some(base) = &self.base_preview else { return };
+            let rgb = base.to_rgb8();
+            let (w, h) = rgb.dimensions();
+            let (cx, cy) = (
+                (nx * (w.saturating_sub(1)) as f32).round() as i64,
+                (ny * (h.saturating_sub(1)) as f32).round() as i64,
+            );
+            let (mut acc, mut n) = ([0.0f32; 3], 0.0f32);
+            for dy in -2..=2i64 {
+                for dx in -2..=2i64 {
+                    let (x, y) = (cx + dx, cy + dy);
+                    if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
+                        let p = rgb.get_pixel(x as u32, y as u32);
+                        for c in 0..3 {
+                            acc[c] += p[c] as f32 / 255.0;
+                        }
+                        n += 1.0;
+                    }
+                }
+            }
+            if n == 0.0 {
+                return;
+            }
+            [acc[0] / n, acc[1] / n, acc[2] / n]
+        };
+        let (k, tint) = autoshop::render::solve_wb_from_neutral(px);
+        self.recipe.temperature_k = Some(k);
+        self.recipe.tint = tint;
+        self.wb_picking = false;
+        self.dirty = true;
+        self.status = format!("WB 吸管：{k:.0} K · tint {tint:+.0} — 可在色调区微调");
     }
 
     /// Box-select on the After image: drag a rectangle to target a local edit;
