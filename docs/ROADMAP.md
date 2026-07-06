@@ -11,6 +11,9 @@
 - 反推配方（`fit.rs` + CLI `match` + GUI 按钮）、gpt-image-2 弹性高分辨率
   （≤8.3MP + 400 回退）、风格提示词提取（`advisor::describe_style`）均已上线。
 - GUI 生产化（直方图/toast/快捷键/拖拽/持久化/分组折叠/双击归零）已上线。
+- **① 曲线编辑器已完成**：develop_panel「曲线 · Curves」，主/R/G/B 通道，
+  直方图背景 + 点击加点/拖动移点/拖出删点；预览线直接采样公开的
+  `render::curve_lut`（引擎同源）。下一项从 **②** 开始。
 - 待用户真机验收：缩放/裁剪/mask 手感；持久化“正常关闭→重启恢复”回路；
   高分辨率生成与风格提示词的真实 API 行为（需付费调用，有 400 回退兜底）。
 
@@ -27,7 +30,7 @@
 - 照片库 `D:/Photography` 只读；输出一律 `./out`（`pipeline::guard_readonly`，
   项目自身 `./out` 永远可写）。
 
-## ① 色调曲线交互编辑器（下一项，纯 GUI）
+## ① 色调曲线交互编辑器（✅ 已完成）
 
 - 数据已通：`recipe.tone_curve/red_curve/green_curve/blue_curve:
   Vec<CurvePoint{input,output: u8}>`（recipe.rs）；引擎组合方式——master 曲线

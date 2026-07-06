@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui::load::SizedTexture;
 
-use autoshop::recipe::{ColorGrade, EditRecipe, Hsl, MaskGeometry};
+use autoshop::recipe::{ColorGrade, CurvePoint, EditRecipe, Hsl, MaskGeometry};
 use image::GenericImageView;
 
 /// How the preview area is laid out. `AfterOnly` gives the edit the whole
@@ -201,6 +201,63 @@ fn section_title(base: &str, active: bool) -> String {
     }
 }
 
+/// Curve-editor channels: label + draw colour, indexed by `curve_channel`
+/// (0 = master, then R/G/B — the recipe's tone/red/green/blue_curve fields).
+const CURVE_CHANNELS: [(&str, egui::Color32); 4] = [
+    ("主", egui::Color32::from_gray(225)),
+    ("红", egui::Color32::from_rgb(235, 90, 90)),
+    ("绿", egui::Color32::from_rgb(90, 205, 90)),
+    ("蓝", egui::Color32::from_rgb(90, 130, 240)),
+];
+
+/// The recipe field behind a curve-editor channel index.
+fn curve_points(recipe: &EditRecipe, ch: usize) -> &Vec<CurvePoint> {
+    match ch {
+        0 => &recipe.tone_curve,
+        1 => &recipe.red_curve,
+        2 => &recipe.green_curve,
+        _ => &recipe.blue_curve,
+    }
+}
+
+fn curve_points_mut(recipe: &mut EditRecipe, ch: usize) -> &mut Vec<CurvePoint> {
+    match ch {
+        0 => &mut recipe.tone_curve,
+        1 => &mut recipe.red_curve,
+        2 => &mut recipe.green_curve,
+        _ => &mut recipe.blue_curve,
+    }
+}
+
+/// Insert a curve control point keeping inputs sorted and UNIQUE — a second
+/// point at the same input overwrites instead of duplicating (the engine's
+/// piecewise-linear interp needs distinct inputs). Returns the point's index.
+fn insert_curve_point(pts: &mut Vec<CurvePoint>, input: u8, output: u8) -> usize {
+    match pts.binary_search_by_key(&input, |p| p.input) {
+        Ok(i) => {
+            pts[i].output = output;
+            i
+        }
+        Err(i) => {
+            pts.insert(i, CurvePoint { input, output });
+            i
+        }
+    }
+}
+
+/// Move point `i` to (input, output), clamping input STRICTLY between its
+/// neighbours so the control points always stay sorted with unique inputs.
+fn drag_curve_point(pts: &mut [CurvePoint], i: usize, input: u8, output: u8) {
+    let lo = if i > 0 { pts[i - 1].input.saturating_add(1) } else { 0 };
+    let hi = if i + 1 < pts.len() { pts[i + 1].input.saturating_sub(1) } else { 255 };
+    // lo > hi would need two neighbours ≤ 2 apart around an existing point —
+    // unreachable via insert/drag above; keep the current input if it happens.
+    if lo <= hi {
+        pts[i].input = input.clamp(lo, hi);
+    }
+    pts[i].output = output;
+}
+
 /// Two API base URLs are the "same endpoint" ignoring whitespace / a trailing slash.
 /// Used so model ids fetched with the image key are only offered to the analysis
 /// picker when both roles point at the same server.
@@ -294,6 +351,9 @@ struct AutoshopApp {
     sel_mask: Option<usize>,               // selected recipe.masks index (overlay + sliders)
     placing_mask: Option<(MaskKind, Option<usize>)>, // next image drag defines a mask (replace idx)
     place_start: Option<(f32, f32)>,       // placement drag origin, full-frame normalized
+    // --- tone-curve editor ---
+    curve_channel: usize,                  // CURVE_CHANNELS index: 0=master 1=R 2=G 3=B
+    curve_drag: Option<usize>,             // control point being dragged (active channel)
 }
 
 /// The two mask geometries a user can place by dragging.
@@ -403,6 +463,8 @@ impl Default for AutoshopApp {
             sel_mask: None,
             placing_mask: None,
             place_start: None,
+            curve_channel: 0,
+            curve_drag: None,
         }
     }
 }
@@ -913,6 +975,170 @@ impl AutoshopApp {
         p.add(egui::Shape::line(pts, egui::Stroke::new(1.0, egui::Color32::from_gray(210))));
     }
 
+    /// The interactive tone-curve editor: a channel picker (master / R / G / B)
+    /// over a painted square — histogram backdrop, quarter grid, and the curve
+    /// drawn straight from `render::curve_lut`, the SAME sampler the engine
+    /// applies (so the preview line can never drift from the render). Click
+    /// adds a point ON the curve, dragging moves it (inputs stay strictly
+    /// increasing), dragging well outside the box deletes it — the Lightroom
+    /// gestures. Returns true when the recipe changed this frame.
+    fn curve_editor(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            for (i, (name, color)) in CURVE_CHANNELS.iter().enumerate() {
+                if ui
+                    .selectable_label(
+                        self.curve_channel == i,
+                        egui::RichText::new(*name).color(*color).small(),
+                    )
+                    .clicked()
+                {
+                    self.curve_channel = i;
+                    self.curve_drag = None;
+                }
+            }
+            if ui.small_button("↺").on_hover_text("清空当前通道曲线").clicked() {
+                let pts = curve_points_mut(&mut self.recipe, self.curve_channel);
+                if !pts.is_empty() {
+                    pts.clear();
+                    changed = true;
+                }
+                self.curve_drag = None;
+            }
+        });
+
+        let side = ui.available_width().clamp(160.0, 240.0);
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click_and_drag());
+        let p = ui.painter_at(rect);
+        let accent = CURVE_CHANNELS[self.curve_channel].1;
+        p.rect_filled(rect, 3.0, egui::Color32::from_gray(16));
+
+        // Value space: x = input 0..1 (left→right), y = output 0..1 (bottom→top).
+        let to_screen = |x: f32, y: f32| {
+            egui::pos2(rect.min.x + x * rect.width(), rect.max.y - y * rect.height())
+        };
+        let to_val = |q: egui::Pos2| {
+            (
+                ((q.x - rect.min.x) / rect.width().max(1.0)).clamp(0.0, 1.0),
+                ((rect.max.y - q.y) / rect.height().max(1.0)).clamp(0.0, 1.0),
+            )
+        };
+
+        // Histogram backdrop for the active channel (luma behind the master curve)
+        // — same data as the panel histogram, sqrt-scaled the same way.
+        if let Some(hist) = &self.histogram {
+            let ch = [3usize, 0, 1, 2][self.curve_channel];
+            let bar_w = rect.width() / hist.len().max(1) as f32;
+            let fill =
+                egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 34);
+            for (i, bins) in hist.iter().enumerate() {
+                let v = bins[ch].sqrt();
+                if v <= 0.0 {
+                    continue;
+                }
+                let x0 = rect.min.x + i as f32 * bar_w;
+                p.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0, rect.max.y - v * (rect.height() - 2.0)),
+                        egui::pos2(x0 + bar_w, rect.max.y),
+                    ),
+                    0.0,
+                    fill,
+                );
+            }
+        }
+
+        // Quarter grid + the identity diagonal for reference.
+        let grid = egui::Stroke::new(1.0, egui::Color32::from_gray(38));
+        for i in 1..4 {
+            let t = i as f32 / 4.0;
+            p.line_segment([to_screen(t, 0.0), to_screen(t, 1.0)], grid);
+            p.line_segment([to_screen(0.0, t), to_screen(1.0, t)], grid);
+        }
+        p.line_segment(
+            [to_screen(0.0, 0.0), to_screen(1.0, 1.0)],
+            egui::Stroke::new(1.0, egui::Color32::from_gray(56)),
+        );
+
+        // --- interaction (mutates the active channel's control points) --------
+        const HIT: f32 = 10.0; // grab radius around a point, screen px
+        let lut_before =
+            autoshop::render::curve_lut(curve_points(&self.recipe, self.curve_channel));
+        let pts = curve_points_mut(&mut self.recipe, self.curve_channel);
+        if (resp.drag_started() || resp.clicked())
+            && let Some(q) = resp.interact_pointer_pos()
+        {
+            let near = pts.iter().position(|c| {
+                to_screen(c.input as f32 / 255.0, c.output as f32 / 255.0).distance(q) <= HIT
+            });
+            let idx = match near {
+                Some(i) => i,
+                None => {
+                    // Add ON the current curve at the clicked input — the shape
+                    // doesn't jump; the user then drags the new point away.
+                    let (vx, _) = to_val(q);
+                    let input = (vx * 255.0).round() as u8;
+                    let output = (lut_before[input as usize] * 255.0).round() as u8;
+                    changed = true;
+                    insert_curve_point(pts, input, output)
+                }
+            };
+            if resp.drag_started() {
+                self.curve_drag = Some(idx);
+            }
+        }
+        if let Some(i) = self.curve_drag.filter(|&i| i < pts.len()) {
+            if resp.dragged()
+                && let Some(q) = resp.interact_pointer_pos()
+            {
+                if rect.expand(28.0).contains(q) {
+                    let (vx, vy) = to_val(q);
+                    drag_curve_point(
+                        pts,
+                        i,
+                        (vx * 255.0).round() as u8,
+                        (vy * 255.0).round() as u8,
+                    );
+                } else {
+                    pts.remove(i); // dragged well outside → delete (LR gesture)
+                    self.curve_drag = None;
+                }
+                changed = true;
+            }
+            if resp.drag_stopped() {
+                self.curve_drag = None;
+            }
+        }
+
+        // Engine-faithful curve line: all 256 samples straight from the shared LUT.
+        let lut = autoshop::render::curve_lut(pts);
+        let line: Vec<egui::Pos2> = lut
+            .iter()
+            .enumerate()
+            .map(|(i, &y)| to_screen(i as f32 / 255.0, y))
+            .collect();
+        p.add(egui::Shape::line(line, egui::Stroke::new(1.6, accent)));
+
+        // Control-point handles (the dragged one filled with the channel colour).
+        for (i, c) in pts.iter().enumerate() {
+            let q = to_screen(c.input as f32 / 255.0, c.output as f32 / 255.0);
+            if self.curve_drag == Some(i) {
+                p.circle_filled(q, 5.0, accent);
+            } else {
+                p.circle_filled(q, 3.5, egui::Color32::from_gray(230));
+                p.circle_stroke(q, 3.5, egui::Stroke::new(1.0, egui::Color32::from_gray(60)));
+            }
+        }
+
+        ui.label(
+            egui::RichText::new("点击加点 · 拖动移点 · 拖出框外删点 — 预览/导出/XMP 同源生效")
+                .weak()
+                .small(),
+        );
+        changed
+    }
+
     fn start_analyze(&mut self) {
         let Some(path) = self.src_path.clone() else { return };
         if self.busy {
@@ -1057,6 +1283,7 @@ impl AutoshopApp {
                         self.sel_mask = None;
                         self.placing_mask = None;
                         self.place_start = None;
+                        self.curve_drag = None; // curve_channel is a UI pref, keep it
                         self.verdict = None;
                         self.rationale.clear();
                         self.dirty = true; // render the (neutral) after
@@ -1330,13 +1557,17 @@ impl AutoshopApp {
         // A section whose values are non-neutral shows a ● so a collapsed
         // active adjustment is never invisible. Flags are snapshot up front —
         // Copy bools, so no borrow spans the section closures (E0500).
-        let (presence_active, detail_active, hsl_active, grade_active) = {
+        let (presence_active, detail_active, hsl_active, grade_active, curves_active) = {
             let r = &self.recipe;
             (
                 r.clarity != 0.0 || r.dehaze != 0.0 || r.vibrance != 0.0 || r.saturation != 0.0,
                 r.sharpening != 0.0 || r.noise_reduction != 0.0,
                 !r.hsl.is_neutral(),
                 !r.color_grade.is_neutral(),
+                !r.tone_curve.is_empty()
+                    || !r.red_curve.is_empty()
+                    || !r.green_curve.is_empty()
+                    || !r.blue_curve.is_empty(),
             )
         };
 
@@ -1363,6 +1594,15 @@ impl AutoshopApp {
                 changed |= Self::slider(ui, "Shadows", &mut r.shadows, -100.0, 100.0, 0.0);
                 changed |= Self::slider(ui, "Whites", &mut r.whites, -100.0, 100.0, 0.0);
                 changed |= Self::slider(ui, "Blacks", &mut r.blacks, -100.0, 100.0, 0.0);
+            });
+
+        // --- 曲线: master + RGB tone curves (engine + XMP already apply them,
+        // this is purely the editing surface — Lightroom's panel order) --------
+        egui::CollapsingHeader::new(section_title("曲线 · Curves", curves_active))
+            .id_salt("sec_curves")
+            .default_open(false)
+            .show(ui, |ui| {
+                changed |= self.curve_editor(ui);
             });
 
         egui::CollapsingHeader::new(section_title("质感 · Presence", presence_active))
@@ -2819,4 +3059,68 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(AutoshopApp::new(cc))) // restores prefs + last library
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_curve_point_keeps_inputs_sorted_and_unique() {
+        let mut pts = Vec::new();
+        insert_curve_point(&mut pts, 128, 140);
+        insert_curve_point(&mut pts, 32, 20);
+        insert_curve_point(&mut pts, 200, 210);
+        assert_eq!(pts.iter().map(|p| p.input).collect::<Vec<_>>(), vec![32, 128, 200]);
+        // Same input again → overwrite in place, never a duplicate input.
+        let i = insert_curve_point(&mut pts, 128, 100);
+        assert_eq!(i, 1);
+        assert_eq!(pts.len(), 3);
+        assert_eq!(pts[1].output, 100);
+    }
+
+    #[test]
+    fn drag_curve_point_clamps_strictly_between_neighbours() {
+        let mut pts = vec![
+            CurvePoint { input: 30, output: 30 },
+            CurvePoint { input: 128, output: 128 },
+            CurvePoint { input: 200, output: 200 },
+        ];
+        // Dragging the middle point past its right neighbour stops 1 short.
+        drag_curve_point(&mut pts, 1, 240, 250);
+        assert_eq!(pts[1].input, 199);
+        assert_eq!(pts[1].output, 250);
+        // …and past its left neighbour stops 1 above it.
+        drag_curve_point(&mut pts, 1, 0, 10);
+        assert_eq!(pts[1].input, 31);
+        // Endpoints reach the full 0 / 255 range.
+        drag_curve_point(&mut pts, 0, 0, 0);
+        drag_curve_point(&mut pts, 2, 255, 255);
+        assert_eq!((pts[0].input, pts[2].input), (0, 255));
+        // Invariant after any sequence: inputs strictly increasing.
+        assert!(pts.windows(2).all(|w| w[0].input < w[1].input));
+    }
+
+    #[test]
+    fn curve_editor_edits_render_identically_to_the_engine() {
+        // The editor mutates recipe.*_curve and previews via render::curve_lut —
+        // the exact LUT the engine applies. Empty = identity; an anchored lift
+        // keeps the ends and raises the anchored midpoint.
+        let id = autoshop::render::curve_lut(&[]);
+        assert!(id[0].abs() < 1e-6 && (id[255] - 1.0).abs() < 1e-6);
+        assert!((id[128] - 128.0 / 255.0).abs() < 1e-3);
+
+        let mut r = EditRecipe::default();
+        let pts = curve_points_mut(&mut r, 0);
+        insert_curve_point(pts, 0, 0);
+        insert_curve_point(pts, 255, 255);
+        insert_curve_point(pts, 64, 96); // classic shadow lift between pinned ends
+        let lut = autoshop::render::curve_lut(pts);
+        assert!(lut[0].abs() < 1e-6 && (lut[255] - 1.0).abs() < 1e-6);
+        assert!((lut[64] - 96.0 / 255.0).abs() < 1e-3, "anchored point maps exactly");
+        // The channel selector reaches the right recipe field (master only here).
+        for ch in 0..4 {
+            assert_eq!(curve_points(&r, ch).len(), if ch == 0 { 3 } else { 0 });
+        }
+    }
 }

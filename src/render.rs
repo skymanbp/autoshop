@@ -642,7 +642,7 @@ pub(crate) fn build_tone_lut(r: &EditRecipe) -> Vec<f32> {
     }
 
     let m = fc_tangents(&TONE_KNOTS_X, &ys);
-    let curve = tone_curve_lut(r); // the recipe's own tone_curve, composed on top
+    let curve = curve_lut(&r.tone_curve); // the recipe's own tone_curve, composed on top
     (0..LUT_N)
         .map(|i| {
             let x = i as f32 / (LUT_N - 1) as f32;
@@ -710,23 +710,20 @@ fn hermite_eval(xs: &[f32], ys: &[f32], m: &[f32], x: f32) -> f32 {
     h00 * ys[i] + h10 * h * m[i] + h01 * ys[i + 1] + h11 * h * m[i + 1]
 }
 
-/// The recipe's tone curve as a 256-entry [0,1]→[0,1] LUT; identity if empty.
-fn tone_curve_lut(r: &EditRecipe) -> Vec<f32> {
-    if r.tone_curve.is_empty() {
+/// Curve control points → a 256-entry [0,1]→[0,1] LUT; identity when empty.
+/// The ONE curve sampler shared by the master tone curve, the per-channel RGB
+/// curves, and the GUI curve editor's on-screen preview — public so what the
+/// editor draws is exactly what the engine applies (same sort + linear interp).
+pub fn curve_lut(points: &[crate::recipe::CurvePoint]) -> Vec<f32> {
+    if points.is_empty() {
         return (0..256).map(|i| i as f32 / 255.0).collect();
     }
-    let mut pts: Vec<(f32, f32)> = r
-        .tone_curve
+    let mut pts: Vec<(f32, f32)> = points
         .iter()
         .map(|p| (p.input as f32 / 255.0, p.output as f32 / 255.0))
         .collect();
     pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    (0..256)
-        .map(|i| {
-            let x = i as f32 / 255.0;
-            interp(&pts, x)
-        })
-        .collect()
+    (0..256).map(|i| interp(&pts, i as f32 / 255.0)).collect()
 }
 
 /// Piecewise-linear interpolation over sorted (x,y) control points, clamped at
@@ -774,11 +771,8 @@ fn apply_rgb_curves(data: &mut [[f32; 3]], r: &EditRecipe) {
     if curves.iter().all(|c| c.is_empty()) {
         return;
     }
-    let luts: [Vec<f32>; 3] = [
-        channel_curve_lut(curves[0]),
-        channel_curve_lut(curves[1]),
-        channel_curve_lut(curves[2]),
-    ];
+    let luts: [Vec<f32>; 3] =
+        [curve_lut(curves[0]), curve_lut(curves[1]), curve_lut(curves[2])];
     for px in data.iter_mut() {
         for ch in 0..3 {
             if !curves[ch].is_empty() {
@@ -786,19 +780,6 @@ fn apply_rgb_curves(data: &mut [[f32; 3]], r: &EditRecipe) {
             }
         }
     }
-}
-
-/// A 256-entry [0,1]→[0,1] LUT from one channel's control points; identity if empty.
-fn channel_curve_lut(points: &[crate::recipe::CurvePoint]) -> Vec<f32> {
-    if points.is_empty() {
-        return (0..256).map(|i| i as f32 / 255.0).collect();
-    }
-    let mut pts: Vec<(f32, f32)> = points
-        .iter()
-        .map(|p| (p.input as f32 / 255.0, p.output as f32 / 255.0))
-        .collect();
-    pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    (0..256).map(|i| interp(&pts, i as f32 / 255.0)).collect()
 }
 
 /// Saturation + vibrance around the pixel's luma. Vibrance boosts low-saturation
