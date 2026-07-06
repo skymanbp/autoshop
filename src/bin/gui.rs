@@ -69,6 +69,7 @@ struct Prefs {
     exp_long_edge: u32,
     exp_sharpen: f32,
     exp_quality: f32,
+    preview_edge: u32,
 }
 
 impl Default for Prefs {
@@ -84,6 +85,7 @@ impl Default for Prefs {
             exp_long_edge: 0,
             exp_sharpen: 0.0,
             exp_quality: 95.0,
+            preview_edge: PREVIEW_EDGE,
         }
     }
 }
@@ -480,6 +482,8 @@ struct AutoshopApp {
     exp_long_edge: u32,                    // resize long edge in px; 0 = full resolution
     exp_sharpen: f32,                      // output sharpening 0..100, post-resize
     exp_quality: f32,                      // JPEG quality 1..100 (f32 for the shared slider)
+    // --- preview resolution (gap batch E) ---
+    preview_edge: u32,                     // working-preview long edge: 1280 fluid / 2560 / 4096 detail
 }
 
 /// The two mask geometries a user can place by dragging.
@@ -604,6 +608,7 @@ impl Default for AutoshopApp {
             exp_long_edge: 0,
             exp_sharpen: 0.0,
             exp_quality: 95.0,
+            preview_edge: PREVIEW_EDGE,
         }
     }
 }
@@ -624,6 +629,11 @@ impl AutoshopApp {
             app.exp_long_edge = prefs.exp_long_edge;
             app.exp_sharpen = prefs.exp_sharpen.clamp(0.0, 100.0);
             app.exp_quality = prefs.exp_quality.clamp(1.0, 100.0);
+            // Only the known steps — a corrupt pref must not produce a 1-px
+            // or 100-MP working preview.
+            if [1280, 2560, 4096].contains(&prefs.preview_edge) {
+                app.preview_edge = prefs.preview_edge;
+            }
             if let Some(dir) = prefs.gallery_dir.filter(|d| d.is_dir()) {
                 app.open_folder(dir);
             }
@@ -727,6 +737,10 @@ impl AutoshopApp {
         self.src_path = Some(path.clone());
         self.status = format!("decoding {} …", path.display());
         let tx = self.tx.clone();
+        // Working-preview size is a user choice now (gap batch E): 1280 keeps
+        // sliders fluid; 2560/4096 trade tick latency for real 1:1 detail when
+        // checking focus / noise.
+        let edge = self.preview_edge.clamp(640, 8192);
         std::thread::spawn(move || {
             // Build a CLEAN preview base by developing the RAW sensor data
             // (downscaled), NOT the camera's already-baked 8-bit JPEG preview:
@@ -739,7 +753,7 @@ impl AutoshopApp {
                 } else {
                     autoshop::decode::load_image(&path)?
                 };
-                Ok(full.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE))
+                Ok(full.thumbnail(edge, edge))
             })();
             let _ = tx.send(Msg::Opened(Box::new(res)));
         });
@@ -2451,6 +2465,28 @@ impl AutoshopApp {
                     self.pan = egui::vec2(0.5, 0.5);
                 }
                 ui.label(egui::RichText::new(format!("{:.0}%", scale * 100.0)).weak().small());
+                // --- preview resolution (gap batch E): 1:1 that actually
+                // resolves detail. Switching re-decodes the current photo with
+                // the recipe KEPT (the keep_recipe path from batch B).
+                let before = self.preview_edge;
+                ui.add_enabled_ui(!self.busy, |ui| {
+                    egui::ComboBox::from_id_salt("preview_edge")
+                        .selected_text(format!("{}px", self.preview_edge))
+                        .width(64.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.preview_edge, 1280, "1280px 流畅");
+                            ui.selectable_value(&mut self.preview_edge, 2560, "2560px");
+                            ui.selectable_value(&mut self.preview_edge, 4096, "4096px 检查");
+                        })
+                        .response
+                        .on_hover_text("工作预览分辨率：1280 滑杆最流畅；2560/4096 供 1:1 查合焦/噪点（每次调整更慢）");
+                });
+                if self.preview_edge != before
+                    && let Some(p) = self.src_path.clone()
+                {
+                    self.keep_recipe = true; // re-decode, keep the edit
+                    self.open_path(p);
+                }
             });
         });
 
@@ -3847,6 +3883,7 @@ impl eframe::App for AutoshopApp {
                 exp_long_edge: self.exp_long_edge,
                 exp_sharpen: self.exp_sharpen,
                 exp_quality: self.exp_quality,
+                preview_edge: self.preview_edge,
             },
         );
     }
