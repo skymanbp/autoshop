@@ -71,14 +71,17 @@
   图上点击取 5×5 均值（取 base_preview 的 pre-develop 像素）。
   单测：合成偏色像素 → 反解中和（<2% 残差）+ 预览 WB 生效性。
 
-## ④ 拉直（需引擎加旋转）
+## ④ 拉直（✅ 已完成）
 
-- 现状：`recipe.straighten_deg` 只进 XMP（`CropAngle`），引擎不旋转。
-- 引擎：任意角双线性旋转 + 旋转后最大内接轴对齐矩形自动裁（闭式公式），
-  在 `render_to_image` 裁剪前应用；GUI 预览在 `redevelop` 时旋转预览像素
-  （1280px 每次配方变更一次，可接受）。
-- GUI：裁剪节加 -10..10° 滑杆；后续可加“画地平线”手势。
-- 测试：旋转 90°/0° 退化、自动裁边界、内接矩形公式。
+- 引擎：`render::rotate_straighten`（顺时针、双线性、16-bit）+ 公开的
+  `render::inscribed_dims`（闭式最大内接矩形），在两条导出路径的用户裁剪
+  **之前**、orientation 之后应用；GUI `redevelop` 用同一函数旋转预览。
+- 坐标空间约定（重要）：`recipe.crop` 存**拉直后**空间（导出旋转后裁剪，
+  裁剪工具无需映射）；masks/画笔/吸管/region 存**原始**空间——gui.rs 的
+  `view_norm_to_orig / orig_norm_to_view / geom_to_view` 在数据边界换算
+  （共用引擎 inscribed_dims，0° 恒等，roundtrip 有单测）。
+- 已知近似（待真 LR 验证）：angle≠0 且带 crop 时 XMP 的 CropLeft…/CropAngle
+  组合语义与我们的"先转后裁"是否逐像素一致未对照过真实 ACR 边车。
 
 ## ⑤ 仿制图章（像素路径）
 

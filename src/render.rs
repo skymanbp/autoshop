@@ -82,6 +82,14 @@ pub fn render_to_image(
         .ok_or_else(|| anyhow!("pixel buffer size mismatch"))?;
     let mut dynimg = oriented(DynamicImage::ImageRgb16(img), orientation);
 
+    // --- straighten: rotate + auto-crop BEFORE the user crop, in display
+    // space (after orientation) so the slider means what the user sees. The
+    // user crop below is therefore defined on the straightened frame — same
+    // composition order as Lightroom's CropAngle + crop rect.
+    if recipe.straighten_deg != 0.0 {
+        dynimg = rotate_straighten(&dynimg, recipe.straighten_deg);
+    }
+
     // --- crop (normalised [0,1] on the displayed frame) ----------------------
     if let Some(c) = &recipe.crop {
         let (iw, ih) = (dynimg.width() as f32, dynimg.height() as f32);
@@ -132,6 +140,11 @@ pub fn render_baked_to_image(
     let out: ImageBuffer<Rgb<u16>, _> = ImageBuffer::from_raw(w as u32, h as u32, buf)
         .ok_or_else(|| anyhow!("baked pixel buffer size mismatch"))?;
     let mut dynimg = DynamicImage::ImageRgb16(out);
+
+    // Straighten before the user crop — same order as the RAW path.
+    if recipe.straighten_deg != 0.0 {
+        dynimg = rotate_straighten(&dynimg, recipe.straighten_deg);
+    }
 
     // Crop (normalised [0,1]) — orientation is already baked into the source.
     if let Some(c) = &recipe.crop {
@@ -1017,6 +1030,77 @@ fn oriented(img: DynamicImage, o: Orientation) -> DynamicImage {
     }
 }
 
+/// The largest axis-aligned rectangle (same aspect freedom as Lightroom's
+/// auto-constrain) inscribed in a `w`×`h` rectangle rotated by `deg` degrees —
+/// the closed-form solution, so a straightened image never shows black
+/// corners. Public: the GUI shares this exact formula to map interaction
+/// coordinates between the straightened view and the original frame.
+pub fn inscribed_dims(w: f32, h: f32, deg: f32) -> (f32, f32) {
+    let a = deg.abs().to_radians();
+    if w <= 0.0 || h <= 0.0 {
+        return (0.0, 0.0);
+    }
+    if a < 1e-6 {
+        return (w, h);
+    }
+    let (s, c) = (a.sin(), a.cos());
+    let (long, short) = (w.max(h), w.min(h));
+    if short <= 2.0 * s * c * long {
+        // Thin case: the short side limits both dimensions (half-diagonal fit).
+        let x = 0.5 * short;
+        if w >= h { (x / s, x / c) } else { (x / c, x / s) }
+    } else {
+        let cos2 = c * c - s * s;
+        ((w * c - h * s) / cos2, (h * c - w * s) / cos2)
+    }
+}
+
+/// Straighten: rotate the image `deg` degrees CLOCKWISE about its centre
+/// (bilinear resample) and auto-crop to the largest inscribed axis-aligned
+/// rectangle ([`inscribed_dims`]) so no black corners survive. Identity when
+/// `deg` rounds to zero. Works in 16-bit so the export path loses nothing;
+/// the preview's 8-bit input survives the round-trip exactly.
+pub fn rotate_straighten(img: &DynamicImage, deg: f32) -> DynamicImage {
+    if deg.abs() < 1e-3 {
+        return img.clone();
+    }
+    let src = img.to_rgb16();
+    let (w, h) = (src.width() as f32, src.height() as f32);
+    let (cw, ch) = inscribed_dims(w, h, deg);
+    let (ow, oh) = ((cw.floor() as u32).max(1), (ch.floor() as u32).max(1));
+    let rad = deg.to_radians();
+    // Content rotates clockwise ⇒ inverse-map each dest pixel by the
+    // counter-clockwise matrix (y-down screen coords): [c, s; -s, c].
+    let (s, c) = (rad.sin(), rad.cos());
+    let (cx_src, cy_src) = ((w - 1.0) * 0.5, (h - 1.0) * 0.5);
+    let (cx_dst, cy_dst) = ((ow as f32 - 1.0) * 0.5, (oh as f32 - 1.0) * 0.5);
+    let mut out: ImageBuffer<Rgb<u16>, Vec<u16>> = ImageBuffer::new(ow, oh);
+    for (x, y, px) in out.enumerate_pixels_mut() {
+        let (dx, dy) = (x as f32 - cx_dst, y as f32 - cy_dst);
+        let sx = c * dx + s * dy + cx_src;
+        let sy = -s * dx + c * dy + cy_src;
+        // Bilinear sample, clamped to the frame (the inscribed crop keeps
+        // samples in-bounds up to float rounding at the very edge).
+        let x0 = sx.floor().clamp(0.0, w - 1.0);
+        let y0 = sy.floor().clamp(0.0, h - 1.0);
+        let x1 = (x0 + 1.0).min(w - 1.0);
+        let y1 = (y0 + 1.0).min(h - 1.0);
+        let (fx, fy) = ((sx - x0).clamp(0.0, 1.0), (sy - y0).clamp(0.0, 1.0));
+        let p00 = src.get_pixel(x0 as u32, y0 as u32);
+        let p10 = src.get_pixel(x1 as u32, y0 as u32);
+        let p01 = src.get_pixel(x0 as u32, y1 as u32);
+        let p11 = src.get_pixel(x1 as u32, y1 as u32);
+        let mut v = [0u16; 3];
+        for (ch_i, out_v) in v.iter_mut().enumerate() {
+            let top = p00[ch_i] as f32 * (1.0 - fx) + p10[ch_i] as f32 * fx;
+            let bot = p01[ch_i] as f32 * (1.0 - fx) + p11[ch_i] as f32 * fx;
+            *out_v = (top * (1.0 - fy) + bot * fy).round().clamp(0.0, 65535.0) as u16;
+        }
+        *px = Rgb(v);
+    }
+    DynamicImage::ImageRgb16(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1239,6 +1323,43 @@ mod tests {
         // An already-neutral pixel solves to ~as-shot, ~zero tint.
         let (k, tint) = solve_wb_from_neutral([0.5, 0.5, 0.5]);
         assert!((k - 5500.0).abs() < 300.0 && tint.abs() < 2.0, "neutral → ({k:.0},{tint:.1})");
+    }
+
+    #[test]
+    fn straighten_rotation_geometry_and_direction() {
+        // (a) 0° is the identity (dims + pixels untouched).
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(40, 30, image::Rgb([200, 10, 10])));
+        let same = rotate_straighten(&img, 0.0);
+        assert_eq!((same.width(), same.height()), (40, 30));
+
+        // (b) inscribed_dims: identity at 0°, symmetric in ±θ, strictly smaller
+        // than the frame for any real tilt.
+        assert_eq!(inscribed_dims(120.0, 80.0, 0.0), (120.0, 80.0));
+        let (w1, h1) = inscribed_dims(120.0, 80.0, 7.0);
+        let (w2, h2) = inscribed_dims(120.0, 80.0, -7.0);
+        assert!((w1 - w2).abs() < 1e-4 && (h1 - h2).abs() < 1e-4);
+        assert!(w1 < 120.0 && h1 < 80.0 && w1 > 90.0 && h1 > 60.0, "({w1},{h1})");
+
+        // (c) No black corners: an all-white frame stays all-white after any
+        // tilt — the auto-crop must keep every sample inside the source.
+        let white = DynamicImage::ImageRgb8(RgbImage::from_pixel(120, 80, image::Rgb([255, 255, 255])));
+        for deg in [3.0, 7.0, -12.0, 30.0] {
+            let r = rotate_straighten(&white, deg).to_rgb8();
+            let min = r.pixels().flat_map(|p| p.0).min().unwrap();
+            assert!(min >= 250, "black bleed at {deg}°: min channel {min}");
+        }
+
+        // (d) Direction: positive = CLOCKWISE (the recipe contract). A vertical
+        // red|blue split rotated clockwise tilts its divider top-to-the-right,
+        // so just right of centre at the TOP row the red half now covers it.
+        let mut split = RgbImage::new(100, 100);
+        for (x, _y, p) in split.enumerate_pixels_mut() {
+            *p = if x < 50 { image::Rgb([255, 0, 0]) } else { image::Rgb([0, 0, 255]) };
+        }
+        let rot = rotate_straighten(&DynamicImage::ImageRgb8(split), 10.0).to_rgb8();
+        let (rw, _rh) = rot.dimensions();
+        let probe = rot.get_pixel(rw / 2 + 3, 1);
+        assert!(probe[0] > probe[2], "clockwise tilt must move red over top-centre-right: {probe:?}");
     }
 
     #[test]

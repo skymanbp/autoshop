@@ -260,6 +260,83 @@ fn drag_curve_point(pts: &mut [CurvePoint], i: usize, input: u8, output: u8) {
     pts[i].output = output;
 }
 
+// --- straighten coordinate mapping ------------------------------------------
+// When straighten_deg ≠ 0 the After view shows the ROTATED + auto-cropped
+// frame, but recipe masks, the paint canvas, fill/heal masks and base_preview
+// pixels all live in the ORIGINAL frame (the engine applies masks before it
+// rotates; fill/heal edit source pixels). These two maps convert between the
+// spaces at the data boundaries, sharing the engine's own inscribed_dims
+// formula and rotation convention (clockwise-positive, y-down) so GUI and
+// render can never disagree. recipe.crop stays in the straightened space —
+// the export applies the user crop AFTER rotation, so the crop tool needs no
+// mapping. Both are the identity at 0°.
+
+/// Straightened-view normalized point → original-frame normalized point.
+fn view_norm_to_orig(nx: f32, ny: f32, dims: (f32, f32), deg: f32) -> (f32, f32) {
+    if deg == 0.0 {
+        return (nx, ny);
+    }
+    let (w, h) = dims;
+    let (cw, ch) = autoshop::render::inscribed_dims(w, h, deg);
+    let rad = deg.to_radians();
+    let (s, c) = (rad.sin(), rad.cos());
+    let (dx, dy) = ((nx - 0.5) * cw, (ny - 0.5) * ch);
+    // Content was rotated clockwise; undo with the counter-clockwise matrix.
+    let ox = c * dx + s * dy;
+    let oy = -s * dx + c * dy;
+    ((ox / w + 0.5).clamp(0.0, 1.0), (oy / h + 0.5).clamp(0.0, 1.0))
+}
+
+/// Original-frame normalized point → straightened-view normalized point.
+/// NOT clamped: an original point can legitimately fall outside the inscribed
+/// window (the painter clips overlays to the image rect anyway).
+fn orig_norm_to_view(nx: f32, ny: f32, dims: (f32, f32), deg: f32) -> (f32, f32) {
+    if deg == 0.0 {
+        return (nx, ny);
+    }
+    let (w, h) = dims;
+    let (cw, ch) = autoshop::render::inscribed_dims(w, h, deg);
+    let rad = deg.to_radians();
+    let (s, c) = (rad.sin(), rad.cos());
+    let (dx, dy) = ((nx - 0.5) * w, (ny - 0.5) * h);
+    let rx = c * dx - s * dy; // clockwise forward
+    let ry = s * dx + c * dy;
+    (rx / cw.max(1e-3) + 0.5, ry / ch.max(1e-3) + 0.5)
+}
+
+/// A mask geometry mapped from the ORIGINAL frame into the straightened view
+/// for on-screen display (identity at 0°). The radial ellipse is shown as the
+/// bounding box of its transformed corners — display-only, and tight at the
+/// small tilt angles straighten allows.
+fn geom_to_view(geom: &MaskGeometry, dims: (f32, f32), deg: f32) -> MaskGeometry {
+    if deg == 0.0 {
+        return geom.clone();
+    }
+    match *geom {
+        MaskGeometry::Linear { zero_x, zero_y, full_x, full_y } => {
+            let a = orig_norm_to_view(zero_x, zero_y, dims, deg);
+            let b = orig_norm_to_view(full_x, full_y, dims, deg);
+            MaskGeometry::Linear { zero_x: a.0, zero_y: a.1, full_x: b.0, full_y: b.1 }
+        }
+        MaskGeometry::Radial { top, left, bottom, right, feather, roundness, flipped } => {
+            let pts = [
+                orig_norm_to_view(left, top, dims, deg),
+                orig_norm_to_view(right, top, dims, deg),
+                orig_norm_to_view(left, bottom, dims, deg),
+                orig_norm_to_view(right, bottom, dims, deg),
+            ];
+            let (mut l, mut t, mut r, mut b) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for (x, y) in pts {
+                l = l.min(x);
+                t = t.min(y);
+                r = r.max(x);
+                b = b.max(y);
+            }
+            MaskGeometry::Radial { top: t, left: l, bottom: b, right: r, feather, roundness, flipped }
+        }
+    }
+}
+
 /// Two API base URLs are the "same endpoint" ignoring whitespace / a trailing slash.
 /// Used so model ids fetched with the image key are only offered to the analysis
 /// picker when both roles point at the same server.
@@ -930,13 +1007,32 @@ impl AutoshopApp {
 
     /// Re-develop the working preview through the current recipe, and refresh
     /// the live histogram from the developed pixels (same buffer, one pass).
+    /// Straighten runs through the engine's own rotate_straighten so the
+    /// preview shows exactly the geometry the export will produce.
     fn redevelop(&mut self, ctx: &egui::Context) {
         if let Some(base) = &self.base_preview {
-            let after = autoshop::render::develop_preview(base, &self.recipe);
+            let mut after = autoshop::render::develop_preview(base, &self.recipe);
+            if self.recipe.straighten_deg != 0.0 {
+                after = autoshop::render::rotate_straighten(&after, self.recipe.straighten_deg);
+            }
             self.histogram = Some(compute_histogram(&after));
             self.after_tex = Some(ctx.load_texture("after", to_color_image(&after), egui::TextureOptions::LINEAR));
         }
         self.dirty = false;
+    }
+
+    /// The straighten mapping context every interaction boundary needs:
+    /// original preview pixel dims + the current angle.
+    fn straighten_ctx(&self) -> ((f32, f32), f32) {
+        let dims = self
+            .base_preview
+            .as_ref()
+            .map(|b| {
+                let (w, h) = b.dimensions();
+                (w as f32, h as f32)
+            })
+            .unwrap_or((1.0, 1.0));
+        (dims, self.recipe.straighten_deg)
     }
 
     /// Draw the live histogram (R/G/B filled, luma outline) — the tone readout a
@@ -1850,8 +1946,9 @@ impl AutoshopApp {
                 changed |= Self::slider(ui, "Balance", &mut cg.balance, -100.0, 100.0, 0.0);
             });
 
-        // --- 裁剪: recipe.crop is what export + XMP already apply ------------
-        egui::CollapsingHeader::new(section_title("裁剪 · Crop", self.recipe.crop.is_some()))
+        // --- 裁剪 + 拉直: recipe.crop / straighten_deg (export + XMP paths) ---
+        let crop_active = self.recipe.crop.is_some() || self.recipe.straighten_deg != 0.0;
+        egui::CollapsingHeader::new(section_title("裁剪 · Crop", crop_active))
             .id_salt("sec_crop")
             .default_open(false)
             .show(ui, |ui| {
@@ -1878,9 +1975,19 @@ impl AutoshopApp {
                         self.recipe.crop = None;
                     }
                 });
+                // Straighten: rotate + auto-crop (engine rotate_straighten);
+                // the preview shows exactly the export geometry.
+                changed |= Self::slider(
+                    ui,
+                    "拉直 Straighten (°)",
+                    &mut self.recipe.straighten_deg,
+                    -45.0,
+                    45.0,
+                    0.0,
+                );
                 ui.label(
                     egui::RichText::new(
-                        "进入后在图上拖角柄/移动裁剪框；预览、导出与 XMP 一致生效。",
+                        "进入后在图上拖角柄/移动裁剪框；预览、导出与 XMP 一致生效。拉直自动裁掉黑角。",
                     )
                     .weak()
                     .small(),
@@ -2139,12 +2246,14 @@ impl AutoshopApp {
             self.handle_region_select(ui, &resp, xf);
         }
 
-        // Selected mask stays visualised so its sliders have visual feedback.
+        // Selected mask stays visualised so its sliders have visual feedback
+        // (geometry is stored in the original frame → map into the view).
         if !self.crop_mode
             && self.placing_mask.is_none()
             && let Some(m) = self.sel_mask.and_then(|i| self.recipe.masks.get(i))
         {
-            draw_mask_overlay(ui, xf, &m.mask);
+            let (dims, deg) = self.straighten_ctx();
+            draw_mask_overlay(ui, xf, &geom_to_view(&m.mask, dims, deg));
         }
     }
 
@@ -2160,6 +2269,9 @@ impl AutoshopApp {
         }
         let Some(q) = resp.interact_pointer_pos() else { return };
         let (nx, ny) = xf.to_norm(q);
+        // base_preview is the ORIGINAL frame — map out of the straightened view.
+        let ((bw, bh), deg) = self.straighten_ctx();
+        let (nx, ny) = view_norm_to_orig(nx, ny, (bw, bh), deg);
         let px = {
             let Some(base) = &self.base_preview else { return };
             let rgb = base.to_rgb8();
@@ -2211,7 +2323,13 @@ impl AutoshopApp {
             }
         } else if resp.drag_stopped() {
             if let Some((s, e)) = self.region_drag.take() {
-                let (sn, en) = (xf.to_norm(s), xf.to_norm(e));
+                // The region feeds the AI's mask prompt — ORIGINAL frame space.
+                let ((bw, bh), deg) = self.straighten_ctx();
+                let map = |p: egui::Pos2| {
+                    let (nx, ny) = xf.to_norm(p);
+                    view_norm_to_orig(nx, ny, (bw, bh), deg)
+                };
+                let (sn, en) = (map(s), map(e));
                 let (l, r) = (sn.0.min(en.0), sn.0.max(en.0));
                 let (t, b) = (sn.1.min(en.1), sn.1.max(en.1));
                 if r - l > 0.02 && b - t > 0.02 {
@@ -2239,8 +2357,12 @@ impl AutoshopApp {
         if let Some((s, e)) = self.region_drag {
             draw(egui::Rect::from_two_pos(s, e).intersect(rect));
         } else if let Some([l, t, rr, bb]) = self.region {
+            // Stored in the original frame → back into the straightened view.
+            let ((bw, bh), deg) = self.straighten_ctx();
+            let a = orig_norm_to_view(l, t, (bw, bh), deg);
+            let b2 = orig_norm_to_view(rr, bb, (bw, bh), deg);
             draw(
-                egui::Rect::from_min_max(xf.to_screen(l, t), xf.to_screen(rr, bb))
+                egui::Rect::from_min_max(xf.to_screen(a.0, a.1), xf.to_screen(b2.0, b2.1))
                     .intersect(rect),
             );
         }
@@ -2397,14 +2519,21 @@ impl AutoshopApp {
     /// the AI writes, so render + XMP need nothing new.
     fn handle_place_mask(&mut self, ui: &egui::Ui, resp: &egui::Response, xf: ViewXform) {
         let Some((kind, replace)) = self.placing_mask else { return };
+        // Mask geometry lives in the ORIGINAL frame (the engine composites
+        // masks before it straightens) — map pointer positions out of the view.
+        let (dims, deg) = self.straighten_ctx();
         if resp.drag_started()
             && let Some(p) = resp.interact_pointer_pos()
         {
-            self.place_start = Some(xf.to_norm(p));
+            let (nx, ny) = xf.to_norm(p);
+            self.place_start = Some(view_norm_to_orig(nx, ny, dims, deg));
         }
         let Some(s) = self.place_start else { return };
         let Some(p) = resp.interact_pointer_pos() else { return };
-        let e = xf.to_norm(p);
+        let e = {
+            let (nx, ny) = xf.to_norm(p);
+            view_norm_to_orig(nx, ny, dims, deg)
+        };
         let geom = match kind {
             MaskKind::Linear => autoshop::recipe::MaskGeometry::Linear {
                 zero_x: s.0,
@@ -2422,7 +2551,7 @@ impl AutoshopApp {
                 flipped: false,
             },
         };
-        draw_mask_overlay(ui, xf, &geom); // live preview while dragging
+        draw_mask_overlay(ui, xf, &geom_to_view(&geom, dims, deg)); // live preview
         if resp.drag_stopped() {
             match replace {
                 Some(i) if i < self.recipe.masks.len() => self.recipe.masks[i].mask = geom,
@@ -2494,11 +2623,15 @@ impl AutoshopApp {
     /// radius converts display px → canvas px by the current pixel scale.
     fn handle_paint(&mut self, resp: &egui::Response, xf: ViewXform) {
         let brush = self.brush;
+        let (dims, deg) = self.straighten_ctx();
         let Some(m) = self.mask_paint.as_mut() else { return };
         let (mw, mh) = (m.width() as f32, m.height() as f32);
+        // The canvas lives in the ORIGINAL frame (fill/heal edit source
+        // pixels), so pointer positions map out of the straightened view.
         let to_mask = |p: egui::Pos2| {
             let (nx, ny) = xf.to_norm(p);
-            (nx * mw, ny * mh)
+            let (ox, oy) = view_norm_to_orig(nx, ny, dims, deg);
+            (ox * mw, oy * mh)
         };
         let brush_mask = (brush * (xf.uv.width() * mw) / xf.rect.width().max(1.0)).max(1.0);
         if resp.dragged() || resp.drag_started() {
@@ -3311,6 +3444,28 @@ mod tests {
         assert_eq!((pts[0].input, pts[2].input), (0, 255));
         // Invariant after any sequence: inputs strictly increasing.
         assert!(pts.windows(2).all(|w| w[0].input < w[1].input));
+    }
+
+    #[test]
+    fn straighten_view_mapping_roundtrips() {
+        // The two boundary maps must be exact inverses (they share the
+        // engine's inscribed_dims + rotation convention), and 0° must be the
+        // identity so no existing flow changes without a tilt.
+        let dims = (1280.0, 853.0);
+        assert_eq!(view_norm_to_orig(0.31, 0.77, dims, 0.0), (0.31, 0.77));
+        for deg in [2.5f32, -7.0, 12.0] {
+            for (nx, ny) in [(0.5, 0.5), (0.35, 0.65), (0.6, 0.42)] {
+                let (vx, vy) = orig_norm_to_view(nx, ny, dims, deg);
+                let (ox, oy) = view_norm_to_orig(vx, vy, dims, deg);
+                assert!(
+                    (ox - nx).abs() < 1e-3 && (oy - ny).abs() < 1e-3,
+                    "deg {deg}: ({nx},{ny}) → view ({vx},{vy}) → back ({ox},{oy})"
+                );
+            }
+            // The centre is a fixed point at any angle.
+            let (cx, cy) = view_norm_to_orig(0.5, 0.5, dims, deg);
+            assert!((cx - 0.5).abs() < 1e-4 && (cy - 0.5).abs() < 1e-4);
+        }
     }
 
     #[test]
