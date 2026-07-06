@@ -3,7 +3,14 @@
 //! (gpt-image-*), which RE-GENERATES pixels.
 //!
 //! Phase 4 raises the pixel quality of this path ("give GPT higher-level pixels"):
-//!   * **Aspect-correct sizing** — pick 1536×1024 / 1024×1536 / 1024×1024 by
+//!   * **Flexible high-res sizing** — models with arbitrary-size support
+//!     (gpt-image-2: any WIDTHxHEIGHT, edges ×16, ratio ≤3:1, ≤8 294 400 px) get
+//!     the largest aspect-correct size inside `Config::openai_image_max_px`;
+//!     models that reject it fall back to the fixed 1024/1536 enum on the API's
+//!     400, so no model list is hard-coded. For a RAW whose embedded preview is
+//!     smaller than the flexible target, the input is a full-sensor neutral
+//!     develop (sharp real detail in, instead of an upscaled ~1.6 MP preview).
+//!   * **Aspect-correct enum fallback** — 1536×1024 / 1024×1536 / 1024×1024 by
 //!     orientation instead of squashing every photo into a 1:1 square.
 //!   * **Configurable quality tier** (`low|medium|high|auto`, default `high`).
 //!   * **`retouch` composites back onto the source's native preview** — only the
@@ -44,18 +51,29 @@ pub fn reimagine(
 ) -> Result<()> {
     let src = decode::preview_only(raw_path)?;
     let (w, h) = src.dimensions();
-    let size = pick_size(w, h);
-    let (sw, sh) = parse_size(size);
-    let small = src.resize_exact(sw, sh, FilterType::Triangle);
+    let sizes = SizePlan::for_source(cfg, w, h);
+    let (sw, sh) = parse_size(sizes.try_first());
+
+    // Input pixels: when the flexible target outresolves the embedded preview of
+    // a RAW, feed a full-sensor neutral develop instead — real detail in, not an
+    // upscaled ~1.6 MP preview (input quality bounds faithful-region output).
+    let base = if decode::is_raw(raw_path) && sw.max(sh) > w.max(h) {
+        println!("  developing full sensor for a sharp high-res input …");
+        crate::render::render_to_image(raw_path, &crate::recipe::EditRecipe::default(), None)?
+    } else {
+        src
+    };
+    let small = DynamicImage::ImageRgb8(base.resize_exact(sw, sh, FilterType::Lanczos3).to_rgb8());
     let png = encode_png(&small)?;
     println!(
-        "⚠ EXPERIMENTAL generative re-render via {} ({size}, quality={quality} — low-res, lossy, not a master)",
-        cfg.openai_image_model
+        "⚠ EXPERIMENTAL generative re-render via {} ({}, quality={quality} — regenerated pixels, not a master)",
+        cfg.openai_image_model,
+        sizes.try_first(),
     );
-    let result = call_images_edit(cfg, &png, None, prompt, fidelity, size, quality)?;
+    let (result, used) = call_images_edit(cfg, &png, None, prompt, fidelity, &sizes, quality)?;
     pipeline::ensure_parent(out)?;
     std::fs::write(out, result).with_context(|| format!("write {}", out.display()))?;
-    println!("generative -> {} ({size}, generative re-render)", out.display());
+    println!("generative -> {} ({used}, generative re-render)", out.display());
     Ok(())
 }
 
@@ -90,23 +108,27 @@ pub fn retouch(
         decode::preview_only(raw_path)?
     };
     let (bw, bh) = base.dimensions();
-    let size = pick_size(bw, bh);
-    let (sw, sh) = parse_size(size);
+    // A generative tile larger than the base is pointless (it only gets downscaled
+    // back onto it) — cap the flexible budget at the base's own pixel count.
+    let budget = cfg.openai_image_max_px.min(bw.saturating_mul(bh));
+    let sizes = SizePlan::for_budget(bw, bh, budget);
+    let (sw, sh) = parse_size(sizes.try_first());
 
     // API input must be 8-bit (the full-res base is 16-bit). Derive the small
     // image from THIS base so the generated pixels match its look (no seam shift).
-    let small = DynamicImage::ImageRgb8(base.resize_exact(sw, sh, FilterType::Triangle).to_rgb8());
+    let small = DynamicImage::ImageRgb8(base.resize_exact(sw, sh, FilterType::Lanczos3).to_rgb8());
     let png = encode_png(&small)?;
     let mask_img = image::open(mask_path)
         .with_context(|| format!("open mask {}", mask_path.display()))?;
     let mask_png = encode_png(&mask_img.resize_exact(sw, sh, FilterType::Nearest))?;
 
     println!(
-        "⚠ EXPERIMENTAL generative fill via {} ({size}, quality={quality}, base={bw}x{bh} {}; composite)",
+        "⚠ EXPERIMENTAL generative fill via {} ({}, quality={quality}, base={bw}x{bh} {}; composite)",
         cfg.openai_image_model,
+        sizes.try_first(),
         if full_res && raw { "full-res" } else { "preview" }
     );
-    let result = call_images_edit(cfg, &png, Some(&mask_png), prompt, "high", size, quality)?;
+    let (result, _used) = call_images_edit(cfg, &png, Some(&mask_png), prompt, "high", &sizes, quality)?;
 
     // Composite the regenerated region back onto the base. Upscale the generative
     // tile to base dimensions; the user's mask (alpha=0 = regenerate) becomes the
@@ -128,9 +150,68 @@ pub fn retouch(
     Ok(())
 }
 
+/// The output-size request strategy: try the flexible high-res size first (when
+/// the budget allows one), fall back to the universally-supported enum size when
+/// the model 400s it. Carrying both here keeps the retry logic in
+/// [`call_images_edit`] mechanical.
+struct SizePlan {
+    /// Flexible WIDTHxHEIGHT (gpt-image-2-style), when one fits the budget.
+    flexible: Option<String>,
+    /// The fixed enum size every gpt-image model accepts.
+    enum_size: &'static str,
+}
+
+impl SizePlan {
+    fn for_source(cfg: &Config, w: u32, h: u32) -> Self {
+        Self::for_budget(w, h, cfg.openai_image_max_px)
+    }
+
+    fn for_budget(w: u32, h: u32, max_px: u32) -> Self {
+        Self { flexible: flex_size(w, h, max_px), enum_size: pick_size(w, h) }
+    }
+
+    /// The size to request on the first attempt.
+    fn try_first(&self) -> &str {
+        self.flexible.as_deref().unwrap_or(self.enum_size)
+    }
+}
+
+/// Largest flexible output size matching the source aspect, under the documented
+/// gpt-image-2 constraints (verified 2026-07 API docs): both edges multiples of
+/// 16, long edge ≤ 3840, long:short ratio ≤ 3:1, total pixels within
+/// [655 360, 8 294 400] — further capped by the user's `max_px` budget. `None`
+/// when no size satisfies all of that (caller uses the enum size).
+fn flex_size(w: u32, h: u32, max_px: u32) -> Option<String> {
+    const API_MIN_PX: f64 = 655_360.0;
+    const API_MAX_PX: f64 = 8_294_400.0;
+    const MAX_EDGE: f64 = 3840.0;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let budget = (max_px as f64).min(API_MAX_PX);
+    if budget < API_MIN_PX {
+        return None;
+    }
+    let r = (w as f64 / h as f64).clamp(1.0 / 3.0, 3.0);
+    // Largest (ow, oh) with ow/oh = r and ow·oh = budget, then the edge cap.
+    let mut oh = (budget / r).sqrt();
+    let mut ow = r * oh;
+    let scale = (MAX_EDGE / ow.max(oh)).min(1.0);
+    ow *= scale;
+    oh *= scale;
+    // Round DOWN to ×16 — keeps every ≤ constraint satisfied.
+    let ow = ((ow / 16.0).floor() * 16.0) as u32;
+    let oh = ((oh / 16.0).floor() * 16.0) as u32;
+    if ow == 0 || oh == 0 || (ow as f64) * (oh as f64) < API_MIN_PX {
+        return None;
+    }
+    Some(format!("{ow}x{oh}"))
+}
+
 /// Pick the supported gpt-image output size whose aspect best matches the source,
-/// so we stop squashing every photo into a 1:1 square. gpt-image supports exactly
-/// 1024×1024, 1536×1024 (landscape 3:2) and 1024×1536 (portrait 2:3).
+/// so we stop squashing every photo into a 1:1 square. Every gpt-image model
+/// accepts exactly 1024×1024, 1536×1024 (landscape 3:2) and 1024×1536 (portrait
+/// 2:3); newer models additionally take arbitrary sizes (see [`flex_size`]).
 fn pick_size(w: u32, h: u32) -> &'static str {
     if h == 0 {
         return "1024x1024";
@@ -244,27 +325,30 @@ fn part_file(buf: &mut Vec<u8>, name: &str, filename: &str, bytes: &[u8]) {
     buf.extend_from_slice(b"\r\n");
 }
 
-#[allow(clippy::too_many_arguments)]
+/// POST /images/edits, negotiating capability drift instead of hard-coding a
+/// model list. Two parameters are droppable, each at most once, on the API's own
+/// 400 for *that specific parameter*:
+///   * `input_fidelity` — a gpt-image-1.x knob; newer models (gpt-image-2)
+///     reject it (`invalid_input_fidelity_model`).
+///   * the FLEXIBLE `size` — a gpt-image-2 capability; older models reject a
+///     non-enum size, so we retry with the fixed enum size from the [`SizePlan`].
+///
+/// Returns the image bytes and the size actually accepted.
 fn call_images_edit(
     cfg: &Config,
     image_png: &[u8],
     mask_png: Option<&[u8]>,
     prompt: &str,
     fidelity: &str,
-    size: &str,
+    sizes: &SizePlan,
     quality: &str,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, String)> {
     let key = cfg
         .openai_api_key
         .as_ref()
         .ok_or_else(|| anyhow!("OPENAI_API_KEY not set — generative editing needs the OpenAI API"))?;
 
-    // `input_fidelity` is a gpt-image-1.x parameter (keeps the edit recognizably the
-    // same photo). Newer models reject it — e.g. gpt-image-2 returns 400
-    // `invalid_input_fidelity_model`. We can't hard-code which models accept it
-    // (the list drifts), so send it and, if the model rejects *that specific
-    // parameter*, retry once without it instead of failing the whole edit.
-    let build_body = |include_fidelity: bool| -> Vec<u8> {
+    let build_body = |include_fidelity: bool, size: &str| -> Vec<u8> {
         let mut body = Vec::new();
         part_text(&mut body, "model", &cfg.openai_image_model);
         part_text(&mut body, "prompt", prompt);
@@ -283,24 +367,39 @@ fn call_images_edit(
 
     let url = format!("{}/images/edits", cfg.openai_base_url.trim_end_matches('/'));
     let mut include_fidelity = true;
-    let value: serde_json::Value = loop {
-        let body = build_body(include_fidelity);
+    let mut use_flexible = sizes.flexible.is_some();
+    let (value, used_size): (serde_json::Value, String) = loop {
+        let size = if use_flexible {
+            sizes.flexible.as_deref().unwrap_or(sizes.enum_size)
+        } else {
+            sizes.enum_size
+        };
+        let body = build_body(include_fidelity, size);
         let resp = ureq::post(&url)
             .set("Authorization", &format!("Bearer {key}"))
             .set("Content-Type", &format!("multipart/form-data; boundary={BOUNDARY}"))
             .send_bytes(&body);
         match resp {
-            Ok(r) => break r.into_json().context("parse image API response")?,
+            Ok(r) => {
+                break (r.into_json().context("parse image API response")?, size.to_string())
+            }
             Err(ureq::Error::Status(code, r)) => {
                 let b = r.into_string().unwrap_or_default();
-                // Retry once dropping the unsupported param; the guard flips
-                // `include_fidelity` to false so this can fire at most once.
+                // Each guard flips its own flag, so each retry fires at most once.
                 if include_fidelity && b.contains("input_fidelity") {
                     eprintln!(
                         "  note: {} rejected input_fidelity — retrying without it",
                         cfg.openai_image_model
                     );
                     include_fidelity = false;
+                    continue;
+                }
+                if use_flexible && b.contains("size") {
+                    eprintln!(
+                        "  note: {} rejected flexible size {size} — falling back to {}",
+                        cfg.openai_image_model, sizes.enum_size
+                    );
+                    use_flexible = false;
                     continue;
                 }
                 return Err(anyhow!("image API {code}: {b}"));
@@ -318,9 +417,10 @@ fn call_images_edit(
         .and_then(|x| x.get("b64_json"))
         .and_then(|s| s.as_str())
         .ok_or_else(|| anyhow!("no data[0].b64_json in response: {value}"))?;
-    base64::engine::general_purpose::STANDARD
+    let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
-        .context("decode b64_json")
+        .context("decode b64_json")?;
+    Ok((bytes, used_size))
 }
 
 #[cfg(test)]
@@ -341,6 +441,41 @@ mod tests {
         assert_eq!(parse_size("1536x1024"), (1536, 1024));
         assert_eq!(parse_size("1024x1536"), (1024, 1536));
         assert_eq!(parse_size("garbage"), (1024, 1024));
+    }
+
+    #[test]
+    fn flex_size_respects_every_documented_constraint() {
+        // Every produced size must satisfy: edges ×16, long edge ≤3840,
+        // ratio ≤3:1, 655 360 ≤ area ≤ min(budget, 8 294 400).
+        let check = |w: u32, h: u32, budget: u32| -> Option<(u32, u32)> {
+            let s = flex_size(w, h, budget)?;
+            let (ow, oh) = parse_size(&s);
+            assert_eq!(ow % 16, 0, "{s}: width ×16");
+            assert_eq!(oh % 16, 0, "{s}: height ×16");
+            assert!(ow.max(oh) <= 3840, "{s}: long edge");
+            assert!(ow.max(oh) as f64 / ow.min(oh) as f64 <= 3.0 + 1e-6, "{s}: ratio");
+            let area = ow as u64 * oh as u64;
+            assert!(area >= 655_360, "{s}: area ≥ API min");
+            assert!(area <= (budget as u64).min(8_294_400), "{s}: area ≤ budget");
+            Some((ow, oh))
+        };
+        // 3:2 landscape at the full budget → ~8.2 MP, 5× the 1536×1024 enum.
+        let (ow, oh) = check(6000, 4000, u32::MAX).unwrap();
+        assert!(ow as u64 * oh as u64 > 8_000_000, "full budget should near the API max");
+        assert!(ow > oh, "landscape stays landscape");
+        // Portrait mirrors it.
+        let (pw, ph) = check(4000, 6000, u32::MAX).unwrap();
+        assert_eq!((pw, ph), (oh, ow));
+        // Square hits the max exactly (2880² = 8 294 400).
+        assert_eq!(flex_size(4000, 4000, u32::MAX).as_deref(), Some("2880x2880"));
+        // Extreme pano is clamped to 3:1 and the 3840 edge.
+        check(12_000, 3_000, u32::MAX).unwrap();
+        // A tighter budget is honoured.
+        let (bw, bh) = check(6000, 4000, 2_000_000).unwrap();
+        assert!((bw as u64 * bh as u64) <= 2_000_000);
+        // Below the API minimum → no flexible size (enum fallback).
+        assert_eq!(flex_size(6000, 4000, 100_000), None);
+        assert_eq!(flex_size(0, 4000, u32::MAX), None);
     }
 
     #[test]

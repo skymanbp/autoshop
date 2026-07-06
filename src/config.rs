@@ -67,6 +67,12 @@ pub struct Config {
     pub openai_image_model: String,
     /// Output quality tier for generative edits: low | medium | high | auto.
     pub openai_image_quality: String,
+    /// Pixel budget for FLEXIBLE-size generative output. gpt-image-2 accepts any
+    /// WIDTHxHEIGHT (edges ×16, ratio ≤3:1, ≤8 294 400 px total — the API max);
+    /// cost scales with pixels, so lower this to spend less per image. Models
+    /// without flexible sizing 400 the request and we fall back to the fixed
+    /// 1024/1536 enum automatically.
+    pub openai_image_max_px: u32,
 
     // --- analysis role: the verifier (oauth = claude CLI, or api = OpenAI) -----
     /// `"oauth"` (default; the `claude` CLI) or `"api"` (OpenAI-compatible chat).
@@ -124,6 +130,9 @@ impl Config {
                 "gpt-image-1.5",
             ),
             openai_image_quality: nonempty("AUTOSHOP_IMAGE_QUALITY").unwrap_or_else(|| "high".to_string()),
+            openai_image_max_px: nonempty("AUTOSHOP_IMAGE_MAX_PX")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(8_294_400),
 
             analysis_provider: pick(
                 &local.analysis_provider,
