@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui::load::SizedTexture;
 
-use autoshop::recipe::{EditRecipe, Hsl, ColorGrade};
+use autoshop::recipe::{ColorGrade, EditRecipe, Hsl, MaskGeometry};
 use image::GenericImageView;
 
 /// How the preview area is laid out. `AfterOnly` gives the edit the whole
@@ -153,6 +153,35 @@ fn photo_file_dialog() -> Option<PathBuf> {
     rfd::FileDialog::new().add_filter("Photos", &PHOTO_EXTS).pick_file()
 }
 
+/// Visualise a mask geometry on the image: linear = the zero→full vector with
+/// end bars (solid = full-effect side); radial = the ellipse outline. Clipped
+/// to the image rect by the painter.
+fn draw_mask_overlay(ui: &egui::Ui, xf: ViewXform, geom: &MaskGeometry) {
+    let p = ui.painter_at(xf.rect);
+    let stroke = egui::Stroke::new(2.0, ACCENT);
+    match geom {
+        MaskGeometry::Linear { zero_x, zero_y, full_x, full_y } => {
+            let a = xf.to_screen(*zero_x, *zero_y);
+            let b = xf.to_screen(*full_x, *full_y);
+            p.line_segment([a, b], stroke);
+            let v = b - a;
+            let len = v.length().max(1.0);
+            let n = egui::vec2(-v.y / len, v.x / len) * 28.0;
+            p.line_segment([a - n, a + n], egui::Stroke::new(1.0, ACCENT));
+            p.line_segment([b - n, b + n], stroke);
+            p.circle_filled(b, 4.0, ACCENT); // full-effect end
+            p.circle_stroke(a, 4.0, stroke); // untouched end
+        }
+        MaskGeometry::Radial { top, left, bottom, right, .. } => {
+            let c = xf.to_screen((left + right) / 2.0, (top + bottom) / 2.0);
+            let rx = (xf.to_screen(*right, 0.0).x - xf.to_screen(*left, 0.0).x).abs() / 2.0;
+            let ry = (xf.to_screen(0.0, *bottom).y - xf.to_screen(0.0, *top).y).abs() / 2.0;
+            p.add(egui::Shape::ellipse_stroke(c, egui::vec2(rx, ry), stroke));
+            p.circle_filled(c, 3.0, ACCENT);
+        }
+    }
+}
+
 /// Scale `tex_size` to fit a `max_w` × `avail_y` box (both dimensions — width
 /// alone lets a portrait overflow the panel), never upscaling past 4×.
 fn fit_in(tex_size: egui::Vec2, max_w: f32, avail_y: f32) -> egui::Vec2 {
@@ -254,6 +283,64 @@ struct AutoshopApp {
     toasts: Vec<Toast>,                    // transient corner notifications
     histogram: Option<Vec<[f32; 4]>>,      // live RGB+luma histogram of the After preview
     last_title: String,                    // window title cache (send only on change)
+    // --- zoom / pan (per-photo, reset on open) ---
+    zoom: f32,                             // 1.0 = fit; up to 12×
+    pan: egui::Vec2,                       // visible-window centre in crop-window coords
+    // --- crop tool ---
+    crop_mode: bool,                       // the crop overlay is active on the After image
+    crop_aspect: usize,                    // index into CROP_ASPECTS
+    crop_drag: Option<(u8, egui::Pos2, [f32; 4])>, // (handle, drag start, crop at start)
+    // --- manual local adjustments (masks) ---
+    sel_mask: Option<usize>,               // selected recipe.masks index (overlay + sliders)
+    placing_mask: Option<(MaskKind, Option<usize>)>, // next image drag defines a mask (replace idx)
+    place_start: Option<(f32, f32)>,       // placement drag origin, full-frame normalized
+}
+
+/// The two mask geometries a user can place by dragging.
+#[derive(Clone, Copy, PartialEq)]
+enum MaskKind {
+    Linear,
+    Radial,
+}
+
+/// Crop aspect presets. `None` = free; `Some(r)` = width/height in PIXELS
+/// (0.0 is the "original" sentinel, resolved against the photo at drag time).
+const CROP_ASPECTS: [(&str, Option<f32>); 7] = [
+    ("自由", None),
+    ("原始", Some(0.0)),
+    ("1:1", Some(1.0)),
+    ("3:2", Some(1.5)),
+    ("2:3", Some(2.0 / 3.0)),
+    ("16:9", Some(16.0 / 9.0)),
+    ("9:16", Some(9.0 / 16.0)),
+];
+
+/// Screen ⇄ full-frame-normalized mapping through the visible uv window
+/// (committed crop × zoom/pan). ALL image-space state — regions, mask
+/// geometry, crop, the paint canvas — lives in full-frame normalized
+/// coordinates, so every interaction handler maps through this one struct and
+/// zoom/crop can never silently break any of them.
+#[derive(Clone, Copy)]
+struct ViewXform {
+    rect: egui::Rect, // where the (visible part of the) image is drawn
+    uv: egui::Rect,   // which full-frame region is visible (texture uv)
+}
+
+impl ViewXform {
+    fn to_norm(self, p: egui::Pos2) -> (f32, f32) {
+        let fx = ((p.x - self.rect.min.x) / self.rect.width().max(1.0)).clamp(0.0, 1.0);
+        let fy = ((p.y - self.rect.min.y) / self.rect.height().max(1.0)).clamp(0.0, 1.0);
+        (self.uv.min.x + fx * self.uv.width(), self.uv.min.y + fy * self.uv.height())
+    }
+
+    fn to_screen(self, nx: f32, ny: f32) -> egui::Pos2 {
+        egui::pos2(
+            self.rect.min.x
+                + (nx - self.uv.min.x) / self.uv.width().max(1e-6) * self.rect.width(),
+            self.rect.min.y
+                + (ny - self.uv.min.y) / self.uv.height().max(1e-6) * self.rect.height(),
+        )
+    }
 }
 
 impl Default for AutoshopApp {
@@ -308,6 +395,14 @@ impl Default for AutoshopApp {
             toasts: Vec::new(),
             histogram: None,
             last_title: String::new(),
+            zoom: 1.0,
+            pan: egui::vec2(0.5, 0.5),
+            crop_mode: false,
+            crop_aspect: 0,
+            crop_drag: None,
+            sel_mask: None,
+            placing_mask: None,
+            place_start: None,
         }
     }
 }
@@ -954,6 +1049,14 @@ impl AutoshopApp {
                         self.region = None; // and a fresh local-edit selection
                         self.region_drag = None;
                         self.last_generated = None; // a fit target belongs to ONE photo
+                        // View + tool state is per-photo.
+                        self.zoom = 1.0;
+                        self.pan = egui::vec2(0.5, 0.5);
+                        self.crop_mode = false;
+                        self.crop_drag = None;
+                        self.sel_mask = None;
+                        self.placing_mask = None;
+                        self.place_start = None;
                         self.verdict = None;
                         self.rationale.clear();
                         self.dirty = true; // render the (neutral) after
@@ -1349,53 +1452,303 @@ impl AutoshopApp {
                 changed |= Self::slider(ui, "Balance", &mut cg.balance, -100.0, 100.0, 0.0);
             });
 
+        // --- 裁剪: recipe.crop is what export + XMP already apply ------------
+        egui::CollapsingHeader::new(section_title("裁剪 · Crop", self.recipe.crop.is_some()))
+            .id_salt("sec_crop")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let label = if self.crop_mode { "✅ 完成" } else { "⛶ 进入裁剪" };
+                    if ui.button(label).clicked() {
+                        self.crop_mode = !self.crop_mode;
+                        if self.crop_mode {
+                            // One tool at a time on the canvas.
+                            self.paint_mode = false;
+                            self.placing_mask = None;
+                        }
+                    }
+                    egui::ComboBox::from_id_salt("crop_aspect")
+                        .selected_text(CROP_ASPECTS[self.crop_aspect].0)
+                        .width(70.0)
+                        .show_ui(ui, |ui| {
+                            for (i, (name, _)) in CROP_ASPECTS.iter().enumerate() {
+                                ui.selectable_value(&mut self.crop_aspect, i, *name);
+                            }
+                        });
+                    if ui.button("清除").clicked() {
+                        self.recipe.crop = None;
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "进入后在图上拖角柄/移动裁剪框；预览、导出与 XMP 一致生效。",
+                    )
+                    .weak()
+                    .small(),
+                );
+            });
+
+        // --- 局部调整: manual masks — the SAME recipe.masks the AI writes -----
+        let n_masks = self.recipe.masks.len();
+        egui::CollapsingHeader::new(section_title(
+            &format!("局部调整 · Local Masks ({n_masks})"),
+            n_masks > 0,
+        ))
+        .id_salt("sec_local")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("＋ 线性渐变").on_hover_text("在图上拖拽：起点=不受影响侧，终点=完全生效侧").clicked() {
+                    self.placing_mask = Some((MaskKind::Linear, None));
+                    self.paint_mode = false;
+                    self.crop_mode = false;
+                    self.status = "在图上拖拽画出线性渐变（起点不受影响 → 终点完全生效）".into();
+                }
+                if ui.button("＋ 径向").on_hover_text("在图上拖拽画出椭圆范围").clicked() {
+                    self.placing_mask = Some((MaskKind::Radial, None));
+                    self.paint_mode = false;
+                    self.crop_mode = false;
+                    self.status = "在图上拖拽画出径向（椭圆）范围".into();
+                }
+            });
+            // Mask list: click to select (shows overlay + sliders), 🗑 deletes.
+            let mut delete: Option<usize> = None;
+            for i in 0..n_masks {
+                ui.horizontal(|ui| {
+                    let m = &self.recipe.masks[i];
+                    let kind = match m.mask {
+                        MaskGeometry::Linear { .. } => "线性",
+                        MaskGeometry::Radial { .. } => "径向",
+                    };
+                    let label = format!("{} · {}", if m.name.is_empty() { "mask" } else { &m.name }, kind);
+                    if ui.selectable_label(self.sel_mask == Some(i), label).clicked() {
+                        self.sel_mask = if self.sel_mask == Some(i) { None } else { Some(i) };
+                    }
+                    if ui.small_button("🗑").clicked() {
+                        delete = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = delete {
+                self.recipe.masks.remove(i);
+                self.sel_mask = match self.sel_mask {
+                    Some(s) if s == i => None,
+                    Some(s) if s > i => Some(s - 1),
+                    other => other,
+                };
+                changed = true;
+            }
+            // Selected mask: its full slider set.
+            if let Some(i) = self.sel_mask.filter(|&i| i < self.recipe.masks.len()) {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let m = &mut self.recipe.masks[i];
+                    ui.add(egui::TextEdit::singleline(&mut m.name).desired_width(110.0).hint_text("名称"));
+                    let kind = match m.mask {
+                        MaskGeometry::Linear { .. } => MaskKind::Linear,
+                        MaskGeometry::Radial { .. } => MaskKind::Radial,
+                    };
+                    if ui.small_button("↻ 重画").on_hover_text("在图上重新拖拽这个 mask 的范围").clicked() {
+                        self.placing_mask = Some((kind, Some(i)));
+                        self.paint_mode = false;
+                        self.crop_mode = false;
+                    }
+                    let m = &mut self.recipe.masks[i];
+                    ui.checkbox(&mut m.inverted, "反转");
+                });
+                let m = &mut self.recipe.masks[i];
+                changed |= Self::slider(ui, "Amount", &mut m.amount, 0.0, 1.0, 1.0);
+                changed |= Self::slider(ui, "Exposure", &mut m.exposure_ev, -5.0, 5.0, 0.0);
+                changed |= Self::slider(ui, "Contrast", &mut m.contrast, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, "Highlights", &mut m.highlights, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, "Shadows", &mut m.shadows, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, "Whites", &mut m.whites, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, "Blacks", &mut m.blacks, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, "Saturation", &mut m.saturation, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, "Noise Red.", &mut m.noise_reduction, 0.0, 100.0, 0.0);
+                // These serialise to the XMP but the in-app preview doesn't
+                // render them yet (documented engine scope) — honest label.
+                egui::CollapsingHeader::new("更多（仅 XMP/Lightroom 生效）")
+                    .id_salt("sec_local_xmp")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        let m = &mut self.recipe.masks[i];
+                        changed |= Self::slider(ui, "Clarity", &mut m.clarity, -100.0, 100.0, 0.0);
+                        changed |= Self::slider(ui, "Dehaze", &mut m.dehaze, -100.0, 100.0, 0.0);
+                        changed |= Self::slider(ui, "Texture", &mut m.texture, -100.0, 100.0, 0.0);
+                        changed |= Self::slider(ui, "Temp", &mut m.temperature, -100.0, 100.0, 0.0);
+                        changed |= Self::slider(ui, "Tint", &mut m.tint, -100.0, 100.0, 0.0);
+                    });
+            } else if n_masks == 0 {
+                ui.label(
+                    egui::RichText::new("像 Lightroom 的局部调整：加一个渐变压暗天空、径向提亮主体。AI Analyze 也会写到同一列表。")
+                        .weak()
+                        .small(),
+                );
+            }
+        });
+
         if changed {
             self.recipe.clamp();
             self.dirty = true;
         }
     }
 
-    /// The After image with its interaction layers (paint mask / box-select),
-    /// or the SOURCE flashed in the same rect while `comparing` (B held) — with
-    /// the handlers paused, since their target isn't on screen.
+    /// The visible full-frame uv window: committed crop (shown cropped, like
+    /// Lightroom — except while the crop tool is open, which needs the full
+    /// frame) narrowed by zoom/pan. `pan` is stored in crop-window coords and
+    /// re-clamped here so edge panning never accumulates out of range.
+    fn view_uv(&mut self) -> egui::Rect {
+        let win = match (&self.recipe.crop, self.crop_mode) {
+            (Some(c), false) => egui::Rect::from_min_max(
+                egui::pos2(c.left.min(c.right), c.top.min(c.bottom)),
+                egui::pos2(c.right.max(c.left), c.bottom.max(c.top)),
+            ),
+            _ => egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        };
+        let half = 0.5 / self.zoom.clamp(1.0, 12.0);
+        self.pan = egui::vec2(
+            self.pan.x.clamp(half, 1.0 - half),
+            self.pan.y.clamp(half, 1.0 - half),
+        );
+        egui::Rect::from_min_max(
+            egui::pos2(
+                win.min.x + (self.pan.x - half) * win.width(),
+                win.min.y + (self.pan.y - half) * win.height(),
+            ),
+            egui::pos2(
+                win.min.x + (self.pan.x + half) * win.width(),
+                win.min.y + (self.pan.y + half) * win.height(),
+            ),
+        )
+    }
+
+    /// The After image with its interaction layers — crop tool, mask placement,
+    /// paint canvas, box-select — or the SOURCE flashed in the same rect while
+    /// `comparing` (B held). Scroll zooms to the cursor; middle-drag or
+    /// Space+drag pans; all image-space handlers map through [`ViewXform`].
     fn after_view(&mut self, ui: &mut egui::Ui, max_w: f32, avail_y: f32, comparing: bool) {
+        let tex = if comparing { self.before_tex.as_ref() } else { self.after_tex.as_ref() };
+        let Some((id, tex_size)) = tex.map(|t| (t.id(), t.size_vec2())) else {
+            ui.label(egui::RichText::new("…").weak());
+            return;
+        };
+
+        let uv = self.view_uv();
+        // Display size fits the VISIBLE window's aspect (in image pixels).
+        let vis_px = egui::vec2(uv.width() * tex_size.x, uv.height() * tex_size.y);
+        let disp = fit_in(vis_px, max_w, avail_y);
+        let scale = disp.x / vis_px.x.max(1.0); // display px per image px
+
+        // Caption row: mode hint left, zoom readout + Fit / 1:1 right.
         let hint = if comparing {
             "Before (source) — 松开 B 回到编辑"
+        } else if self.crop_mode {
+            "裁剪 — 拖角柄调整，框内拖动移动"
+        } else if self.placing_mask.is_some() {
+            "局部调整 — 在图上拖拽画出渐变范围"
         } else if self.paint_mode {
-            "After (edit) — paint over the area to fill / heal"
+            "After — paint over the area to fill / heal"
         } else {
-            "After (edit) — drag a box to target a local edit · 按住 B 看原图"
+            "After — 拖框=局部AI · 滚轮缩放 · 空格/中键平移 · 按住B对比"
         };
-        ui.label(egui::RichText::new(hint).weak());
-        let tex = if comparing { self.before_tex.as_ref() } else { self.after_tex.as_ref() };
-        if let Some((id, size)) = tex.map(|t| (t.id(), t.size_vec2())) {
-            let resp = ui.add(
-                egui::Image::new(SizedTexture::new(id, size))
-                    .fit_to_exact_size(fit_in(size, max_w, avail_y))
-                    .sense(egui::Sense::click_and_drag()),
-            );
-            let rect = resp.rect;
-            if comparing {
-                return;
-            }
-            if self.paint_mode {
-                self.handle_paint(&resp, rect);
-                self.ensure_mask_tex(ui.ctx());
-                if let Some(t) = &self.mask_tex {
-                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                    ui.painter().image(t.id(), rect, uv, egui::Color32::WHITE);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(hint).weak().small());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("1:1").on_hover_text("预览像素 1:1（双击图片可切换）").clicked() {
+                    self.zoom = (vis_px.x * self.zoom / disp.x).max(1.0);
                 }
-            } else {
-                self.handle_region_select(ui, &resp, rect);
+                if ui.small_button("Fit").clicked() {
+                    self.zoom = 1.0;
+                    self.pan = egui::vec2(0.5, 0.5);
+                }
+                ui.label(egui::RichText::new(format!("{:.0}%", scale * 100.0)).weak().small());
+            });
+        });
+
+        let (rect, resp) = ui.allocate_exact_size(disp, egui::Sense::click_and_drag());
+        ui.painter_at(rect).image(id, rect, uv, egui::Color32::WHITE);
+        let xf = ViewXform { rect, uv };
+
+        // --- zoom to cursor (scroll) -----------------------------------------
+        if resp.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll.abs() > 0.1
+                && let Some(p) = resp.hover_pos()
+            {
+                let half = 0.5 / self.zoom;
+                let (fx, fy) = (
+                    ((p.x - rect.min.x) / rect.width().max(1.0)).clamp(0.0, 1.0),
+                    ((p.y - rect.min.y) / rect.height().max(1.0)).clamp(0.0, 1.0),
+                );
+                // Cursor's point in crop-window coords, kept stationary across the zoom.
+                let q = egui::vec2(
+                    self.pan.x - half + fx * 2.0 * half,
+                    self.pan.y - half + fy * 2.0 * half,
+                );
+                self.zoom = (self.zoom * (scroll * 0.003).exp()).clamp(1.0, 12.0);
+                let nh = 0.5 / self.zoom;
+                self.pan = q - egui::vec2((fx - 0.5) * 2.0 * nh, (fy - 0.5) * 2.0 * nh);
             }
+        }
+        // Double-click toggles fit ↔ 1:1 (preview pixels).
+        if resp.double_clicked() {
+            if self.zoom > 1.01 {
+                self.zoom = 1.0;
+                self.pan = egui::vec2(0.5, 0.5);
+            } else {
+                self.zoom = (vis_px.x / disp.x).max(1.0);
+            }
+        }
+
+        // --- pan: middle-drag, or Space + left-drag (the Photoshop gesture) ---
+        let space = ui.input(|i| i.key_down(egui::Key::Space));
+        let panning = resp.dragged_by(egui::PointerButton::Middle)
+            || (space && resp.dragged_by(egui::PointerButton::Primary));
+        if panning {
+            let d = resp.drag_delta();
+            let ext = 1.0 / self.zoom; // visible extent in crop-window coords
+            self.pan -= egui::vec2(
+                d.x / rect.width().max(1.0) * ext,
+                d.y / rect.height().max(1.0) * ext,
+            );
+        }
+
+        if comparing || panning {
+            return; // tools pause while comparing / panning
+        }
+
+        // --- tool dispatch (one active interaction at a time) -----------------
+        if self.crop_mode {
+            self.handle_crop(ui, &resp, xf, tex_size);
+        } else if self.placing_mask.is_some() {
+            self.handle_place_mask(ui, &resp, xf);
+        } else if self.paint_mode {
+            self.handle_paint(&resp, xf);
+            self.ensure_mask_tex(ui.ctx());
+            if let Some(t) = &self.mask_tex {
+                ui.painter_at(rect).image(t.id(), rect, uv, egui::Color32::WHITE);
+            }
+        } else {
+            self.handle_region_select(ui, &resp, xf);
+        }
+
+        // Selected mask stays visualised so its sliders have visual feedback.
+        if !self.crop_mode
+            && self.placing_mask.is_none()
+            && let Some(m) = self.sel_mask.and_then(|i| self.recipe.masks.get(i))
+        {
+            draw_mask_overlay(ui, xf, &m.mask);
         }
     }
 
     /// Box-select on the After image: drag a rectangle to target a local edit;
     /// the normalized box is folded into the AI direction so it masks exactly
     /// there (mirrors the web region→mask prompt). A plain click — or a tiny
-    /// drag — clears the selection.
-    fn handle_region_select(&mut self, ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect) {
+    /// drag — clears the selection. Coordinates are full-frame normalized (the
+    /// AI mask space), mapped through the view transform.
+    fn handle_region_select(&mut self, ui: &egui::Ui, resp: &egui::Response, xf: ViewXform) {
+        let rect = xf.rect;
         if resp.drag_started() {
             if let Some(p) = resp.interact_pointer_pos() {
                 self.region_drag = Some((p, p));
@@ -1406,10 +1759,9 @@ impl AutoshopApp {
             }
         } else if resp.drag_stopped() {
             if let Some((s, e)) = self.region_drag.take() {
-                let nx = |x: f32| ((x - rect.min.x) / rect.width().max(1.0)).clamp(0.0, 1.0);
-                let ny = |y: f32| ((y - rect.min.y) / rect.height().max(1.0)).clamp(0.0, 1.0);
-                let (l, r) = (nx(s.x).min(nx(e.x)), nx(s.x).max(nx(e.x)));
-                let (t, b) = (ny(s.y).min(ny(e.y)), ny(s.y).max(ny(e.y)));
+                let (sn, en) = (xf.to_norm(s), xf.to_norm(e));
+                let (l, r) = (sn.0.min(en.0), sn.0.max(en.0));
+                let (t, b) = (sn.1.min(en.1), sn.1.max(en.1));
                 if r - l > 0.02 && b - t > 0.02 {
                     self.region = Some([l, t, r, b]);
                     self.status = format!(
@@ -1435,10 +1787,207 @@ impl AutoshopApp {
         if let Some((s, e)) = self.region_drag {
             draw(egui::Rect::from_two_pos(s, e).intersect(rect));
         } else if let Some([l, t, rr, bb]) = self.region {
-            draw(egui::Rect::from_min_max(
-                egui::pos2(rect.min.x + l * rect.width(), rect.min.y + t * rect.height()),
-                egui::pos2(rect.min.x + rr * rect.width(), rect.min.y + bb * rect.height()),
-            ));
+            draw(
+                egui::Rect::from_min_max(xf.to_screen(l, t), xf.to_screen(rr, bb))
+                    .intersect(rect),
+            );
+        }
+    }
+
+    /// The interactive crop overlay: darkened surround, thirds grid, four
+    /// corner handles (aspect-constrained) and move-inside. The crop lives in
+    /// `recipe.crop` (full-frame normalized) — exactly what the export render
+    /// and the XMP already apply, so the tool adds no new data path.
+    fn handle_crop(
+        &mut self,
+        ui: &egui::Ui,
+        resp: &egui::Response,
+        xf: ViewXform,
+        tex_size: egui::Vec2,
+    ) {
+        use autoshop::recipe::Crop;
+        let cur = self
+            .recipe
+            .crop
+            .map(|c| [c.left, c.top, c.right, c.bottom])
+            .unwrap_or([0.0, 0.0, 1.0, 1.0]);
+
+        // Pixel aspect ratio (w/h) requested by the preset; "原始" resolves here.
+        let aspect = CROP_ASPECTS[self.crop_aspect.min(CROP_ASPECTS.len() - 1)]
+            .1
+            .map(|r| if r == 0.0 { tex_size.x / tex_size.y.max(1.0) } else { r });
+
+        // Handle order: 0=TL 1=TR 2=BL 3=BR, 4=move (inside).
+        let corner_pos = |c: &[f32; 4], k: u8| match k {
+            0 => xf.to_screen(c[0], c[1]),
+            1 => xf.to_screen(c[2], c[1]),
+            2 => xf.to_screen(c[0], c[3]),
+            _ => xf.to_screen(c[2], c[3]),
+        };
+        if resp.drag_started()
+            && let Some(p) = resp.interact_pointer_pos()
+        {
+            const HIT: f32 = 12.0;
+            let handle = (0..4)
+                .find(|&k| corner_pos(&cur, k).distance(p) <= HIT)
+                .or_else(|| {
+                    let r = egui::Rect::from_min_max(
+                        xf.to_screen(cur[0], cur[1]),
+                        xf.to_screen(cur[2], cur[3]),
+                    );
+                    r.contains(p).then_some(4)
+                });
+            if let Some(h) = handle {
+                self.crop_drag = Some((h, p, cur));
+            }
+        }
+        if resp.dragged()
+            && let (Some((h, start, orig)), Some(p)) = (self.crop_drag, resp.interact_pointer_pos())
+        {
+            let (sn, pn) = (xf.to_norm(start), xf.to_norm(p));
+            let (dx, dy) = (pn.0 - sn.0, pn.1 - sn.1);
+            let c: [f32; 4];
+            if h == 4 {
+                // Move: shift, clamped so the rect stays inside the frame.
+                let (w, hg) = (orig[2] - orig[0], orig[3] - orig[1]);
+                let nl = (orig[0] + dx).clamp(0.0, 1.0 - w);
+                let nt = (orig[1] + dy).clamp(0.0, 1.0 - hg);
+                c = [nl, nt, nl + w, nt + hg];
+            } else {
+                // Corner: drag it, anchored at the opposite corner.
+                let (ax, ay) = match h {
+                    0 => (orig[2], orig[3]),
+                    1 => (orig[0], orig[3]),
+                    2 => (orig[2], orig[1]),
+                    _ => (orig[0], orig[1]),
+                };
+                let mut x = (match h {
+                    0 | 2 => orig[0] + dx,
+                    _ => orig[2] + dx,
+                })
+                .clamp(0.0, 1.0);
+                let mut y = (match h {
+                    0 | 1 => orig[1] + dy,
+                    _ => orig[3] + dy,
+                })
+                .clamp(0.0, 1.0);
+                if let Some(r_px) = aspect {
+                    // Width drives; height follows the pixel ratio; if the
+                    // derived height leaves the frame, shrink both to fit.
+                    let top_corner = h == 0 || h == 1;
+                    let mut w_n = (x - ax).abs();
+                    let mut h_n = w_n * tex_size.x / (r_px * tex_size.y.max(1.0));
+                    let room = if top_corner { ay } else { 1.0 - ay };
+                    if h_n > room {
+                        h_n = room;
+                        w_n = h_n * r_px * tex_size.y / tex_size.x.max(1.0);
+                    }
+                    x = if x >= ax { ax + w_n } else { ax - w_n };
+                    y = if top_corner { ay - h_n } else { ay + h_n };
+                }
+                c = [x.min(ax), y.min(ay), x.max(ax), y.max(ay)];
+            }
+            if c[2] - c[0] >= 0.05 && c[3] - c[1] >= 0.05 {
+                self.recipe.crop =
+                    Some(Crop { left: c[0], top: c[1], right: c[2], bottom: c[3] });
+            }
+        }
+        if resp.drag_stopped() {
+            self.crop_drag = None;
+        }
+
+        // --- overlay: darkened surround + thirds + handles --------------------
+        let c = self
+            .recipe
+            .crop
+            .map(|c| [c.left, c.top, c.right, c.bottom])
+            .unwrap_or([0.0, 0.0, 1.0, 1.0]);
+        let p = ui.painter_at(xf.rect);
+        let r = egui::Rect::from_min_max(xf.to_screen(c[0], c[1]), xf.to_screen(c[2], c[3]))
+            .intersect(xf.rect);
+        let dark = egui::Color32::from_black_alpha(140);
+        let full = xf.rect;
+        for shade in [
+            egui::Rect::from_min_max(full.min, egui::pos2(full.max.x, r.min.y)), // top
+            egui::Rect::from_min_max(egui::pos2(full.min.x, r.max.y), full.max), // bottom
+            egui::Rect::from_min_max(egui::pos2(full.min.x, r.min.y), egui::pos2(r.min.x, r.max.y)),
+            egui::Rect::from_min_max(egui::pos2(r.max.x, r.min.y), egui::pos2(full.max.x, r.max.y)),
+        ] {
+            if shade.width() > 0.0 && shade.height() > 0.0 {
+                p.rect_filled(shade, 0.0, dark);
+            }
+        }
+        let grid = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(70));
+        for i in 1..3 {
+            let t = i as f32 / 3.0;
+            p.line_segment(
+                [egui::pos2(r.min.x + t * r.width(), r.min.y), egui::pos2(r.min.x + t * r.width(), r.max.y)],
+                grid,
+            );
+            p.line_segment(
+                [egui::pos2(r.min.x, r.min.y + t * r.height()), egui::pos2(r.max.x, r.min.y + t * r.height())],
+                grid,
+            );
+        }
+        p.rect_stroke(r, 0.0, egui::Stroke::new(1.5, egui::Color32::WHITE));
+        for k in 0..4u8 {
+            p.rect_filled(
+                egui::Rect::from_center_size(corner_pos(&c, k), egui::vec2(9.0, 9.0)),
+                1.0,
+                egui::Color32::WHITE,
+            );
+        }
+    }
+
+    /// Place (or re-draw) a manual local-adjustment mask by dragging: the drag
+    /// vector defines a linear gradient (start = untouched side) or the
+    /// bounding box of a radial. Commits into `recipe.masks` — the SAME field
+    /// the AI writes, so render + XMP need nothing new.
+    fn handle_place_mask(&mut self, ui: &egui::Ui, resp: &egui::Response, xf: ViewXform) {
+        let Some((kind, replace)) = self.placing_mask else { return };
+        if resp.drag_started()
+            && let Some(p) = resp.interact_pointer_pos()
+        {
+            self.place_start = Some(xf.to_norm(p));
+        }
+        let Some(s) = self.place_start else { return };
+        let Some(p) = resp.interact_pointer_pos() else { return };
+        let e = xf.to_norm(p);
+        let geom = match kind {
+            MaskKind::Linear => autoshop::recipe::MaskGeometry::Linear {
+                zero_x: s.0,
+                zero_y: s.1,
+                full_x: e.0,
+                full_y: e.1,
+            },
+            MaskKind::Radial => autoshop::recipe::MaskGeometry::Radial {
+                top: s.1.min(e.1),
+                left: s.0.min(e.0),
+                bottom: s.1.max(e.1),
+                right: s.0.max(e.0),
+                feather: 0.5,
+                roundness: 0.0,
+                flipped: false,
+            },
+        };
+        draw_mask_overlay(ui, xf, &geom); // live preview while dragging
+        if resp.drag_stopped() {
+            match replace {
+                Some(i) if i < self.recipe.masks.len() => self.recipe.masks[i].mask = geom,
+                _ => {
+                    let n = self.recipe.masks.len();
+                    self.recipe.masks.push(autoshop::recipe::LocalAdjustment {
+                        mask: geom,
+                        name: format!("手动 {}", n + 1),
+                        ..Default::default()
+                    });
+                    self.sel_mask = Some(n);
+                }
+            }
+            self.placing_mask = None;
+            self.place_start = None;
+            self.dirty = true;
+            self.status = "mask 已放置 — 在左侧「局部调整」里拉滑杆（当前全为 0，无可见效果）".into();
         }
     }
 
@@ -1487,18 +2036,19 @@ impl AutoshopApp {
         }
     }
 
-    /// Brush-paint into the mask while dragging on the After image.
-    fn handle_paint(&mut self, resp: &egui::Response, rect: egui::Rect) {
+    /// Brush-paint into the mask while dragging on the After image. The canvas
+    /// is full-frame at preview resolution; pointer→canvas goes through the
+    /// view transform so painting stays accurate at any zoom, and the brush
+    /// radius converts display px → canvas px by the current pixel scale.
+    fn handle_paint(&mut self, resp: &egui::Response, xf: ViewXform) {
         let brush = self.brush;
         let Some(m) = self.mask_paint.as_mut() else { return };
         let (mw, mh) = (m.width() as f32, m.height() as f32);
         let to_mask = |p: egui::Pos2| {
-            (
-                (p.x - rect.min.x) / rect.width().max(1.0) * mw,
-                (p.y - rect.min.y) / rect.height().max(1.0) * mh,
-            )
+            let (nx, ny) = xf.to_norm(p);
+            (nx * mw, ny * mh)
         };
-        let brush_mask = (brush * mw / rect.width().max(1.0)).max(1.0);
+        let brush_mask = (brush * (xf.uv.width() * mw) / xf.rect.width().max(1.0)).max(1.0);
         if resp.dragged() || resp.drag_started() {
             if let Some(p) = resp.interact_pointer_pos() {
                 let cur = to_mask(p);
@@ -2103,15 +2653,17 @@ impl eframe::App for AutoshopApp {
             match self.view_mode {
                 ViewMode::SideBySide => {
                     let half = (avail.x - 16.0) * 0.5;
+                    let uv = self.view_uv(); // same window for both panes (synced zoom)
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
-                            ui.label(egui::RichText::new("Before (source)").weak());
+                            ui.label(egui::RichText::new("Before (source)").weak().small());
                             if let Some(t) = &self.before_tex {
                                 let size = t.size_vec2();
-                                ui.add(
-                                    egui::Image::new(SizedTexture::new(t.id(), size))
-                                        .fit_to_exact_size(fit_in(size, half, avail.y)),
-                                );
+                                let vis = egui::vec2(uv.width() * size.x, uv.height() * size.y);
+                                let disp = fit_in(vis, half, avail.y);
+                                let (rect, _) =
+                                    ui.allocate_exact_size(disp, egui::Sense::hover());
+                                ui.painter_at(rect).image(t.id(), rect, uv, egui::Color32::WHITE);
                             }
                         });
                         ui.separator();
