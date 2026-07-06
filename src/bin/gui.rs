@@ -78,6 +78,13 @@ const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x4c, 0x8b, 0xf5);
 const SEL_BG: egui::Color32 = egui::Color32::from_rgb(0x26, 0x41, 0x7a);
 const PILL: egui::Color32 = egui::Color32::from_rgb(0xc9, 0xa1, 0x4a);
 
+/// A finished retouch, from any of the four pixel paths (fill/heal/clone/
+/// reimagine): (preview of the saved ./out master, status message, the saved
+/// path when it is a REIMAGINE output — a whole-frame rendition that can be
+/// reverse-fitted into a recipe — and the master path itself, which
+///「以此母版继续修图」reopens as the working source with the recipe kept).
+type RetouchDone = anyhow::Result<(image::DynamicImage, String, Option<PathBuf>, PathBuf)>;
+
 /// Messages from worker threads back to the UI. The large payloads are boxed so
 /// the channel message stays small (clippy::large_enum_variant).
 enum Msg {
@@ -89,10 +96,8 @@ enum Msg {
     /// A gallery thumbnail decoded. `generation` tags the folder generation so a
     /// folder switch can't insert a stale thumbnail under a reused index.
     Thumb { generation: u64, idx: usize, img: Box<anyhow::Result<image::DynamicImage>> },
-    /// A generative-fill / heal / reimagine result: (preview of the saved ./out
-    /// master, status, the saved path when it is a REIMAGINE output — i.e. a
-    /// whole-frame rendition that can be reverse-fitted into a recipe).
-    Retouched(Box<anyhow::Result<(image::DynamicImage, String, Option<PathBuf>)>>),
+    /// A generative-fill / heal / clone / reimagine result — see [`RetouchDone`].
+    Retouched(Box<RetouchDone>),
     /// Reverse-fit finished: the fitted recipe + a status note (fit.rs).
     Fitted(Box<anyhow::Result<(EditRecipe, String)>>),
     /// Style-prompt extraction finished: the reusable prompt text.
@@ -445,6 +450,9 @@ struct AutoshopApp {
     clone_mode: bool,                      // brush paints the clone target; Alt+click = source
     clone_src: Option<(f32, f32)>,         // picked source point, original-frame normalized
     clone_fullres: bool,                   // clone on the full-res develop (RAW only)
+    // --- pixel-master ↔ recipe chaining (gap batch B) ---
+    master: Option<PathBuf>,               // last ./out retouch master (fill/heal/clone/reimagine)
+    keep_recipe: bool,                     // one-shot: next Opened keeps the recipe (continue-from-master)
 }
 
 /// The two mask geometries a user can place by dragging.
@@ -564,6 +572,8 @@ impl Default for AutoshopApp {
             clone_mode: false,
             clone_src: None,
             clone_fullres: false,
+            master: None,
+            keep_recipe: false,
         }
     }
 }
@@ -700,6 +710,24 @@ impl AutoshopApp {
             })();
             let _ = tx.send(Msg::Opened(Box::new(res)));
         });
+    }
+
+    /// 「以此母版继续修图」— reopen the last ./out retouch master as the working
+    /// source with the current recipe KEPT (gap batch B: the pixel master and
+    /// the parametric recipe chain instead of detaching). Valid because every
+    /// master is a NEUTRAL develop + retouched pixels of the same full frame,
+    /// so tone/colour/masks/crop/straighten all still mean the same thing.
+    /// Subsequent fill/heal/clone read the master (src_path re-targets); XMP
+    /// stays tied to RAW sources only, as before.
+    fn continue_from_master(&mut self) {
+        let Some(p) = self.master.clone() else { return };
+        if !p.exists() {
+            self.status = format!("母版不存在：{}（已被移动/删除？）", p.display());
+            self.master = None;
+            return;
+        }
+        self.keep_recipe = true; // consumed by the next Msg::Opened
+        self.open_path(p);
     }
 
     /// Open one of the gallery photos by index (keeps the thumbnail highlighted).
@@ -1441,7 +1469,12 @@ impl AutoshopApp {
         for _ in 0..64 {
             let Some(msg) = self.rx.as_ref().and_then(|rx| rx.try_recv().ok()) else { break };
             match msg {
-                Msg::Opened(boxed) => match *boxed {
+                Msg::Opened(boxed) => {
+                    // One-shot continue-from-master flag: consumed whether the
+                    // open succeeded or failed, so a failure can't leak it into
+                    // an unrelated later open.
+                    let keep = std::mem::take(&mut self.keep_recipe);
+                    match *boxed {
                     Ok(base) => {
                         self.before_tex = Some(ctx.load_texture(
                             "before",
@@ -1456,7 +1489,16 @@ impl AutoshopApp {
                         self.mask_dirty = false;
                         self.paint_last = None;
                         self.paint_mode = false;
-                        self.recipe = EditRecipe::default();
+                        if keep {
+                            // Continue-from-master: the ./out master is a NEUTRAL
+                            // develop + retouched pixels, so the working recipe
+                            // applies to it 1:1 — the pixel and parametric tracks
+                            // chain instead of detaching. History restarts on the
+                            // new base (the master is the new "original").
+                        } else {
+                            self.recipe = EditRecipe::default();
+                            self.master = None; // a master belongs to ONE source photo
+                        }
                         self.reset_history(); // a new photo starts a fresh undo history
                         self.region = None; // and a fresh local-edit selection
                         self.region_drag = None;
@@ -1478,12 +1520,16 @@ impl AutoshopApp {
                         self.rationale.clear();
                         self.dirty = true; // render the (neutral) after
                         self.busy = false;
-                        self.status = "ready — adjust sliders or run AI Analyze".into();
+                        self.status = if keep {
+                            "已从母版继续 — 配方保留，可继续调滑杆/再修图".into()
+                        } else {
+                            "ready — adjust sliders or run AI Analyze".into()
+                        };
                     }
                     Err(e) => {
                         self.fail("could not open", e);
                     }
-                },
+                }},
                 Msg::Analyzed(boxed) => match *boxed {
                     Ok((recipe, verdict)) => {
                         self.recipe = recipe;
@@ -1537,7 +1583,7 @@ impl AutoshopApp {
                     }
                 }
                 Msg::Retouched(boxed) => match *boxed {
-                    Ok((img, msg, generated)) => {
+                    Ok((img, msg, generated, master)) => {
                         // Show the saved master in the After pane (it's a separate
                         // ./out artifact, not the develop recipe — a slider edit
                         // re-develops over it, exactly like the web UI).
@@ -1552,6 +1598,9 @@ impl AutoshopApp {
                         if let Some(p) = generated {
                             self.last_generated = Some(p);
                         }
+                        // Remember the master so「以此母版继续修图」can chain it
+                        // back in as the working source (recipe kept).
+                        self.master = Some(master);
                         self.clear_mask();
                         self.done(msg);
                     }
@@ -2894,7 +2943,7 @@ impl AutoshopApp {
         let quality = ["high", "medium", "low"][self.fill_quality.min(2)].to_string();
         let full_res = self.fill_fullres;
         std::thread::spawn(move || {
-            let res = (|| -> anyhow::Result<(image::DynamicImage, String, Option<PathBuf>)> {
+            let res = (|| -> RetouchDone {
                 let cfg = autoshop::config::Config::load();
                 let out = autoshop::pipeline::default_out(&path, "retouch", "png");
                 let mask_tmp =
@@ -2906,7 +2955,7 @@ impl AutoshopApp {
                 let img = autoshop::decode::load_image(&out)?.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE);
                 // Not a fit target: a fill keeps most source pixels, so a reverse
                 // fit against it would just recover a neutral recipe.
-                Ok((img, format!("filled → {} (saved to ./out)", out.display()), None))
+                Ok((img, format!("filled → {} (saved to ./out)", out.display()), None, out))
             })();
             let _ = tx.send(Msg::Retouched(Box::new(res)));
         });
@@ -2939,7 +2988,7 @@ impl AutoshopApp {
         let tx = self.tx.clone();
         let full_res = self.heal_fullres;
         std::thread::spawn(move || {
-            let res = (|| -> anyhow::Result<(image::DynamicImage, String, Option<PathBuf>)> {
+            let res = (|| -> RetouchDone {
                 let cfg = autoshop::config::Config::load();
                 let out = autoshop::pipeline::default_out(&path, "heal", "png");
                 let mask_tmp = match mask_png {
@@ -2958,7 +3007,7 @@ impl AutoshopApp {
                 let rep = rep?;
                 let img = autoshop::decode::load_image(&out)?.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE);
                 // Not a fit target (pixel heal, not a whole-frame rendition).
-                Ok((img, format!("healed {} spot(s) → {}", rep.spots, out.display()), None))
+                Ok((img, format!("healed {} spot(s) → {}", rep.spots, out.display()), None, out))
             })();
             let _ = tx.send(Msg::Retouched(Box::new(res)));
         });
@@ -2985,7 +3034,7 @@ impl AutoshopApp {
         let tx = self.tx.clone();
         let full_res = self.clone_fullres;
         std::thread::spawn(move || {
-            let res = (|| -> anyhow::Result<(image::DynamicImage, String, Option<PathBuf>)> {
+            let res = (|| -> RetouchDone {
                 let out = autoshop::pipeline::default_out(&path, "clone", "png");
                 let mask_tmp = std::env::temp_dir()
                     .join(format!("autoshop_gui_clone_{}.png", std::process::id()));
@@ -2995,7 +3044,7 @@ impl AutoshopApp {
                 let rep = rep?;
                 let img = autoshop::decode::load_image(&out)?.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE);
                 // Not a fit target (pixel transplant, not a whole-frame look).
-                Ok((img, format!("克隆 {} 处 → {}", rep.spots, out.display()), None))
+                Ok((img, format!("克隆 {} 处 → {}", rep.spots, out.display()), None, out))
             })();
             let _ = tx.send(Msg::Retouched(Box::new(res)));
         });
@@ -3027,14 +3076,14 @@ impl AutoshopApp {
         self.status = "AI 生成出片中… (gpt-image, ~15–60s; 高分辨率输入需先全幅显影)".into();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let res = (|| -> anyhow::Result<(image::DynamicImage, String, Option<PathBuf>)> {
+            let res = (|| -> RetouchDone {
                 let cfg = autoshop::config::Config::load();
                 let out = autoshop::pipeline::default_out(&path, "reimagine", "png");
                 // fidelity "high" keeps it recognisably the same photo.
                 autoshop::generative::reimagine(&cfg, &path, &prompt, "high", &cfg.openai_image_quality, &out)?;
                 let img = autoshop::decode::load_image(&out)?.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE);
                 let msg = format!("generated → {} (可再点「反推配方」得滑杆/XMP)", out.display());
-                Ok((img, msg, Some(out)))
+                Ok((img, msg, Some(out.clone()), out))
             })();
             let _ = tx.send(Msg::Retouched(Box::new(res)));
         });
@@ -3114,6 +3163,26 @@ impl AutoshopApp {
     fn retouch_panel(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.heading("Retouch");
+
+        // --- pixel-master ↔ recipe chaining (gap batch B): after any retouch,
+        // one click makes the saved ./out master the new working source with
+        // the recipe kept, so retouch + develop keep compounding.
+        if let Some(m) = self.master.clone() {
+            ui.horizontal(|ui| {
+                let name = m.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                ui.label(egui::RichText::new(format!("母版 {name}")).weak().small());
+                if ui
+                    .button("⤴ 以此母版继续修图")
+                    .on_hover_text(
+                        "把这张 ./out 像素母版设为当前工作图（保留全部滑杆/蒙版/裁剪），\
+后续修图与导出都基于它 — 修补不再因动滑杆而丢失",
+                    )
+                    .clicked()
+                {
+                    self.continue_from_master();
+                }
+            });
+        }
 
         // Whole-image generative re-render: let gpt-image DIRECTLY produce the
         // picture (the optional "GPT makes the image" path). Distinct from
