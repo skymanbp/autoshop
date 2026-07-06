@@ -99,6 +99,8 @@ enum Msg {
     Styled(Box<anyhow::Result<String>>),
     /// A `GET /models` fetch finished: the account's model ids (Settings pick-list).
     Models(anyhow::Result<Vec<String>>),
+    /// A batch recipe paste finished: the human summary (counts; Err on any failure).
+    Pasted(anyhow::Result<String>),
 }
 
 /// Editable buffers for the in-app Settings window. Key fields stay blank on
@@ -354,6 +356,10 @@ struct AutoshopApp {
     // --- tone-curve editor ---
     curve_channel: usize,                  // CURVE_CHANNELS index: 0=master 1=R 2=G 3=B
     curve_drag: Option<usize>,             // control point being dragged (active channel)
+    // --- batch recipe copy / paste ---
+    multi_sel: HashSet<usize>,             // Ctrl+click gallery multi-selection
+    copied: Option<EditRecipe>,            // the recipe "clipboard" (in-app only)
+    paste_geometry: bool,                  // keep crop/straighten when pasting
 }
 
 /// The two mask geometries a user can place by dragging.
@@ -465,6 +471,9 @@ impl Default for AutoshopApp {
             place_start: None,
             curve_channel: 0,
             curve_drag: None,
+            multi_sel: HashSet::new(),
+            copied: None,
+            paste_geometry: false,
         }
     }
 }
@@ -1249,6 +1258,74 @@ impl AutoshopApp {
         }
     }
 
+    /// Paste the copied recipe onto every Ctrl+click-selected photo on a worker
+    /// thread — Lightroom's "sync settings", without rendering anything: a
+    /// ./out recipe JSON per photo plus an XMP sidecar for RAWs. Geometry
+    /// (crop/straighten) is stripped unless `paste_geometry` is on, because
+    /// composition rarely transfers between frames. Library files are never
+    /// touched (write_recipe / write_xmp only ever land in ./out).
+    fn start_paste(&mut self) {
+        let Some(src) = self.copied.clone() else { return };
+        if self.busy {
+            return;
+        }
+        let targets: Vec<PathBuf> = {
+            let mut idx: Vec<usize> = self.multi_sel.iter().copied().collect();
+            idx.sort_unstable(); // report in gallery order, not hash order
+            idx.into_iter().filter_map(|i| self.gallery.get(i).cloned()).collect()
+        };
+        if targets.is_empty() {
+            return;
+        }
+        let mut recipe = src;
+        if !self.paste_geometry {
+            recipe.crop = None;
+            recipe.straighten_deg = 0.0;
+        }
+        // If the open photo is one of the targets, take the paste live in the
+        // editor too (undo-able through the usual committed-snapshot step).
+        if let Some(open) = &self.src_path
+            && targets.iter().any(|t| t == open)
+        {
+            self.recipe = recipe.clone();
+            self.dirty = true;
+        }
+        self.busy = true;
+        self.status = format!("粘贴配方到 {} 张…", targets.len());
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let res = (|| -> anyhow::Result<String> {
+                let (mut okn, mut xmpn) = (0usize, 0usize);
+                let mut errs: Vec<String> = Vec::new();
+                for path in &targets {
+                    let step = || -> anyhow::Result<bool> {
+                        autoshop::pipeline::write_recipe(path, &recipe, None)?;
+                        if autoshop::decode::is_raw(path) {
+                            autoshop::pipeline::write_xmp(path, &recipe)?;
+                            return Ok(true);
+                        }
+                        Ok(false)
+                    };
+                    match step() {
+                        Ok(wrote_xmp) => {
+                            okn += 1;
+                            xmpn += usize::from(wrote_xmp);
+                        }
+                        Err(e) => errs.push(format!("{}: {e}", autoshop::pipeline::stem(path))),
+                    }
+                }
+                // Any failure surfaces as an error toast WITH the success count —
+                // a partial failure must never read as a clean success.
+                if errs.is_empty() {
+                    Ok(format!("配方已粘贴到 {okn} 张（{xmpn} 个 XMP）→ ./out"))
+                } else {
+                    anyhow::bail!("{okn} 成功、{} 失败：{}", errs.len(), errs.join(" · "))
+                }
+            })();
+            let _ = tx.send(Msg::Pasted(res));
+        });
+    }
+
     fn poll_workers(&mut self, ctx: &egui::Context) {
         // Drain a bounded batch each frame so a burst of thumbnails doesn't take
         // one-per-frame to land (try_recv borrow is released before we mutate).
@@ -1323,6 +1400,7 @@ impl AutoshopApp {
                         self.thumb_requested.clear();
                         self.thumb_inflight = 0;
                         self.selected = None;
+                        self.multi_sel.clear(); // indices belong to the old folder
                         self.busy = false;
                         self.status = format!("{n} photo{} — click a thumbnail to open", if n == 1 { "" } else { "s" });
                     }
@@ -1394,6 +1472,10 @@ impl AutoshopApp {
                         self.fail("风格提取失败", e);
                     }
                 },
+                Msg::Pasted(res) => match res {
+                    Ok(s) => self.done(s),
+                    Err(e) => self.fail("批量粘贴", e),
+                },
                 Msg::Models(res) => match res {
                     Ok(ids) => {
                         let chat: Vec<String> = ids
@@ -1463,6 +1545,37 @@ impl AutoshopApp {
                     .small(),
             );
         }
+        // Batch: copy the open photo's recipe → Ctrl+click a selection → paste.
+        // Lightroom's "sync settings" for the whole working folder.
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(self.src_path.is_some(), |ui| {
+                if ui
+                    .small_button("⎘ 复制配方")
+                    .on_hover_text("复制当前照片的全部 develop 参数")
+                    .clicked()
+                {
+                    self.copied = Some(self.recipe.clone());
+                    self.status = "配方已复制 — Ctrl+点击选多张，再「粘贴到选中」".into();
+                }
+            });
+            let n = self.multi_sel.len();
+            ui.add_enabled_ui(self.copied.is_some() && n > 0 && !self.busy, |ui| {
+                if ui
+                    .small_button(format!("⇩ 粘贴到选中({n})"))
+                    .on_hover_text("对每张写 ./out 配方 JSON；RAW 同时写 XMP 边车。不动库文件、不渲染成品")
+                    .clicked()
+                {
+                    self.start_paste();
+                }
+            });
+            if n > 0 && ui.small_button("✕").on_hover_text("清除多选").clicked() {
+                self.multi_sel.clear();
+            }
+        });
+        if self.copied.is_some() {
+            ui.checkbox(&mut self.paste_geometry, "粘贴时含裁剪/拉直")
+                .on_hover_text("默认不带几何 — 构图在照片间通常不可复用");
+        }
         ui.separator();
         if self.gallery.is_empty() {
             ui.label(egui::RichText::new("Open a folder to browse your photos here.").weak());
@@ -1475,7 +1588,9 @@ impl AutoshopApp {
         let thumbs = &self.thumbs;
         let gallery = &self.gallery;
         let selected = self.selected;
+        let multi_sel = &self.multi_sel;
         let mut to_open: Option<usize> = None;
+        let mut to_toggle: Option<usize> = None;
         let mut to_request: Vec<usize> = Vec::new();
 
         egui::ScrollArea::vertical()
@@ -1484,7 +1599,14 @@ impl AutoshopApp {
                 for i in range {
                     let path = &gallery[i];
                     let is_sel = selected == Some(i);
-                    let fill = if is_sel { SEL_BG } else { egui::Color32::TRANSPARENT };
+                    let is_multi = multi_sel.contains(&i);
+                    let fill = if is_sel {
+                        SEL_BG
+                    } else if is_multi {
+                        egui::Color32::from_rgb(0x1a, 0x2a, 0x4e) // dimmer than SEL_BG
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
                     let resp = egui::Frame::none()
                         .fill(fill)
                         .inner_margin(egui::Margin::same(3.0))
@@ -1517,6 +1639,9 @@ impl AutoshopApp {
                                         || autoshop::pipeline::xmp_target(path).exists();
                                     let baked = !autoshop::decode::is_raw(path);
                                     ui.horizontal(|ui| {
+                                        if is_multi {
+                                            ui.label(egui::RichText::new("✓ 选中").color(ACCENT).small());
+                                        }
                                         if baked {
                                             ui.label(egui::RichText::new("PNG/TIFF").color(PILL).small());
                                         }
@@ -1533,13 +1658,23 @@ impl AutoshopApp {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
                     if resp.clicked() {
-                        to_open = Some(i);
+                        // Ctrl+click toggles the batch selection; plain click opens.
+                        if ui.input(|inp| inp.modifiers.command) {
+                            to_toggle = Some(i);
+                        } else {
+                            to_open = Some(i);
+                        }
                     }
                 }
             });
 
         for i in to_request {
             self.request_thumb(i);
+        }
+        if let Some(i) = to_toggle
+            && !self.multi_sel.remove(&i)
+        {
+            self.multi_sel.insert(i);
         }
         if let Some(i) = to_open {
             self.open_gallery_index(i);
