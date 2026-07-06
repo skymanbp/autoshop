@@ -268,6 +268,9 @@ impl ColorGrade {
 #[serde(default, deny_unknown_fields)]
 pub struct LocalAdjustment {
     pub mask: MaskGeometry,
+    /// Optional Range Mask refinement intersected with `mask` (final weight =
+    /// geometry × range). `None` = pure geometry (v1-compatible).
+    pub range: Option<RangeMask>,
     /// Human label → `crs:CorrectionName` / `crs:MaskName`.
     pub name: String,
     /// Master opacity 0.0..=1.0 → `crs:CorrectionAmount` + `crs:MaskValue`.
@@ -296,6 +299,7 @@ impl Default for LocalAdjustment {
     fn default() -> Self {
         Self {
             mask: MaskGeometry::Linear { zero_x: 0.5, zero_y: 0.0, full_x: 0.5, full_y: 0.5 },
+            range: None,
             name: String::new(),
             amount: 1.0,
             inverted: false,
@@ -334,6 +338,26 @@ pub enum MaskGeometry {
         roundness: f32,
         flipped: bool,
     },
+}
+
+/// Lightroom's Range Mask: a per-pixel refinement INTERSECTED with the mask's
+/// geometry (final weight = geometry × range), so a sky gradient can affect only
+/// the bright pixels, or only the blues. Serialised to XMP as a second
+/// `Mask/RangeMask` component inside `crs:CorrectionMasks` — structure verified
+/// against the user's own Lightroom sidecars (e.g. `_DSC9245.xmp` LumRange,
+/// `_DSC9303.xmp` PointModels).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RangeMask {
+    /// Select by luminance: full weight inside [lo, hi], smooth ramps over
+    /// lo_outer→lo and hi→hi_outer. All four in 0..=1, non-decreasing —
+    /// exactly ACR's `crs:LumRange="lo_outer lo hi hi_outer"`.
+    Luminance { lo_outer: f32, lo: f32, hi: f32, hi_outer: f32 },
+    /// Select pixels whose chromaticity (brightness-independent colour) is near
+    /// the reference `r,g,b` (0..=1 sRGB). `amount` 0..=1 widens the tolerance
+    /// (ACR `crs:ColorAmount`, LR default 0.5). `(px, py)` is the normalised
+    /// sample point in the ORIGINAL frame — cosmetic, for LR's sample marker.
+    Color { r: f32, g: f32, b: f32, amount: f32, px: f32, py: f32 },
 }
 
 // `clamp` is used by the render engine + advisors; `is_noop` is not yet wired to
@@ -380,6 +404,26 @@ impl EditRecipe {
                 *v = (*v).clamp(-100.0, 100.0);
             }
             m.noise_reduction = m.noise_reduction.clamp(0.0, 100.0);
+            // Range mask invariants: everything in 0..=1, and the luminance
+            // trapezoid non-decreasing (lo_outer ≤ lo ≤ hi ≤ hi_outer) so the
+            // render's ramps and ACR's LumRange both stay well-formed.
+            match &mut m.range {
+                Some(RangeMask::Luminance { lo_outer, lo, hi, hi_outer }) => {
+                    let a = lo.clamp(0.0, 1.0);
+                    let b = hi.clamp(0.0, 1.0);
+                    let (a, b) = if a <= b { (a, b) } else { (b, a) };
+                    *lo = a;
+                    *hi = b;
+                    *lo_outer = lo_outer.clamp(0.0, a);
+                    *hi_outer = hi_outer.clamp(b, 1.0);
+                }
+                Some(RangeMask::Color { r, g, b, amount, px, py }) => {
+                    for v in [r, g, b, amount, px, py] {
+                        *v = v.clamp(0.0, 1.0);
+                    }
+                }
+                None => {}
+            }
         }
     }
 
@@ -471,6 +515,9 @@ mod tests {
             masks: vec![
                 LocalAdjustment {
                     mask: MaskGeometry::Linear { zero_x: 0.5, zero_y: 0.35, full_x: 0.5, full_y: 0.0 },
+                    // Luminance range with a deliberately ill-formed trapezoid:
+                    // clamp must sort lo/hi and pin the outers around them.
+                    range: Some(RangeMask::Luminance { lo_outer: 0.9, lo: 0.8, hi: 0.5, hi_outer: 0.2 }),
                     name: "sky".into(),
                     exposure_ev: -0.4,
                     highlights: -200.0, // out of range → clamp pulls to -100
@@ -481,6 +528,7 @@ mod tests {
                         top: 0.3, left: 0.35, bottom: 0.7, right: 0.65,
                         feather: 0.5, roundness: 0.0, flipped: false,
                     },
+                    range: Some(RangeMask::Color { r: 0.9, g: 0.6, b: 0.2, amount: 1.7, px: 0.5, py: 0.5 }),
                     name: "subject".into(),
                     shadows: 15.0,
                     ..Default::default()
@@ -490,6 +538,16 @@ mod tests {
         };
         recipe.clamp();
         assert_eq!(recipe.masks[0].highlights, -100.0); // clamped
+        // Luminance trapezoid re-ordered to lo_outer ≤ lo ≤ hi ≤ hi_outer.
+        assert_eq!(
+            recipe.masks[0].range,
+            Some(RangeMask::Luminance { lo_outer: 0.5, lo: 0.5, hi: 0.8, hi_outer: 0.8 })
+        );
+        // Color amount clamped into 0..=1.
+        match recipe.masks[1].range {
+            Some(RangeMask::Color { amount, .. }) => assert_eq!(amount, 1.0),
+            other => panic!("color range lost in clamp: {other:?}"),
+        }
 
         let json = serde_json::to_string_pretty(&recipe).unwrap();
         let back: EditRecipe = serde_json::from_str(&json).unwrap();
@@ -499,6 +557,9 @@ mod tests {
         // A v1 recipe JSON (no "masks" key) still deserializes, masks default empty.
         let v1 = r#"{ "exposure_ev": 0.5, "rationale": "x", "confidence": 0.9 }"#;
         assert!(serde_json::from_str::<EditRecipe>(v1).unwrap().masks.is_empty());
+        // A mask WITHOUT a "range" key (pre-range recipes) defaults to None.
+        let old_mask = r#"{ "masks": [ { "name": "sky" } ] }"#;
+        assert_eq!(serde_json::from_str::<EditRecipe>(old_mask).unwrap().masks[0].range, None);
     }
 
     #[test]

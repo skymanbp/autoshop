@@ -8,7 +8,7 @@
 //! `"x, y"` strings (see `docs/M1_PLAN.md` §5 and §9). We emit only the keys we
 //! set; Lightroom fills the rest from defaults.
 
-use crate::recipe::{EditRecipe, MaskGeometry};
+use crate::recipe::{EditRecipe, MaskGeometry, RangeMask};
 
 /// Format an integer-valued slider the way ACR writes it: explicit `+` for
 /// positives (`"+14"`, `"-12"`, `"0"`).
@@ -77,6 +77,64 @@ crs:Feather=\"{feather}\" crs:Roundness=\"{roundness}\" crs:Flipped=\"{flipped}\
     }
 }
 
+/// A `Mask/RangeMask` component `<rdf:li>` intersected with the correction's
+/// geometric mask (empty string when the adjustment has no range). Component
+/// structure and attribute values verified against the user's own Lightroom
+/// sidecars (`_DSC9245.xmp` luminance, `_DSC9303.xmp` colour): the intersect
+/// encoding is `MaskBlendMode="1" + MaskInverted="true" + MaskValue="0"` —
+/// i.e. "paint 0 wherever the range does NOT match", which erases everything
+/// outside geometry ∩ range. Luminance uses the attribute form
+/// (`crs:LumRange="lo_outer lo hi hi_outer"`); colour uses the child-element
+/// form with one `crs:PointModels` entry `"r g b px py 0"` (last three numbers
+/// assumed sample-point + reserved; see ROADMAP §A for the verification note).
+fn range_mask_xml(range: &Option<RangeMask>, sync_id: &str) -> String {
+    let Some(rm) = range else { return String::new() };
+    let head = |name: &str| {
+        format!(
+            "         <rdf:li>\n\
+          <rdf:Description\n\
+           crs:What=\"Mask/RangeMask\" crs:MaskActive=\"true\" crs:MaskName=\"{name}\"\n\
+           crs:MaskBlendMode=\"1\" crs:MaskInverted=\"true\" crs:MaskSyncID=\"{sync_id}\"\n\
+           crs:MaskValue=\"0\">\n"
+        )
+    };
+    match rm {
+        RangeMask::Luminance { lo_outer, lo, hi, hi_outer } => format!(
+            "{}\
+           <crs:CorrectionRangeMask\n\
+            crs:Version=\"3\"\n\
+            crs:Type=\"2\"\n\
+            crs:Invert=\"false\"\n\
+            crs:SampleType=\"0\"\n\
+            crs:LumRange=\"{lo_outer:.6} {lo:.6} {hi:.6} {hi_outer:.6}\"\n\
+            crs:LuminanceDepthSampleInfo=\"0 0.500000 0.500000\"/>\n\
+          </rdf:Description>\n\
+         </rdf:li>\n",
+            head("Luminance Range"),
+        ),
+        RangeMask::Color { r, g, b, amount, px, py } => format!(
+            "{}\
+           <crs:CorrectionRangeMask>\n\
+            <rdf:Description\n\
+             crs:Version=\"3\"\n\
+             crs:Type=\"1\"\n\
+             crs:ColorAmount=\"{amount:.6}\"\n\
+             crs:Invert=\"false\"\n\
+             crs:SampleType=\"0\">\n\
+            <crs:PointModels>\n\
+             <rdf:Seq>\n\
+              <rdf:li>{r:.6} {g:.6} {b:.6} {px:.6} {py:.6} 0</rdf:li>\n\
+             </rdf:Seq>\n\
+            </crs:PointModels>\n\
+            </rdf:Description>\n\
+           </crs:CorrectionRangeMask>\n\
+          </rdf:Description>\n\
+         </rdf:li>\n",
+            head("Color Range"),
+        ),
+    }
+}
+
 /// Build the `<crs:MaskGroupBasedCorrections>` child element (empty string when
 /// there are no masks). Local sliders convert UI scale → ACR local scale:
 /// exposure stops ÷4, every other slider ÷100 (verified against the user's real
@@ -112,10 +170,12 @@ fn masks_xml(r: &EditRecipe) -> String {
          <rdf:li crs:What=\"{what}\" crs:MaskActive=\"true\" crs:MaskName=\"{mname}\"\n\
           crs:MaskBlendMode=\"0\" crs:MaskInverted=\"{inv}\" crs:MaskSyncID=\"{mask_id}\"\n\
           crs:MaskValue=\"1\"{geom}/>\n\
+{range}\
         </rdf:Seq>\n\
        </crs:CorrectionMasks>\n\
       </rdf:Description>\n\
      </rdf:li>\n",
+            range = range_mask_xml(&m.range, &guid(&format!("range-{i}-{name}"))),
             amount = local_fmt(m.amount),
             name = xml_escape(&name),
             corr_id = corr_id,
@@ -323,6 +383,54 @@ mod tests {
         assert!(xmp.contains(r#"crs:Feather="0.5""#));
         // unset masks ⇒ no mask block (v1-compatible)
         assert!(!recipe_to_xmp(&EditRecipe::default()).contains("MaskGroupBasedCorrections"));
+    }
+
+    #[test]
+    fn renders_range_masks_as_intersected_components() {
+        use crate::recipe::RangeMask;
+        let r = EditRecipe {
+            masks: vec![
+                LocalAdjustment {
+                    mask: MaskGeometry::Linear { zero_x: 0.5, zero_y: 0.35, full_x: 0.5, full_y: 0.0 },
+                    range: Some(RangeMask::Luminance { lo_outer: 0.4, lo: 0.5, hi: 1.0, hi_outer: 1.0 }),
+                    name: "sky".into(),
+                    highlights: -40.0,
+                    ..Default::default()
+                },
+                LocalAdjustment {
+                    mask: MaskGeometry::Radial {
+                        top: 0.3, left: 0.35, bottom: 0.7, right: 0.65,
+                        feather: 0.5, roundness: 0.0, flipped: false,
+                    },
+                    range: Some(RangeMask::Color { r: 0.9, g: 0.6, b: 0.2, amount: 0.5, px: 0.4, py: 0.7 }),
+                    name: "subject".into(),
+                    saturation: 20.0,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let xmp = recipe_to_xmp(&r);
+        // Both range components present, encoded as intersections (the decoded
+        // ACR algebra: BlendMode 1 + Inverted true + Value 0 = keep only where
+        // the range matches).
+        assert_eq!(xmp.matches(r#"crs:What="Mask/RangeMask""#).count(), 2);
+        assert_eq!(
+            xmp.matches(r#"crs:MaskBlendMode="1" crs:MaskInverted="true""#).count(), 2
+        );
+        // Luminance: attribute form, LumRange in ACR's 4-number trapezoid.
+        assert!(xmp.contains(r#"crs:Type="2""#));
+        assert!(xmp.contains(r#"crs:LumRange="0.400000 0.500000 1.000000 1.000000""#));
+        // Colour: child-element form with one PointModels entry.
+        assert!(xmp.contains(r#"crs:Type="1""#));
+        assert!(xmp.contains(r#"crs:ColorAmount="0.500000""#));
+        assert!(xmp.contains("<rdf:li>0.900000 0.600000 0.200000 0.400000 0.700000 0</rdf:li>"));
+        // A mask WITHOUT a range emits no RangeMask component at all.
+        let plain = EditRecipe {
+            masks: vec![LocalAdjustment { name: "plain".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        assert!(!recipe_to_xmp(&plain).contains("RangeMask"));
     }
 
     #[test]

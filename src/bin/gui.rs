@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui::load::SizedTexture;
 
-use autoshop::recipe::{ColorGrade, CurvePoint, EditRecipe, Hsl, MaskGeometry};
+use autoshop::recipe::{ColorGrade, CurvePoint, EditRecipe, Hsl, MaskGeometry, RangeMask};
 use image::GenericImageView;
 
 /// How the preview area is laid out. `AfterOnly` gives the edit the whole
@@ -439,6 +439,8 @@ struct AutoshopApp {
     paste_geometry: bool,                  // keep crop/straighten when pasting
     // --- WB eyedropper ---
     wb_picking: bool,                      // next image click samples a neutral point
+    // --- colour-range sample (Range Mask) ---
+    range_picking: Option<usize>,          // next image click keys masks[i]'s Color range
     // --- clone stamp ---
     clone_mode: bool,                      // brush paints the clone target; Alt+click = source
     clone_src: Option<(f32, f32)>,         // picked source point, original-frame normalized
@@ -558,6 +560,7 @@ impl Default for AutoshopApp {
             copied: None,
             paste_geometry: false,
             wb_picking: false,
+            range_picking: None,
             clone_mode: false,
             clone_src: None,
             clone_fullres: false,
@@ -1468,6 +1471,7 @@ impl AutoshopApp {
                         self.place_start = None;
                         self.curve_drag = None; // curve_channel is a UI pref, keep it
                         self.wb_picking = false;
+                        self.range_picking = None;
                         self.clone_mode = false;
                         self.clone_src = None;
                         self.verdict = None;
@@ -1839,6 +1843,7 @@ impl AutoshopApp {
                             self.crop_mode = false;
                             self.paint_mode = false;
                             self.placing_mask = None;
+                            self.range_picking = None;
                             self.clone_mode = false;
                             self.status = "WB 吸管：点击图中应为中性灰/白的位置".into();
                         }
@@ -1971,6 +1976,7 @@ impl AutoshopApp {
                             self.paint_mode = false;
                             self.placing_mask = None;
                             self.wb_picking = false;
+                            self.range_picking = None;
                             self.clone_mode = false;
                         }
                     }
@@ -2020,6 +2026,7 @@ impl AutoshopApp {
                     self.paint_mode = false;
                     self.crop_mode = false;
                     self.wb_picking = false;
+                    self.range_picking = None;
                     self.clone_mode = false;
                     self.status = "在图上拖拽画出线性渐变（起点不受影响 → 终点完全生效）".into();
                 }
@@ -2028,6 +2035,7 @@ impl AutoshopApp {
                     self.paint_mode = false;
                     self.crop_mode = false;
                     self.wb_picking = false;
+                    self.range_picking = None;
                     self.clone_mode = false;
                     self.status = "在图上拖拽画出径向（椭圆）范围".into();
                 }
@@ -2074,11 +2082,101 @@ impl AutoshopApp {
                         self.paint_mode = false;
                         self.crop_mode = false;
                         self.wb_picking = false;
+                        self.range_picking = None;
                         self.clone_mode = false;
                     }
                     let m = &mut self.recipe.masks[i];
                     ui.checkbox(&mut m.inverted, "反转");
                 });
+                // --- Range Mask（LR 范围蒙版）: refines WHERE the geometry applies —
+                // final weight = geometry × range, live in preview + export + XMP.
+                {
+                    let cur = match &self.recipe.masks[i].range {
+                        None => 0usize,
+                        Some(RangeMask::Luminance { .. }) => 1,
+                        Some(RangeMask::Color { .. }) => 2,
+                    };
+                    let mut sel = cur;
+                    ui.horizontal(|ui| {
+                        ui.label("范围蒙版");
+                        egui::ComboBox::from_id_salt("range_kind")
+                            .selected_text(["无", "亮度", "颜色"][sel])
+                            .width(70.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut sel, 0, "无");
+                                ui.selectable_value(&mut sel, 1, "亮度");
+                                ui.selectable_value(&mut sel, 2, "颜色");
+                            });
+                    });
+                    if sel != cur {
+                        self.recipe.masks[i].range = match sel {
+                            // Full range = neutral start; narrow from there.
+                            1 => Some(RangeMask::Luminance { lo_outer: 0.0, lo: 0.0, hi: 1.0, hi_outer: 1.0 }),
+                            2 => Some(RangeMask::Color { r: 0.5, g: 0.5, b: 0.5, amount: 0.5, px: 0.5, py: 0.5 }),
+                            _ => None,
+                        };
+                        if sel == 2 {
+                            // Jump straight into sampling — a colour range without
+                            // a picked colour selects nothing useful.
+                            self.range_picking = Some(i);
+                            self.paint_mode = false;
+                            self.crop_mode = false;
+                            self.placing_mask = None;
+                            self.wb_picking = false;
+                            self.clone_mode = false;
+                            self.status = "颜色范围：点击图中要选取的颜色".into();
+                        }
+                        changed = true;
+                    }
+                    let picking_this = self.range_picking == Some(i);
+                    let mut want_pick = false;
+                    match &mut self.recipe.masks[i].range {
+                        Some(RangeMask::Luminance { lo_outer, lo, hi, hi_outer }) => {
+                            // GUI shows lo/hi + one symmetric feather; the recipe keeps
+                            // ACR's 4-number trapezoid (asymmetric AI trapezoids show
+                            // their averaged feather until a slider is touched).
+                            let mut f = ((*lo - *lo_outer) + (*hi_outer - *hi)) * 0.5;
+                            let mut ch = false;
+                            ch |= Self::slider(ui, "亮度下限", lo, 0.0, 1.0, 0.0);
+                            ch |= Self::slider(ui, "亮度上限", hi, 0.0, 1.0, 1.0);
+                            ch |= Self::slider(ui, "羽化", &mut f, 0.0, 0.5, 0.1);
+                            if ch {
+                                if *lo > *hi {
+                                    std::mem::swap(lo, hi);
+                                }
+                                *lo_outer = (*lo - f).max(0.0);
+                                *hi_outer = (*hi + f).min(1.0);
+                                changed = true;
+                            }
+                        }
+                        Some(RangeMask::Color { r, g, b, amount, .. }) => {
+                            ui.horizontal(|ui| {
+                                let mut c = [*r, *g, *b];
+                                if ui.color_edit_button_rgb(&mut c).changed() {
+                                    [*r, *g, *b] = [c[0], c[1], c[2]];
+                                    changed = true;
+                                }
+                                let label = if picking_this { "🎯 点击图中…" } else { "🎯 取样" };
+                                if ui.small_button(label).on_hover_text("在图上点击要选取的颜色（亮暗不同的同色也会被选中）").clicked() {
+                                    want_pick = true;
+                                }
+                            });
+                            changed |= Self::slider(ui, "容差", amount, 0.0, 1.0, 0.5);
+                        }
+                        None => {}
+                    }
+                    if want_pick {
+                        self.range_picking = if picking_this { None } else { Some(i) };
+                        if self.range_picking.is_some() {
+                            self.paint_mode = false;
+                            self.crop_mode = false;
+                            self.placing_mask = None;
+                            self.wb_picking = false;
+                            self.clone_mode = false;
+                            self.status = "颜色范围：点击图中要选取的颜色".into();
+                        }
+                    }
+                }
                 let m = &mut self.recipe.masks[i];
                 changed |= Self::slider(ui, "Amount", &mut m.amount, 0.0, 1.0, 1.0);
                 changed |= Self::slider(ui, "Exposure", &mut m.exposure_ev, -5.0, 5.0, 0.0);
@@ -2172,6 +2270,8 @@ impl AutoshopApp {
             "局部调整 — 在图上拖拽画出渐变范围"
         } else if self.wb_picking {
             "WB 吸管 — 点击应为中性灰/白的位置"
+        } else if self.range_picking.is_some() {
+            "颜色范围 — 点击图中要选取的颜色"
         } else if self.clone_mode {
             "图章 — Alt+点击取源点 · 拖动涂要覆盖的区域"
         } else if self.paint_mode {
@@ -2252,6 +2352,8 @@ impl AutoshopApp {
             self.handle_place_mask(ui, &resp, xf);
         } else if self.wb_picking {
             self.handle_wb_pick(ui, &resp, xf);
+        } else if self.range_picking.is_some() {
+            self.handle_range_pick(ui, &resp, xf);
         } else if self.clone_mode {
             self.handle_clone(ui, &resp, xf);
             self.ensure_mask_tex(ui.ctx());
@@ -2326,6 +2428,65 @@ impl AutoshopApp {
         self.wb_picking = false;
         self.dirty = true;
         self.status = format!("WB 吸管：{k:.0} K · tint {tint:+.0} — 可在色调区微调");
+    }
+
+    /// Colour-range sample: click keys the pending mask's Color range to that
+    /// spot. Samples a 5×5 mean of a PRE-MASK develop (this recipe with masks
+    /// stripped) — the exact pixel state `apply_masks` evaluates range weights
+    /// against, so the picked colour is what the engine will match. One extra
+    /// preview-sized develop per click ≈ the cost of one slider tick.
+    fn handle_range_pick(&mut self, ui: &egui::Ui, resp: &egui::Response, xf: ViewXform) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        if !resp.clicked() {
+            return;
+        }
+        let Some(q) = resp.interact_pointer_pos() else { return };
+        let Some(mi) = self.range_picking.filter(|&i| i < self.recipe.masks.len()) else {
+            self.range_picking = None; // stale index (mask deleted mid-pick)
+            return;
+        };
+        let (nx, ny) = xf.to_norm(q);
+        // develop_preview works in the ORIGINAL frame — map out of the view.
+        let ((bw, bh), deg) = self.straighten_ctx();
+        let (nx, ny) = view_norm_to_orig(nx, ny, (bw, bh), deg);
+        let smp = {
+            let Some(base) = &self.base_preview else { return };
+            let mut pre = self.recipe.clone();
+            pre.masks.clear();
+            let rgb = autoshop::render::develop_preview(base, &pre).to_rgb8();
+            let (w, h) = rgb.dimensions();
+            let (cx, cy) = (
+                (nx * (w.saturating_sub(1)) as f32).round() as i64,
+                (ny * (h.saturating_sub(1)) as f32).round() as i64,
+            );
+            let (mut acc, mut n) = ([0.0f32; 3], 0.0f32);
+            for dy in -2..=2i64 {
+                for dx in -2..=2i64 {
+                    let (x, y) = (cx + dx, cy + dy);
+                    if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
+                        let p = rgb.get_pixel(x as u32, y as u32);
+                        for c in 0..3 {
+                            acc[c] += p[c] as f32 / 255.0;
+                        }
+                        n += 1.0;
+                    }
+                }
+            }
+            if n == 0.0 {
+                return;
+            }
+            [acc[0] / n, acc[1] / n, acc[2] / n]
+        };
+        // Keep the tolerance the user already dialled in; only re-key the colour.
+        let amount = match self.recipe.masks[mi].range {
+            Some(RangeMask::Color { amount, .. }) => amount,
+            _ => 0.5,
+        };
+        self.recipe.masks[mi].range =
+            Some(RangeMask::Color { r: smp[0], g: smp[1], b: smp[2], amount, px: nx, py: ny });
+        self.range_picking = None;
+        self.dirty = true;
+        self.status = "颜色范围：已取样 — 「容差」滑杆调节选中宽度".into();
     }
 
     /// Box-select on the After image: drag a rectangle to target a local edit;
@@ -3017,6 +3178,7 @@ impl AutoshopApp {
                 .on_hover_text("Brush over the area; box-select is paused while on. Fill 与 Heal 共用");
             if r.changed() && self.paint_mode {
                 self.clone_mode = false; // the stamp has its own paint dispatch
+                self.range_picking = None; // and painting cancels a pending colour sample
             }
             if ui.button("Clear").clicked() {
                 self.clear_mask();
@@ -3096,6 +3258,7 @@ impl AutoshopApp {
                             self.crop_mode = false;
                             self.placing_mask = None;
                             self.wb_picking = false;
+                            self.range_picking = None;
                             self.clear_mask();
                             self.status =
                                 "图章：Alt+点击取源点 → 画笔涂目标区 → 「⎘ 克隆已涂区域」".into();

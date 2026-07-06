@@ -24,7 +24,7 @@ use rawler::imgop::develop::{Intermediate, RawDevelop};
 use rawler::rawsource::RawSource;
 use rawler::Orientation;
 
-use crate::recipe::{EditRecipe, MaskGeometry};
+use crate::recipe::{EditRecipe, MaskGeometry, RangeMask};
 
 const LUT_N: usize = 4096;
 
@@ -314,12 +314,23 @@ fn apply_masks(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
         // --- tone + saturation pass ---
         for y in 0..h {
             for x in 0..w {
-                let wgt = weight_at(x, y);
+                let mut wgt = weight_at(x, y);
                 if wgt <= 0.001 {
                     continue;
                 }
                 let i = y * w + x;
                 let p = data[i];
+                // Range Mask refinement: intersect the geometric weight with the
+                // per-pixel range weight, evaluated on the pixel as it stands when
+                // this mask runs (post-global develop, pre-this-mask — masks stack
+                // sequentially, so a later mask's range sees earlier masks' output;
+                // documented approximation vs LR's fixed reference image).
+                if let Some(rm) = &m.range {
+                    wgt *= range_weight(rm, &p);
+                    if wgt <= 0.001 {
+                        continue;
+                    }
+                }
                 // Luminance-preserving local tone (same anti-greying reason as the
                 // global pass), then local saturation.
                 let mut t = p;
@@ -340,11 +351,17 @@ fn apply_masks(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
             let blur = blur_plane(&luma, w, h, 2);
             for y in 0..h {
                 for x in 0..w {
-                    let nw = weight_at(x, y) * nr;
+                    let i = y * w + x;
+                    let mut nw = weight_at(x, y) * nr;
+                    if let Some(rm) = &m.range {
+                        // Same intersection as the tone pass (pixel state here
+                        // includes this mask's own tone move — acceptable drift,
+                        // NR is the subtler effect).
+                        nw *= range_weight(rm, &data[i]);
+                    }
                     if nw <= 0.001 {
                         continue;
                     }
-                    let i = y * w + x;
                     let l = luma[i];
                     let new_l = l + (blur[i] - l) * nw;
                     scale_chroma(&mut data[i], l, new_l);
@@ -379,6 +396,47 @@ fn mask_weight(g: &MaskGeometry, nx: f32, ny: f32) -> f32 {
             } else {
                 wgt
             }
+        }
+    }
+}
+
+/// Per-pixel Range Mask weight [0,1] — Lightroom's 范围蒙版, multiplied into the
+/// geometric mask weight (intersection).
+///
+/// * `Luminance`: trapezoid over `LumRange` — smooth ramp lo_outer→lo, hold 1
+///   across lo..hi, ramp down hi→hi_outer. Degenerate edges (outer == inner,
+///   e.g. ACR's real `"… 1.000000 1.000000"`) become hard steps.
+/// * `Color`: falloff on the luminance-invariant chromaticity distance to the
+///   reference colour (each colour divided by its own luma), so a darker patch
+///   of the same hue still matches. `amount` widens tolerance: at the LR-default
+///   0.5 a saturated reference keeps same-hue pixels (d=0), rejects neutral grey
+///   (d≈0.8) and opposite hues (d≳2); at 1.0 grey gains partial weight. Very
+///   dark pixels (luma < 1e-4) have no reliable chroma and get weight 0.
+pub fn range_weight(rm: &RangeMask, px: &[f32; 3]) -> f32 {
+    // smoothstep with a degenerate-edge guard (equal edges = step function).
+    fn ramp(e0: f32, e1: f32, x: f32) -> f32 {
+        if e1 - e0 < 1e-6 {
+            if x < e0 { 0.0 } else { 1.0 }
+        } else {
+            smoothstep(e0, e1, x)
+        }
+    }
+    match rm {
+        RangeMask::Luminance { lo_outer, lo, hi, hi_outer } => {
+            let l = luma601(px);
+            ramp(*lo_outer, *lo, l) * (1.0 - ramp(*hi, *hi_outer, l))
+        }
+        RangeMask::Color { r, g, b, amount, .. } => {
+            let rl = luma601(&[*r, *g, *b]).max(1e-4);
+            let pl = luma601(px).max(1e-4);
+            let mut d2 = 0.0;
+            for (rc, pc) in [(*r, px[0]), (*g, px[1]), (*b, px[2])] {
+                let diff = rc / rl - pc / pl;
+                d2 += diff * diff;
+            }
+            let d = d2.sqrt();
+            let d_max = 0.15 + 0.9 * amount.clamp(0.0, 1.0);
+            1.0 - ramp(0.5 * d_max, d_max, d)
         }
     }
 }
@@ -1267,6 +1325,74 @@ mod tests {
         apply_develop(&mut data, w, h, &r);
         assert!(var(&data, 4..8) < right0 * 0.8, "right half should smooth");
         assert!((var(&data, 0..4) - left0).abs() < 1e-4, "left half untouched");
+    }
+
+    #[test]
+    fn luminance_range_mask_gates_by_pixel_brightness() {
+        // Full-coverage geometry (degenerate linear = weight 1 everywhere) so
+        // ONLY the luminance range decides where the −2 EV darken lands. The
+        // trapezoid uses a degenerate top edge (hi == hi_outer == 1.0), exactly
+        // like the real ACR sidecars' `LumRange="… 1.000000 1.000000"`.
+        let full = MaskGeometry::Linear { zero_x: 0.5, zero_y: 0.5, full_x: 0.5, full_y: 0.5 };
+        let r = EditRecipe {
+            masks: vec![LocalAdjustment {
+                mask: full,
+                range: Some(RangeMask::Luminance { lo_outer: 0.55, lo: 0.7, hi: 1.0, hi_outer: 1.0 }),
+                amount: 1.0,
+                exposure_ev: -2.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let dark = [0.15_f32; 3];
+        let mid = [0.625_f32; 3]; // ramp midpoint between lo_outer and lo
+        let bright = [0.85_f32; 3];
+        // Control: identical pipeline WITHOUT the mask. The global stages run
+        // either way (the neutral tone LUT still costs ~1 ULP of interpolation
+        // noise), so "untouched by the mask" means equal to the CONTROL, not to
+        // the raw input.
+        let mut control = vec![dark, mid, bright];
+        apply_develop(&mut control, 3, 1, &EditRecipe::default());
+        let mut data = vec![dark, mid, bright];
+        apply_develop(&mut data, 3, 1, &r);
+        assert_eq!(data[0], control[0], "below the range: the mask must skip it");
+        assert!(data[2][0] < 0.6, "bright pixel must darken: {}", data[2][0]);
+        // The ramp midpoint moves, but less than the fully-selected pixel.
+        let (d_mid, d_bright) = (control[1][0] - data[1][0], control[2][0] - data[2][0]);
+        assert!(d_mid > 0.01 && d_mid < d_bright, "feathered ramp: mid {d_mid} vs bright {d_bright}");
+    }
+
+    #[test]
+    fn color_range_mask_selects_chroma_not_brightness() {
+        // Desaturate through a colour range keyed to orange: both bright and
+        // dark orange collapse to grey (luminance-invariant match), while blue
+        // and neutral grey pass through bit-exact.
+        let full = MaskGeometry::Linear { zero_x: 0.5, zero_y: 0.5, full_x: 0.5, full_y: 0.5 };
+        let r = EditRecipe {
+            masks: vec![LocalAdjustment {
+                mask: full,
+                range: Some(RangeMask::Color { r: 0.9, g: 0.6, b: 0.2, amount: 0.5, px: 0.5, py: 0.5 }),
+                amount: 1.0,
+                saturation: -100.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let orange = [0.9_f32, 0.6, 0.2];
+        let dark_orange = [0.45_f32, 0.3, 0.1]; // same chromaticity, half as bright
+        let blue = [0.2_f32, 0.3, 0.9];
+        let grey = [0.6_f32; 3];
+        // Same control-render comparison as the luminance test: out-of-range
+        // pixels must match a mask-less render exactly (the mask pass skips them).
+        let mut control = vec![orange, dark_orange, blue, grey];
+        apply_develop(&mut control, 4, 1, &EditRecipe::default());
+        let mut data = vec![orange, dark_orange, blue, grey];
+        apply_develop(&mut data, 4, 1, &r);
+        let spread = |p: [f32; 3]| p[0].max(p[1]).max(p[2]) - p[0].min(p[1]).min(p[2]);
+        assert!(spread(data[0]) < 0.05, "orange must desaturate: {:?}", data[0]);
+        assert!(spread(data[1]) < 0.05, "dark orange (same hue) must desaturate: {:?}", data[1]);
+        assert_eq!(data[2], control[2], "opposite hue: the mask must skip it");
+        assert_eq!(data[3], control[3], "neutral grey: the mask must skip it");
     }
 
     #[test]

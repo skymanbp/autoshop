@@ -1,29 +1,33 @@
-# ROADMAP — “一定程度直接取代 Photoshop” 路线（v0.2.0 之后）
+# ROADMAP — “一定程度直接取代 Photoshop” 路线（v0.3.0 之后）
 
 > 交接文档：每项都附实现要点与 `file:line` 锚点，供新会话不重读全库即可
-> 开工。更新于 2026-07-06，HEAD = `997de65`（已推送，local==origin）。
+> 开工。更新于 2026-07-06（v0.3.0 发布 + 差距批次 A① 范围蒙版完成）。
 
 ## 当前状态（已完成，勿重做）
 
-- **v0.2.0 已发布**（tag `v0.2.0` → `1bc57ff`，GitHub Release 带双 exe）。
-  其后 `150c3f3`（缩放/mask/裁剪）与 **①-⑤ 整批 + 差距调查**
-  （`006b7d4`/`c0ac3e7`/`35a39e6`/`124f994`/`4154534`/`997de65`）均已推送，
-  **尚未发新 release**——内容已够 v0.3.0，等用户说"发布"。
+- **v0.3.0 已发布**（tag `v0.3.0` → `fa9add8`，GitHub Release "Autoshop
+  v0.3.0" 带双 exe）：曲线编辑器 / 批量粘贴 / WB 吸管 / 拉直 / 仿制图章 /
+  暗房工具（缩放/手动 mask/裁剪）整批。上一版 v0.2.0 → `1bc57ff`。
 - **有序批次 ①-⑤ 全部完成**（详见各节 ✅ 小节，含实现锚点与已知近似）：
   ①曲线编辑器 ②批量复制/粘贴 ③WB 吸管（含 WB 预览前置重构）
   ④拉直（引擎真旋转+自动内接裁剪）⑤仿制图章（clone_raw 像素通路）。
+- **差距批次 A① 亮度/颜色范围蒙版已完成**（见 §A ✅ 小节：recipe/render/
+  xmp/gui/advisor 五层，60 lib + 4 gui 测试）。A②（主体/天空 AI 分割）
+  未做——前置是引擎位图 mask 通路。
 - 更早已上线：反推配方（`fit.rs` + CLI `match`）、gpt-image-2 弹性高分辨率
   （≤8.3MP + 400 回退）、风格提示词提取、GUI 生产化（直方图/toast/快捷键/
   拖拽/持久化/折叠分组/双击归零）。
-- **下一批按 §与 Photoshop 的核心差距 的顺序：A 范围蒙版 → B 双轨打通 →
-  F 导出管线 → E 高分预览 → C 镜头校正 → D 色管 → G 版本。**
-- 待用户真机验收：曲线拖拽/吸管/图章/拉直手感；持久化"正常关闭→重启恢复"；
-  高分辨率生成与风格提示词的真实 API 行为（付费调用，有 400 回退兜底）。
+- **下一步按 §与 Photoshop 的核心差距 的顺序：B 双轨打通 → F 导出管线 →
+  E 高分预览 → C 镜头校正 → D 色管 → G 版本（A② AI 分割可穿插）。**
+- 待用户真机验收：曲线拖拽/吸管/图章/拉直/范围蒙版手感；持久化"正常关闭→
+  重启恢复"；范围蒙版 XMP 在真 Lightroom 打开的效果；高分辨率生成与风格
+  提示词的真实 API 行为（付费调用，有 400 回退兜底）。
 
 ## 关键架构事实（新会话必读）
 
 - 所有图上交互经 `ViewXform`（屏幕↔全幅归一化，gui.rs）；工具互斥分发在
-  `after_view`（crop > placing > wb_pick > clone > paint > box-select）。
+  `after_view`（crop > placing > wb_pick > range_pick > clone > paint >
+  box-select）。
 - `develop_preview`（render.rs）跑 `apply_recipe_wb` + `apply_develop`；
   **不应用裁剪**（GUI 用 uv 窗显示、导出端真裁）。**拉直**由 GUI `redevelop`
   在 develop_preview 之后调引擎 `rotate_straighten` 完成（导出路径同函数）。
@@ -100,15 +104,32 @@
 > 定位前提：目标是"日常出片替代"（LR/ACR + PS 修图子集），不是 PS 的
 > 设计/合成全集。按对日常出片的影响排序；「现状」均为当日代码实测。
 
-### A. 智能选区 / 范围蒙版（差距最大）
+### A. 智能选区 / 范围蒙版（① ✅ 已完成 2026-07-06 · ② 未做）
 - PS/LR：Select Subject / Sky、亮度/颜色范围蒙版。
-- 现状：mask 仅线性/径向两种几何（recipe.rs `MaskGeometry`；xmp.rs 只写
-  `Mask/Gradient` + `Mask/CircularGradient`，全库 grep 无 RangeMask 实现）；
-  画笔手涂只喂 fill/heal/clone，进不了 recipe。
-- 路径：① 亮度/颜色范围蒙版——`apply_masks` 加逐像素权重项，XMP 有
-  CorrectionRangeMask 约定，**低成本高价值，建议下一批第一项**；
-  ② 主体/天空 AI 分割（python sidecar 循 SCUNet 模式或云 API），前置是
-  引擎加位图 mask 通路。
+- **① 亮度/颜色范围蒙版 ✅**：五层打通，权重 = 几何 × 范围（相交）。
+  - recipe.rs：`RangeMask` 枚举（Luminance 4 数梯形 = ACR LumRange 原样；
+    Color = 参考色 rgb + amount 容差 + px/py 取样点）+
+    `LocalAdjustment.range: Option<RangeMask>`（serde default，旧 JSON 兼容）；
+    clamp 强制梯形非降序。
+  - render.rs：`range_weight`（亮度=梯形 ramp，退化边=阶跃；颜色=亮度不变
+    色度距离，除以各自 luma 后欧氏距离，d_max = 0.15+0.9·amount）；
+    apply_masks tone + NR 双 pass 相乘接入。
+  - xmp.rs：`range_mask_xml` 第二组件 `Mask/RangeMask`，相交编码
+    `BlendMode=1 + Inverted=true + Value=0`（从用户自己的 LR 边车
+    `_DSC9245.xmp`/`_DSC9303.xmp` 解码验证的代数）。
+  - gui.rs：选中 mask 面板「范围蒙版」下拉（无/亮度/颜色）；亮度=下限/上限/
+    羽化三滑杆（GUI 对称羽化 ↔ recipe 4 数梯形）；颜色=色块 + 🎯 取样
+    （`handle_range_pick`：pre-mask develop 的 5×5 均值，与引擎评估像素
+    一致）+ 容差滑杆；`range_picking` 入工具互斥。
+  - advisor：openai.rs 结构化 schema 加 `range`（anyOf 双变体 + null）+
+    prompt 用法指引。
+  - 已知近似：(a) 范围权重按"全局显影后、蒙版逐个叠加时"的像素评估——
+    多 mask 叠加时后面的 range 看到前面 mask 的输出（LR 是固定参考图；
+    全分辨率快照内存不可行，已注释）；(b) 颜色 PointModels 第 4-6 数
+    按"取样点坐标+保留位"假设写出，未与真 ACR 对照语义；(c) 真 LR 打开
+    效果待用户验收。
+- **② 主体/天空 AI 分割（未做）**：python sidecar 循 SCUNet 模式或云 API，
+  前置是引擎加位图 mask 通路。
 
 ### B. 像素母版 ↔ 参数配方双轨打通
 - 现状：fill/heal/clone 输出 ./out 像素母版，仅在 After 显示一次；滑杆一动
@@ -145,8 +166,8 @@
   reimagine/fill + 反推配方已覆盖摄影侧的"创意改图"。
 
 ### 建议批次顺序（v0.3.x 起）
-A（范围蒙版）→ B（双轨打通）→ F（导出管线）→ E（高分预览）→
-C（镜头校正）→ D（色管）→ G（版本）。
+~~A①（范围蒙版）~~ ✅ → B（双轨打通）→ F（导出管线）→ E（高分预览）→
+C（镜头校正）→ D（色管）→ G（版本）；A②（AI 分割）可穿插。
 
 ## 完成每项后的例行动作
 

@@ -97,6 +97,13 @@ When the USER DIRECTION names a SPECIFIC AREA (e.g. 'that corner', 'the sky', 't
 'top-left', 'this part is too noisy', 'brighten her face') translate it into a mask placed over \
 THAT area and set the relevant local sliders — including local `noise_reduction` (0..100) for a \
 noisy region. Use 1-3 masks for such localized requests. \
+Each mask MAY set `range` (else null) to refine WHERE it applies inside the geometry, like \
+Lightroom's Range Mask: {{\"kind\":\"luminance\", lo_outer<=lo<=hi<=hi_outer in 0..1}} keeps only \
+that brightness band (e.g. lo 0.6, hi/hi_outer 1.0, lo_outer 0.45 = only the bright sky inside a \
+gradient — clouds stay protected below the horizon line); {{\"kind\":\"color\", r,g,b reference in \
+0..1, amount 0..1 tolerance (0.5 default), px,py sample point}} keeps only pixels of a similar \
+colour at any brightness (e.g. deepen only the blues in a sky gradient). Prefer a plain mask; add \
+`range` when the geometry alone would spill onto things the edit must not touch. \
 Local slider values use the same scale as the globals. METADATA: {meta_json}  HISTOGRAM: {hist}",
             meta_json = meta_json,
             hist = hist_summary(hist),
@@ -244,13 +251,30 @@ fn edit_recipe_schema() -> Value {
                 "feather": num(), "roundness": num(), "flipped": {"type": "boolean"}}}
         ]
     });
+    // RangeMask tagged enum (#[serde(tag="kind")]) → anyOf of the two variants
+    // + null (strict mode requires the field to be present, so "no range" = null).
+    let range_mask = json!({
+        "anyOf": [
+            {"type": "object", "additionalProperties": false,
+             "required": ["kind","lo_outer","lo","hi","hi_outer"],
+             "properties": {"kind": {"type": "string", "enum": ["luminance"]},
+                "lo_outer": num(), "lo": num(), "hi": num(), "hi_outer": num()}},
+            {"type": "object", "additionalProperties": false,
+             "required": ["kind","r","g","b","amount","px","py"],
+             "properties": {"kind": {"type": "string", "enum": ["color"]},
+                "r": num(), "g": num(), "b": num(), "amount": num(),
+                "px": num(), "py": num()}},
+            {"type": "null"}
+        ]
+    });
     let local_adjustment = json!({
         "type": "object", "additionalProperties": false,
-        "required": ["mask","name","amount","inverted","exposure_ev","contrast","highlights",
+        "required": ["mask","range","name","amount","inverted","exposure_ev","contrast","highlights",
             "shadows","whites","blacks","clarity","dehaze","texture","saturation","temperature","tint",
             "noise_reduction"],
         "properties": {
             "mask": mask_geometry,
+            "range": range_mask,
             "name": {"type": "string"}, "amount": num(), "inverted": {"type": "boolean"},
             "exposure_ev": num(), "contrast": num(), "highlights": num(), "shadows": num(),
             "whites": num(), "blacks": num(), "clarity": num(), "dehaze": num(),
