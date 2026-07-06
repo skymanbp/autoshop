@@ -14,12 +14,56 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::load::SizedTexture;
 
 use autoshop::recipe::{EditRecipe, Hsl, ColorGrade};
 use image::GenericImageView;
+
+/// How the preview area is laid out. `AfterOnly` gives the edit the whole
+/// canvas (hold **B** to flash the source in place — the Lightroom gesture);
+/// `SideBySide` keeps the permanent comparison.
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+enum ViewMode {
+    SideBySide,
+    AfterOnly,
+}
+
+/// A transient corner notification. Errors linger twice as long as successes —
+/// a one-line status bar alone is too easy to miss for a failed export.
+struct Toast {
+    text: String,
+    kind: ToastKind,
+    born: Instant,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ToastKind {
+    Success,
+    Error,
+}
+
+impl Toast {
+    fn ttl(&self) -> Duration {
+        match self.kind {
+            ToastKind::Success => Duration::from_secs(4),
+            ToastKind::Error => Duration::from_secs(8),
+        }
+    }
+}
+
+/// The prefs worth remembering across launches (stored via eframe persistence
+/// next to the window geometry). Everything here must stay cheap to re-apply.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Prefs {
+    gallery_dir: Option<PathBuf>,
+    style_strength: f32,
+    save_jpeg: bool,
+    save_denoise: bool,
+    view_mode: ViewMode,
+}
 
 const PREVIEW_EDGE: u32 = 1280; // working preview size for fast live develop
 const THUMB_EDGE: u32 = 160; // decoded gallery-thumbnail long edge
@@ -92,6 +136,40 @@ fn model_opts(fetched: &[String], fallback: &[&str], current: &str) -> Vec<Strin
         v.insert(0, current.to_string());
     }
     v
+}
+
+/// Every source type the app opens — ONE list shared by the file dialog, drag &
+/// drop, and any future association, so they can't drift apart.
+const PHOTO_EXTS: [&str; 11] =
+    ["arw", "dng", "raf", "nef", "cr2", "cr3", "png", "tif", "tiff", "jpg", "jpeg"];
+
+fn is_photo_path(p: &std::path::Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| PHOTO_EXTS.iter().any(|x| e.eq_ignore_ascii_case(x)))
+}
+
+fn photo_file_dialog() -> Option<PathBuf> {
+    rfd::FileDialog::new().add_filter("Photos", &PHOTO_EXTS).pick_file()
+}
+
+/// Scale `tex_size` to fit a `max_w` × `avail_y` box (both dimensions — width
+/// alone lets a portrait overflow the panel), never upscaling past 4×.
+fn fit_in(tex_size: egui::Vec2, max_w: f32, avail_y: f32) -> egui::Vec2 {
+    let s = (max_w / tex_size.x.max(1.0))
+        .min(avail_y.max(1.0) / tex_size.y.max(1.0))
+        .clamp(0.01, 4.0);
+    tex_size * s
+}
+
+/// Section header text with an activity dot when the section holds non-neutral
+/// values — a collapsed active adjustment must never be invisible.
+fn section_title(base: &str, active: bool) -> String {
+    if active {
+        format!("{base}  ●")
+    } else {
+        base.to_string()
+    }
 }
 
 /// Two API base URLs are the "same endpoint" ignoring whitespace / a trailing slash.
@@ -171,6 +249,11 @@ struct AutoshopApp {
     heal_fullres: bool,                    // heal the full-res develop
     // --- reverse-fit ("match") ---
     last_generated: Option<PathBuf>,       // this photo's last reimagine output (fit target)
+    // --- production niceties ---
+    view_mode: ViewMode,                   // side-by-side vs after-only (hold B = compare)
+    toasts: Vec<Toast>,                    // transient corner notifications
+    histogram: Option<Vec<[f32; 4]>>,      // live RGB+luma histogram of the After preview
+    last_title: String,                    // window title cache (send only on change)
 }
 
 impl Default for AutoshopApp {
@@ -221,8 +304,83 @@ impl Default for AutoshopApp {
             fill_fullres: false,
             heal_fullres: false,
             last_generated: None,
+            view_mode: ViewMode::SideBySide,
+            toasts: Vec::new(),
+            histogram: None,
+            last_title: String::new(),
         }
     }
+}
+
+impl AutoshopApp {
+    /// Restore persisted prefs (last folder, view mode, export options) and
+    /// re-open the library the user was browsing. Window geometry itself is
+    /// restored by eframe's own persistence layer.
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut app = Self::default();
+        if let Some(prefs) =
+            cc.storage.and_then(|s| eframe::get_value::<Prefs>(s, eframe::APP_KEY))
+        {
+            app.style_strength = prefs.style_strength.clamp(0.0, 1.0);
+            app.save_jpeg = prefs.save_jpeg;
+            app.save_denoise = prefs.save_denoise;
+            app.view_mode = prefs.view_mode;
+            if let Some(dir) = prefs.gallery_dir.filter(|d| d.is_dir()) {
+                app.open_folder(dir);
+            }
+        }
+        app
+    }
+
+    fn toast(&mut self, kind: ToastKind, text: impl Into<String>) {
+        self.toasts.push(Toast { text: text.into(), kind, born: Instant::now() });
+        if self.toasts.len() > 5 {
+            self.toasts.remove(0); // keep the stack readable
+        }
+    }
+
+    /// A worker finished successfully: status line + a success toast, unbusy.
+    fn done(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        self.status = text.clone();
+        self.toast(ToastKind::Success, text);
+        self.busy = false;
+    }
+
+    /// A worker failed: status line + a lingering error toast, unbusy. A single
+    /// status line is too easy to miss for a failed export or API call.
+    fn fail(&mut self, what: &str, e: impl std::fmt::Display) {
+        let text = format!("{what}: {e}");
+        self.status = text.clone();
+        self.toast(ToastKind::Error, text);
+        self.busy = false;
+    }
+}
+
+/// 64-bin RGB+luma histogram of a preview, each channel normalised to its own
+/// peak bin (shape is what matters; absolute counts depend on preview size).
+fn compute_histogram(img: &image::DynamicImage) -> Vec<[f32; 4]> {
+    const BINS: usize = 64;
+    let rgb = img.to_rgb8();
+    let mut counts = vec![[0u32; 4]; BINS];
+    for px in rgb.pixels() {
+        let (r, g, b) = (px[0] as usize, px[1] as usize, px[2] as usize);
+        let luma = (0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32) as usize;
+        counts[r * BINS / 256][0] += 1;
+        counts[g * BINS / 256][1] += 1;
+        counts[b * BINS / 256][2] += 1;
+        counts[(luma * BINS / 256).min(BINS - 1)][3] += 1;
+    }
+    let mut max = [1u32; 4];
+    for bins in &counts {
+        for ch in 0..4 {
+            max[ch] = max[ch].max(bins[ch]);
+        }
+    }
+    counts
+        .iter()
+        .map(|bins| std::array::from_fn(|ch| bins[ch] as f32 / max[ch] as f32))
+        .collect()
 }
 
 /// `image::DynamicImage` → egui texture-ready colour image.
@@ -601,13 +759,63 @@ impl AutoshopApp {
         });
     }
 
-    /// Re-develop the working preview through the current recipe.
+    /// Re-develop the working preview through the current recipe, and refresh
+    /// the live histogram from the developed pixels (same buffer, one pass).
     fn redevelop(&mut self, ctx: &egui::Context) {
         if let Some(base) = &self.base_preview {
             let after = autoshop::render::develop_preview(base, &self.recipe);
+            self.histogram = Some(compute_histogram(&after));
             self.after_tex = Some(ctx.load_texture("after", to_color_image(&after), egui::TextureOptions::LINEAR));
         }
         self.dirty = false;
+    }
+
+    /// Draw the live histogram (R/G/B filled, luma outline) — the tone readout a
+    /// photo editor is expected to have. Sqrt-scaled so shadow detail reads.
+    fn histogram_ui(&self, ui: &mut egui::Ui) {
+        let Some(hist) = &self.histogram else { return };
+        let h = 72.0;
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), h),
+            egui::Sense::hover(),
+        );
+        let p = ui.painter_at(rect);
+        p.rect_filled(rect, 3.0, egui::Color32::from_gray(16));
+        let n = hist.len().max(1);
+        let bar_w = rect.width() / n as f32;
+        // Additive-ish RGB: draw each channel as translucent filled bars.
+        let colors = [
+            egui::Color32::from_rgba_unmultiplied(220, 70, 70, 110),
+            egui::Color32::from_rgba_unmultiplied(90, 200, 90, 110),
+            egui::Color32::from_rgba_unmultiplied(90, 130, 240, 110),
+        ];
+        for (ch, color) in colors.iter().enumerate() {
+            for (i, bins) in hist.iter().enumerate() {
+                let v = bins[ch].sqrt(); // sqrt: make shadow counts visible
+                if v <= 0.0 {
+                    continue;
+                }
+                let x0 = rect.min.x + i as f32 * bar_w;
+                let y0 = rect.max.y - v * (h - 2.0);
+                p.rect_filled(
+                    egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x0 + bar_w, rect.max.y)),
+                    0.0,
+                    *color,
+                );
+            }
+        }
+        // Luma as a thin outline on top for the overall tone shape.
+        let pts: Vec<egui::Pos2> = hist
+            .iter()
+            .enumerate()
+            .map(|(i, bins)| {
+                egui::pos2(
+                    rect.min.x + (i as f32 + 0.5) * bar_w,
+                    rect.max.y - bins[3].sqrt() * (h - 2.0),
+                )
+            })
+            .collect();
+        p.add(egui::Shape::line(pts, egui::Stroke::new(1.0, egui::Color32::from_gray(210))));
     }
 
     fn start_analyze(&mut self) {
@@ -753,8 +961,7 @@ impl AutoshopApp {
                         self.status = "ready — adjust sliders or run AI Analyze".into();
                     }
                     Err(e) => {
-                        self.busy = false;
-                        self.status = format!("could not open: {e}");
+                        self.fail("could not open", e);
                     }
                 },
                 Msg::Analyzed(boxed) => match *boxed {
@@ -767,17 +974,14 @@ impl AutoshopApp {
                         self.status = "AI develop applied".into();
                     }
                     Err(e) => {
-                        self.busy = false;
-                        self.status = format!("analyze failed: {e}");
+                        self.fail("analyze failed", e);
                     }
                 },
                 Msg::Exported(Ok(p)) => {
-                    self.busy = false;
-                    self.status = format!("exported → {p}");
+                    self.done(format!("exported → {p}"));
                 }
                 Msg::Exported(Err(e)) => {
-                    self.busy = false;
-                    self.status = format!("export failed: {e}");
+                    self.fail("export failed", e);
                 }
                 Msg::Folder(boxed) => match *boxed {
                     Ok((dir, list)) => {
@@ -793,8 +997,7 @@ impl AutoshopApp {
                         self.status = format!("{n} photo{} — click a thumbnail to open", if n == 1 { "" } else { "s" });
                     }
                     Err(e) => {
-                        self.busy = false;
-                        self.status = format!("scan failed: {e}");
+                        self.fail("scan failed", e);
                     }
                 },
                 Msg::Thumb { generation, idx, img } => {
@@ -829,12 +1032,10 @@ impl AutoshopApp {
                             self.last_generated = Some(p);
                         }
                         self.clear_mask();
-                        self.busy = false;
-                        self.status = msg;
+                        self.done(msg);
                     }
                     Err(e) => {
-                        self.busy = false;
-                        self.status = format!("retouch failed: {e}");
+                        self.fail("retouch failed", e);
                     }
                 },
                 Msg::Fitted(boxed) => match *boxed {
@@ -847,25 +1048,20 @@ impl AutoshopApp {
                         self.rationale = self.recipe.rationale.clone();
                         self.verdict = None;
                         self.dirty = true;
-                        self.busy = false;
-                        self.status = note;
+                        self.done(note);
                     }
                     Err(e) => {
-                        self.busy = false;
-                        self.status = format!("反推失败: {e}");
+                        self.fail("反推失败", e);
                     }
                 },
                 Msg::Styled(boxed) => match *boxed {
                     Ok(prompt) => {
                         // Into the Direction box: ready to restyle OTHER photos.
                         self.guidance = prompt;
-                        self.busy = false;
-                        self.status =
-                            "风格提示词已提取 → 已填入 Direction（同时存 ./out/<stem>.style.txt）".into();
+                        self.done("风格提示词已提取 → 已填入 Direction（同时存 ./out/<stem>.style.txt）");
                     }
                     Err(e) => {
-                        self.busy = false;
-                        self.status = format!("风格提取失败: {e}");
+                        self.fail("风格提取失败", e);
                     }
                 },
                 Msg::Models(res) => match res {
@@ -899,9 +1095,24 @@ impl AutoshopApp {
         }
     }
 
-    /// One labelled slider; returns true if the value changed this frame.
-    fn slider(ui: &mut egui::Ui, label: &str, value: &mut f32, min: f32, max: f32) -> bool {
-        ui.add(egui::Slider::new(value, min..=max).text(label)).changed()
+    /// One labelled slider; double-click resets to `default` (the Lightroom
+    /// gesture). Returns true if the value changed this frame.
+    fn slider(
+        ui: &mut egui::Ui,
+        label: &str,
+        value: &mut f32,
+        min: f32,
+        max: f32,
+        default: f32,
+    ) -> bool {
+        let resp = ui
+            .add(egui::Slider::new(value, min..=max).text(label))
+            .on_hover_text("双击归零 / double-click resets");
+        if resp.double_clicked() && *value != default {
+            *value = default;
+            return true;
+        }
+        resp.changed()
     }
 
     /// Left-most panel: the working-folder thumbnail gallery. Only visible rows
@@ -1008,97 +1219,175 @@ impl AutoshopApp {
     fn develop_panel(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
         ui.heading("Develop");
+        self.histogram_ui(ui);
+        ui.add_space(4.0);
 
-        // White balance (temperature is nullable = as-shot).
-        let mut custom_wb = self.recipe.temperature_k.is_some();
-        if ui.checkbox(&mut custom_wb, "Custom white balance (off = as-shot)").changed() {
-            self.recipe.temperature_k = if custom_wb { Some(5500.0) } else { None };
-            changed = true;
-        }
-        if let Some(mut k) = self.recipe.temperature_k
-            && Self::slider(ui, "Temp (K)", &mut k, 2000.0, 40000.0)
-        {
-            self.recipe.temperature_k = Some(k);
-            changed = true;
-        }
-
-        let r = &mut self.recipe;
-        changed |= Self::slider(ui, "Exposure", &mut r.exposure_ev, -5.0, 5.0);
-        changed |= Self::slider(ui, "Contrast", &mut r.contrast, -100.0, 100.0);
-        changed |= Self::slider(ui, "Highlights", &mut r.highlights, -100.0, 100.0);
-        changed |= Self::slider(ui, "Shadows", &mut r.shadows, -100.0, 100.0);
-        changed |= Self::slider(ui, "Whites", &mut r.whites, -100.0, 100.0);
-        changed |= Self::slider(ui, "Blacks", &mut r.blacks, -100.0, 100.0);
-        changed |= Self::slider(ui, "Clarity", &mut r.clarity, -100.0, 100.0);
-        changed |= Self::slider(ui, "Dehaze", &mut r.dehaze, -100.0, 100.0);
-        changed |= Self::slider(ui, "Vibrance", &mut r.vibrance, -100.0, 100.0);
-        changed |= Self::slider(ui, "Saturation", &mut r.saturation, -100.0, 100.0);
-        changed |= Self::slider(ui, "Tint", &mut r.tint, -100.0, 100.0);
-        changed |= Self::slider(ui, "Sharpening", &mut r.sharpening, 0.0, 150.0);
-        changed |= Self::slider(ui, "Noise Reduction", &mut r.noise_reduction, 0.0, 100.0);
-
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.heading("Color Mixer");
-            ui.label(egui::RichText::new("· HSL").weak());
-            if ui.small_button("reset").clicked() {
-                self.recipe.hsl = Hsl::default();
-                changed = true;
-            }
-        });
-        egui::ComboBox::from_id_salt("hsl_band")
-            .selected_text(HSL_BANDS[self.hsl_band])
-            .show_ui(ui, |ui| {
-                for (i, name) in HSL_BANDS.iter().enumerate() {
-                    ui.selectable_value(&mut self.hsl_band, i, *name);
-                }
-            });
-        let b = self.hsl_band;
-        changed |= Self::slider(ui, "Hue", &mut self.recipe.hsl.hue[b], -100.0, 100.0);
-        changed |= Self::slider(ui, "Saturation", &mut self.recipe.hsl.saturation[b], -100.0, 100.0);
-        changed |= Self::slider(ui, "Luminance", &mut self.recipe.hsl.luminance[b], -100.0, 100.0);
-
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.heading("Color Grading");
-            if ui.small_button("reset").clicked() {
-                self.recipe.color_grade = ColorGrade::default();
-                changed = true;
-            }
-        });
-        egui::ComboBox::from_id_salt("grade_region")
-            .selected_text(GRADE_REGIONS[self.grade_region])
-            .show_ui(ui, |ui| {
-                for (i, name) in GRADE_REGIONS.iter().enumerate() {
-                    ui.selectable_value(&mut self.grade_region, i, *name);
-                }
-            });
-        let cg = &mut self.recipe.color_grade;
-        let (mut hue, mut sat, mut lum) = match self.grade_region {
-            0 => (cg.shadow_hue, cg.shadow_sat, cg.shadow_lum),
-            1 => (cg.midtone_hue, cg.midtone_sat, cg.midtone_lum),
-            2 => (cg.highlight_hue, cg.highlight_sat, cg.highlight_lum),
-            _ => (cg.global_hue, cg.global_sat, cg.global_lum),
+        // Lightroom-style grouping: a wall of 16 sliders scans terribly; four
+        // titled sections (tone open, the rest by activity) scan at a glance.
+        // A section whose values are non-neutral shows a ● so a collapsed
+        // active adjustment is never invisible. Flags are snapshot up front —
+        // Copy bools, so no borrow spans the section closures (E0500).
+        let (presence_active, detail_active, hsl_active, grade_active) = {
+            let r = &self.recipe;
+            (
+                r.clarity != 0.0 || r.dehaze != 0.0 || r.vibrance != 0.0 || r.saturation != 0.0,
+                r.sharpening != 0.0 || r.noise_reduction != 0.0,
+                !r.hsl.is_neutral(),
+                !r.color_grade.is_neutral(),
+            )
         };
-        let mut wheel_changed = false;
-        wheel_changed |= Self::slider(ui, "Hue", &mut hue, 0.0, 360.0);
-        wheel_changed |= Self::slider(ui, "Saturation", &mut sat, 0.0, 100.0);
-        wheel_changed |= Self::slider(ui, "Luminance", &mut lum, -100.0, 100.0);
-        if wheel_changed {
-            match self.grade_region {
-                0 => { cg.shadow_hue = hue; cg.shadow_sat = sat; cg.shadow_lum = lum; }
-                1 => { cg.midtone_hue = hue; cg.midtone_sat = sat; cg.midtone_lum = lum; }
-                2 => { cg.highlight_hue = hue; cg.highlight_sat = sat; cg.highlight_lum = lum; }
-                _ => { cg.global_hue = hue; cg.global_sat = sat; cg.global_lum = lum; }
-            }
-            changed = true;
-        }
-        changed |= Self::slider(ui, "Blending", &mut cg.blending, 0.0, 100.0);
-        changed |= Self::slider(ui, "Balance", &mut cg.balance, -100.0, 100.0);
+
+        egui::CollapsingHeader::new("色调 · Tone & WB")
+            .id_salt("sec_tone")
+            .default_open(true)
+            .show(ui, |ui| {
+                let mut custom_wb = self.recipe.temperature_k.is_some();
+                if ui.checkbox(&mut custom_wb, "Custom white balance (off = as-shot)").changed() {
+                    self.recipe.temperature_k = if custom_wb { Some(5500.0) } else { None };
+                    changed = true;
+                }
+                if let Some(mut k) = self.recipe.temperature_k
+                    && Self::slider(ui, "Temp (K)", &mut k, 2000.0, 40000.0, 5500.0)
+                {
+                    self.recipe.temperature_k = Some(k);
+                    changed = true;
+                }
+                let r = &mut self.recipe;
+                changed |= Self::slider(ui, "Tint", &mut r.tint, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, "Exposure", &mut r.exposure_ev, -5.0, 5.0, 0.0);
+                changed |= Self::slider(ui, "Contrast", &mut r.contrast, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, "Highlights", &mut r.highlights, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, "Shadows", &mut r.shadows, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, "Whites", &mut r.whites, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, "Blacks", &mut r.blacks, -100.0, 100.0, 0.0);
+            });
+
+        egui::CollapsingHeader::new(section_title("质感 · Presence", presence_active))
+            .id_salt("sec_presence")
+            .default_open(true)
+            .show(ui, |ui| {
+                let r = &mut self.recipe;
+                changed |= Self::slider(ui, "Clarity", &mut r.clarity, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, "Dehaze", &mut r.dehaze, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, "Vibrance", &mut r.vibrance, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, "Saturation", &mut r.saturation, -100.0, 100.0, 0.0);
+            });
+
+        egui::CollapsingHeader::new(section_title("细节 · Detail", detail_active))
+            .id_salt("sec_detail")
+            .default_open(false)
+            .show(ui, |ui| {
+                let r = &mut self.recipe;
+                changed |= Self::slider(ui, "Sharpening", &mut r.sharpening, 0.0, 150.0, 0.0);
+                changed |=
+                    Self::slider(ui, "Noise Reduction", &mut r.noise_reduction, 0.0, 100.0, 0.0);
+            });
+
+        egui::CollapsingHeader::new(section_title("混色器 · Color Mixer (HSL)", hsl_active))
+            .id_salt("sec_hsl")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("hsl_band")
+                        .selected_text(HSL_BANDS[self.hsl_band])
+                        .show_ui(ui, |ui| {
+                            for (i, name) in HSL_BANDS.iter().enumerate() {
+                                ui.selectable_value(&mut self.hsl_band, i, *name);
+                            }
+                        });
+                    if ui.small_button("↺ reset all").clicked() {
+                        self.recipe.hsl = Hsl::default();
+                        changed = true;
+                    }
+                });
+                let b = self.hsl_band;
+                changed |= Self::slider(ui, "Hue", &mut self.recipe.hsl.hue[b], -100.0, 100.0, 0.0);
+                changed |=
+                    Self::slider(ui, "Saturation", &mut self.recipe.hsl.saturation[b], -100.0, 100.0, 0.0);
+                changed |=
+                    Self::slider(ui, "Luminance", &mut self.recipe.hsl.luminance[b], -100.0, 100.0, 0.0);
+            });
+
+        egui::CollapsingHeader::new(section_title("调色 · Color Grading", grade_active))
+            .id_salt("sec_grade")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("grade_region")
+                        .selected_text(GRADE_REGIONS[self.grade_region])
+                        .show_ui(ui, |ui| {
+                            for (i, name) in GRADE_REGIONS.iter().enumerate() {
+                                ui.selectable_value(&mut self.grade_region, i, *name);
+                            }
+                        });
+                    if ui.small_button("↺ reset all").clicked() {
+                        self.recipe.color_grade = ColorGrade::default();
+                        changed = true;
+                    }
+                });
+                let cg = &mut self.recipe.color_grade;
+                let (mut hue, mut sat, mut lum) = match self.grade_region {
+                    0 => (cg.shadow_hue, cg.shadow_sat, cg.shadow_lum),
+                    1 => (cg.midtone_hue, cg.midtone_sat, cg.midtone_lum),
+                    2 => (cg.highlight_hue, cg.highlight_sat, cg.highlight_lum),
+                    _ => (cg.global_hue, cg.global_sat, cg.global_lum),
+                };
+                let mut wheel_changed = false;
+                wheel_changed |= Self::slider(ui, "Hue", &mut hue, 0.0, 360.0, 0.0);
+                wheel_changed |= Self::slider(ui, "Saturation", &mut sat, 0.0, 100.0, 0.0);
+                wheel_changed |= Self::slider(ui, "Luminance", &mut lum, -100.0, 100.0, 0.0);
+                if wheel_changed {
+                    match self.grade_region {
+                        0 => { cg.shadow_hue = hue; cg.shadow_sat = sat; cg.shadow_lum = lum; }
+                        1 => { cg.midtone_hue = hue; cg.midtone_sat = sat; cg.midtone_lum = lum; }
+                        2 => { cg.highlight_hue = hue; cg.highlight_sat = sat; cg.highlight_lum = lum; }
+                        _ => { cg.global_hue = hue; cg.global_sat = sat; cg.global_lum = lum; }
+                    }
+                    changed = true;
+                }
+                changed |= Self::slider(ui, "Blending", &mut cg.blending, 0.0, 100.0, 50.0);
+                changed |= Self::slider(ui, "Balance", &mut cg.balance, -100.0, 100.0, 0.0);
+            });
 
         if changed {
             self.recipe.clamp();
             self.dirty = true;
+        }
+    }
+
+    /// The After image with its interaction layers (paint mask / box-select),
+    /// or the SOURCE flashed in the same rect while `comparing` (B held) — with
+    /// the handlers paused, since their target isn't on screen.
+    fn after_view(&mut self, ui: &mut egui::Ui, max_w: f32, avail_y: f32, comparing: bool) {
+        let hint = if comparing {
+            "Before (source) — 松开 B 回到编辑"
+        } else if self.paint_mode {
+            "After (edit) — paint over the area to fill / heal"
+        } else {
+            "After (edit) — drag a box to target a local edit · 按住 B 看原图"
+        };
+        ui.label(egui::RichText::new(hint).weak());
+        let tex = if comparing { self.before_tex.as_ref() } else { self.after_tex.as_ref() };
+        if let Some((id, size)) = tex.map(|t| (t.id(), t.size_vec2())) {
+            let resp = ui.add(
+                egui::Image::new(SizedTexture::new(id, size))
+                    .fit_to_exact_size(fit_in(size, max_w, avail_y))
+                    .sense(egui::Sense::click_and_drag()),
+            );
+            let rect = resp.rect;
+            if comparing {
+                return;
+            }
+            if self.paint_mode {
+                self.handle_paint(&resp, rect);
+                self.ensure_mask_tex(ui.ctx());
+                if let Some(t) = &self.mask_tex {
+                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    ui.painter().image(t.id(), rect, uv, egui::Color32::WHITE);
+                }
+            } else {
+                self.handle_region_select(ui, &resp, rect);
+            }
         }
     }
 
@@ -1438,112 +1727,126 @@ impl AutoshopApp {
         // Whole-image generative re-render: let gpt-image DIRECTLY produce the
         // picture (the optional "GPT makes the image" path). Distinct from
         // AI Analyze, which emits a faithful parametric recipe — but the
-        // reverse-fit button below closes the loop: generated look → recipe.
-        ui.label(egui::RichText::new("整图 AI 生成 · Reimagine (gpt-image 直接出图)").strong());
-        ui.add_enabled_ui(!self.busy, |ui| {
-            if ui
-                .button("✨ AI 生成出片")
-                .on_hover_text(
-                    "用 gpt-image 直接重绘整张图（拿上方 Direction 文本当风格描述）。重绘像素=非保真；\
-                     支持任意尺寸的模型（gpt-image-2）可达 ~8MP，其余 ~1.5K。需 OPENAI_API_KEY",
-                )
-                .clicked()
-            {
-                self.start_reimagine();
-            }
-        });
-        // Reverse-fit the generated look back into an editable recipe — this is
-        // how the low-res experiment becomes a full-resolution, XMP-able edit.
-        let can_fit = self.last_generated.is_some() && self.base_preview.is_some();
-        ui.add_enabled_ui(!self.busy && can_fit, |ui| {
-            ui.horizontal(|ui| {
-                if ui
-                    .button("🎛 反推配方 → 滑杆/XMP")
-                    .on_hover_text(
-                        "统计拟合：把刚生成的观感反解成可编辑的 develop 参数（本地运算，无 API 费）。\
-                         滑杆会更新（可 undo），RAW 同时写 ./out XMP；再点 Save 可出全分辨率成品",
+        // reverse-fit button closes the loop: generated look → recipe.
+        egui::CollapsingHeader::new("整图 AI 生成 · Reimagine")
+            .id_salt("sec_reimagine")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.add_enabled_ui(!self.busy, |ui| {
+                    if ui
+                        .button("✨ AI 生成出片")
+                        .on_hover_text(
+                            "用 gpt-image 直接重绘整张图（拿上方 Direction 文本当风格描述）。重绘像素=非保真；\
+                             支持任意尺寸的模型（gpt-image-2）可达 ~8MP，其余 ~1.5K。需 OPENAI_API_KEY",
+                        )
+                        .clicked()
+                    {
+                        self.start_reimagine();
+                    }
+                });
+                // Reverse-fit the generated look back into an editable recipe —
+                // how the low-res experiment becomes a full-res, XMP-able edit.
+                let can_fit = self.last_generated.is_some() && self.base_preview.is_some();
+                ui.add_enabled_ui(!self.busy && can_fit, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("🎛 反推配方 → 滑杆/XMP")
+                            .on_hover_text(
+                                "统计拟合：把刚生成的观感反解成可编辑的 develop 参数（本地运算，无 API 费）。\
+                                 滑杆会更新（可 undo），RAW 同时写 ./out XMP；再点 Save 可出全分辨率成品",
+                            )
+                            .clicked()
+                        {
+                            self.start_fit();
+                        }
+                        if ui
+                            .button("📝 提取风格提示词")
+                            .on_hover_text(
+                                "对比 原图/生成图，让 vision 模型写一段可复用的风格 prompt：\
+                                 自动填入 Direction（可直接给别的照片 Reimagine 用）并存 ./out/<stem>.style.txt",
+                            )
+                            .clicked()
+                        {
+                            self.start_style_prompt();
+                        }
+                    });
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "拿上方 Direction 当风格描述。生成后可「反推配方」把观感变成滑杆+XMP（全分辨率的正道）。",
                     )
-                    .clicked()
-                {
-                    self.start_fit();
-                }
-                if ui
-                    .button("📝 提取风格提示词")
-                    .on_hover_text(
-                        "对比 原图/生成图，让 vision 模型写一段可复用的风格 prompt：\
-                         自动填入 Direction（可直接给别的照片 Reimagine 用）并存 ./out/<stem>.style.txt",
-                    )
-                    .clicked()
-                {
-                    self.start_style_prompt();
-                }
+                    .weak()
+                    .small(),
+                );
             });
-        });
-        ui.label(
-            egui::RichText::new(
-                "拿上方 Direction 当风格描述。生成后可「反推配方」把观感变成滑杆+XMP（全分辨率的正道）。",
-            )
-            .weak()
-            .small(),
-        );
-        ui.separator();
 
+        // Mask tools shared by Fill AND Heal — one brush, two consumers.
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.paint_mode, "Paint mask")
-                .on_hover_text("Brush over the area; box-select is paused while on");
+                .on_hover_text("Brush over the area; box-select is paused while on. Fill 与 Heal 共用");
             if ui.button("Clear").clicked() {
                 self.clear_mask();
             }
         });
         ui.add(egui::Slider::new(&mut self.brush, 4.0..=80.0).text("brush"));
 
-        ui.label(egui::RichText::new("Generative Fill · 实验").strong());
-        ui.add(
-            egui::TextEdit::singleline(&mut self.fill_prompt)
-                .desired_width(f32::INFINITY)
-                .hint_text("what belongs there, e.g. remove the trash can, extend the sky"),
-        );
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("fill_quality")
-                .selected_text(["high", "medium", "low"][self.fill_quality.min(2)])
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.fill_quality, 0, "high");
-                    ui.selectable_value(&mut self.fill_quality, 1, "medium");
-                    ui.selectable_value(&mut self.fill_quality, 2, "low");
+        egui::CollapsingHeader::new("生成填充 · Generative Fill")
+            .id_salt("sec_fill")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.fill_prompt)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("what belongs there, e.g. remove the trash can, extend the sky"),
+                );
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("fill_quality")
+                        .selected_text(["high", "medium", "low"][self.fill_quality.min(2)])
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.fill_quality, 0, "high");
+                            ui.selectable_value(&mut self.fill_quality, 1, "medium");
+                            ui.selectable_value(&mut self.fill_quality, 2, "low");
+                        });
+                    ui.checkbox(&mut self.fill_fullres, "Full-res")
+                        .on_hover_text("Composite onto the full-sensor develop (slow, RAW only)");
+                    ui.add_enabled_ui(!self.busy, |ui| {
+                        if ui.button("Remove / Fill").clicked() {
+                            self.start_fill();
+                        }
+                    });
                 });
-            ui.checkbox(&mut self.fill_fullres, "Full-res")
-                .on_hover_text("Composite onto the full-sensor develop (slow, RAW only)");
-        });
-        ui.add_enabled_ui(!self.busy, |ui| {
-            if ui.button("Remove / Fill").clicked() {
-                self.start_fill();
-            }
-        });
-        ui.label(
-            egui::RichText::new("Paint the area, write what belongs there, then Remove/Fill. Needs OPENAI_API_KEY.")
-                .weak()
-                .small(),
-        );
-
-        ui.label(egui::RichText::new("修图 · 去瑕疵 Heal（像素）").strong());
-        ui.horizontal(|ui| {
-            ui.add_enabled_ui(!self.busy, |ui| {
-                if ui.button("✦ AI 去瑕疵 (auto)").clicked() {
-                    self.start_heal(false);
-                }
-                if ui.button("Heal painted area").clicked() {
-                    self.start_heal(true);
-                }
+                ui.label(
+                    egui::RichText::new(
+                        "Paint the area, write what belongs there, then Remove/Fill. Needs OPENAI_API_KEY.",
+                    )
+                    .weak()
+                    .small(),
+                );
             });
-            ui.checkbox(&mut self.heal_fullres, "Full-res");
-        });
-        ui.label(
-            egui::RichText::new(
-                "AI auto-detects dust / blemishes, or paint a mask and Heal it. Pixel retouch from surrounding pixels; saved to ./out.",
-            )
-            .weak()
-            .small(),
-        );
+
+        egui::CollapsingHeader::new("去瑕疵 · Heal（像素）")
+            .id_salt("sec_heal")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!self.busy, |ui| {
+                        if ui.button("✦ AI 去瑕疵 (auto)").clicked() {
+                            self.start_heal(false);
+                        }
+                        if ui.button("Heal painted area").clicked() {
+                            self.start_heal(true);
+                        }
+                    });
+                    ui.checkbox(&mut self.heal_fullres, "Full-res");
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "AI auto-detects dust / blemishes, or paint a mask and Heal it. Pixel retouch from surrounding pixels; saved to ./out.",
+                    )
+                    .weak()
+                    .small(),
+                );
+            });
     }
 }
 
@@ -1551,27 +1854,83 @@ impl eframe::App for AutoshopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_workers(ctx);
 
-        // Global undo/redo keys. Skip while a widget is focused so the Direction
-        // text field keeps its own text undo. Ctrl+Z = undo; Ctrl+Y / Ctrl+Shift+Z = redo.
+        // Global shortcuts. Skip while a widget is focused so the Direction text
+        // field keeps its own text editing / undo. Ctrl+Z/Y = undo/redo,
+        // Ctrl+O = open, Ctrl+E = export, Ctrl+S = save XMP, ←/→ = walk the
+        // gallery — the keyboard grammar of every desktop photo editor.
         if ctx.memory(|m| m.focused()).is_none() {
-            let (mut do_undo, mut do_redo) = (false, false);
+            let (mut do_undo, mut do_redo, mut do_open, mut do_export, mut do_xmp) =
+                (false, false, false, false, false);
+            let mut nav: i32 = 0;
             ctx.input_mut(|i| {
                 if i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z) { do_redo = true; }
                 if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y) { do_redo = true; }
                 if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z) { do_undo = true; }
+                if i.consume_key(egui::Modifiers::COMMAND, egui::Key::O) { do_open = true; }
+                if i.consume_key(egui::Modifiers::COMMAND, egui::Key::E) { do_export = true; }
+                if i.consume_key(egui::Modifiers::COMMAND, egui::Key::S) { do_xmp = true; }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) { nav = 1; }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) { nav = -1; }
             });
             if do_undo { self.undo(); }
             if do_redo { self.redo(); }
+            if do_open && !self.busy
+                && let Some(path) = photo_file_dialog()
+            {
+                self.selected = None;
+                self.open_path(path);
+            }
+            if do_export && self.src_path.is_some() && !self.busy {
+                self.start_export();
+            }
+            if do_xmp && self.src_path.is_some() && !self.busy {
+                self.save_xmp();
+            }
+            if nav != 0 && !self.busy && !self.gallery.is_empty() {
+                let cur = self.selected.map(|i| i as i32).unwrap_or(-nav.min(0));
+                let next = (cur + nav).clamp(0, self.gallery.len() as i32 - 1);
+                if Some(next as usize) != self.selected {
+                    self.open_gallery_index(next as usize);
+                }
+            }
+        }
+
+        // Drag & drop: dropping a photo opens it, a folder opens the library.
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+        });
+        if let Some(p) = dropped.into_iter().next() {
+            if self.busy {
+                self.toast(ToastKind::Error, "busy — 等当前任务完成再打开");
+            } else if p.is_dir() {
+                self.open_folder(p);
+            } else if is_photo_path(&p) {
+                self.selected = None;
+                self.open_path(p);
+            } else {
+                self.toast(ToastKind::Error, format!("不支持的文件类型: {}", p.display()));
+            }
+        }
+
+        // Window title mirrors the open photo (send only on change).
+        let title = match &self.src_path {
+            Some(p) => format!(
+                "{} — Autoshop",
+                p.file_name().and_then(|s| s.to_str()).unwrap_or("photo")
+            ),
+            None => "Autoshop".to_string(),
+        };
+        if title != self.last_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_title = title;
         }
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Autoshop");
                 ui.separator();
-                if ui.button("Open photo…").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Photos", &["arw", "dng", "raf", "nef", "cr2", "cr3", "png", "tif", "tiff", "jpg", "jpeg"])
-                        .pick_file()
+                if ui.button("Open photo…").on_hover_text("Ctrl+O · 或直接拖拽进窗口").clicked()
+                    && let Some(path) = photo_file_dialog()
                 {
                     self.selected = None; // a one-off file isn't a gallery selection
                     self.open_path(path);
@@ -1604,6 +1963,12 @@ impl eframe::App for AutoshopApp {
                 ui.label("Style");
                 ui.add(egui::Slider::new(&mut self.style_strength, 0.0..=1.0).show_value(false));
                 ui.label(format!("{:.0}%", self.style_strength * 100.0));
+                ui.separator();
+                // View mode: side-by-side vs a full-width edit (hold B = compare).
+                ui.selectable_value(&mut self.view_mode, ViewMode::SideBySide, "⿲ 对比")
+                    .on_hover_text("Before/After side by side");
+                ui.selectable_value(&mut self.view_mode, ViewMode::AfterOnly, "⬛ 单图")
+                    .on_hover_text("编辑图占满画布；按住 B 快速对比原图");
                 ui.separator();
                 if ui.button("⚙ Settings").on_hover_text("AI provider / model / API key").clicked() {
                     self.show_settings = true;
@@ -1696,45 +2061,67 @@ impl eframe::App for AutoshopApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let avail = ui.available_size();
-            let half = (avail.x - 16.0) * 0.5;
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(egui::RichText::new("Before (source)").weak());
-                    if let Some(t) = &self.before_tex {
-                        ui.add(egui::Image::new(SizedTexture::new(t.id(), t.size_vec2())).max_width(half));
-                    }
-                });
-                ui.separator();
-                ui.vertical(|ui| {
-                    let hint = if self.paint_mode {
-                        "After (edit) — paint over the area to fill / heal"
-                    } else {
-                        "After (edit) — drag a box to target a local edit"
-                    };
-                    ui.label(egui::RichText::new(hint).weak());
-                    // Copy id/size out so we don't hold a borrow of self.after_tex
-                    // while the handlers mutate self.region / self.mask_paint.
-                    if let Some((id, size)) = self.after_tex.as_ref().map(|t| (t.id(), t.size_vec2())) {
-                        let resp = ui.add(
-                            egui::Image::new(SizedTexture::new(id, size))
-                                .max_width(half)
-                                .sense(egui::Sense::click_and_drag()),
-                        );
-                        let rect = resp.rect;
-                        if self.paint_mode {
-                            self.handle_paint(&resp, rect);
-                            self.ensure_mask_tex(ui.ctx());
-                            if let Some(t) = &self.mask_tex {
-                                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                                ui.painter().image(t.id(), rect, uv, egui::Color32::WHITE);
-                            }
-                        } else {
-                            self.handle_region_select(ui, &resp, rect);
+            // Empty state: a real landing surface instead of a blank canvas.
+            if self.src_path.is_none() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() * 0.32);
+                    ui.heading("Autoshop");
+                    ui.label(egui::RichText::new("AI 自动出片 · RAW develop").weak());
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        // Center the button pair by padding half the leftover width.
+                        let w = 300.0;
+                        ui.add_space((ui.available_width() - w).max(0.0) * 0.5);
+                        if ui.button("📷 打开照片…  (Ctrl+O)").clicked()
+                            && let Some(p) = photo_file_dialog()
+                        {
+                            self.open_path(p);
                         }
-                    }
+                        if ui.button("🗂 打开文件夹…").clicked()
+                            && let Some(d) = rfd::FileDialog::new().pick_folder()
+                        {
+                            self.open_folder(d);
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("或把 RAW / 图片直接拖进窗口 · drag & drop anywhere")
+                            .weak()
+                            .small(),
+                    );
                 });
-            });
+                return;
+            }
+
+            // Fit BOTH dimensions (max_width alone lets a portrait overflow the
+            // panel). The displayed rect is what paint/box-select map against,
+            // so sizing here never changes their coordinate math.
+            let avail = ui.available_size() - egui::vec2(0.0, 22.0); // room for the caption row
+            // Hold B to flash the source in place — the Lightroom compare gesture.
+            let comparing = ctx.input(|i| i.key_down(egui::Key::B));
+
+            match self.view_mode {
+                ViewMode::SideBySide => {
+                    let half = (avail.x - 16.0) * 0.5;
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new("Before (source)").weak());
+                            if let Some(t) = &self.before_tex {
+                                let size = t.size_vec2();
+                                ui.add(
+                                    egui::Image::new(SizedTexture::new(t.id(), size))
+                                        .fit_to_exact_size(fit_in(size, half, avail.y)),
+                                );
+                            }
+                        });
+                        ui.separator();
+                        ui.vertical(|ui| self.after_view(ui, half, avail.y, comparing));
+                    });
+                }
+                ViewMode::AfterOnly => {
+                    ui.vertical(|ui| self.after_view(ui, avail.x, avail.y, comparing));
+                }
+            }
         });
 
         // Settings window (provider / model / API keys). A local `open` avoids a
@@ -1752,9 +2139,75 @@ impl eframe::App for AutoshopApp {
             }
         }
 
+        // Drag & drop affordance: show a full-window overlay while files hover.
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("drop_overlay"),
+            ));
+            let rect = ctx.screen_rect();
+            painter.rect_filled(rect, 0.0, egui::Color32::from_rgba_unmultiplied(16, 36, 72, 150));
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "松开打开 · Drop to open",
+                egui::FontId::proportional(28.0),
+                egui::Color32::WHITE,
+            );
+        }
+
+        // Transient toasts (bottom-right). Errors linger longer than successes.
+        self.toasts.retain(|t| t.born.elapsed() < t.ttl());
+        if !self.toasts.is_empty() {
+            egui::Area::new(egui::Id::new("toasts"))
+                .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-12.0, -40.0))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    for t in &self.toasts {
+                        let (bg, fg) = match t.kind {
+                            ToastKind::Success => (
+                                egui::Color32::from_rgb(22, 58, 34),
+                                egui::Color32::from_rgb(150, 230, 170),
+                            ),
+                            ToastKind::Error => (
+                                egui::Color32::from_rgb(70, 26, 26),
+                                egui::Color32::from_rgb(255, 165, 165),
+                            ),
+                        };
+                        egui::Frame::none()
+                            .fill(bg)
+                            .rounding(6.0)
+                            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                            .show(ui, |ui| {
+                                ui.set_max_width(420.0);
+                                ui.label(egui::RichText::new(&t.text).color(fg));
+                            });
+                        ui.add_space(6.0);
+                    }
+                });
+            // Keep repainting so expiry doesn't wait for the next input event.
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+
         // Land a finished edit gesture (slider release, AI Analyze, Reset) into
         // the undo history — once per gesture, after all controls are read.
         self.commit_if_settled(ctx);
+    }
+
+    /// Persist the prefs (last folder, view mode, export options) — restored by
+    /// [`AutoshopApp::new`]. Window geometry is saved by eframe itself.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(
+            storage,
+            eframe::APP_KEY,
+            &Prefs {
+                gallery_dir: self.gallery_dir.clone(),
+                style_strength: self.style_strength,
+                save_jpeg: self.save_jpeg,
+                save_denoise: self.save_denoise,
+                view_mode: self.view_mode,
+            },
+        );
     }
 }
 
@@ -1811,7 +2264,7 @@ fn main() -> eframe::Result<()> {
         opts,
         Box::new(|cc| {
             install_cjk_font(&cc.egui_ctx); // CJK glyphs so Chinese labels aren't tofu
-            Ok(Box::new(AutoshopApp::default()))
+            Ok(Box::new(AutoshopApp::new(cc))) // restores prefs + last library
         }),
     )
 }

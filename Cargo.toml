@@ -26,7 +26,9 @@ path = "src/bin/gui.rs"
 required-features = ["gui"]
 
 [features]
-gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:ab_glyph"]
+# `eframe/persistence` remembers window geometry + our own prefs (last folder,
+# view mode, export options) across launches — table stakes for a real app.
+gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:ab_glyph", "eframe/persistence"]
 
 [dependencies]
 anyhow = "1.0.103"
