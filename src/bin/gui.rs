@@ -45,8 +45,14 @@ enum Msg {
     /// A gallery thumbnail decoded. `generation` tags the folder generation so a
     /// folder switch can't insert a stale thumbnail under a reused index.
     Thumb { generation: u64, idx: usize, img: Box<anyhow::Result<image::DynamicImage>> },
-    /// A generative-fill / heal result: (preview of the saved ./out master, status).
-    Retouched(Box<anyhow::Result<(image::DynamicImage, String)>>),
+    /// A generative-fill / heal / reimagine result: (preview of the saved ./out
+    /// master, status, the saved path when it is a REIMAGINE output — i.e. a
+    /// whole-frame rendition that can be reverse-fitted into a recipe).
+    Retouched(Box<anyhow::Result<(image::DynamicImage, String, Option<PathBuf>)>>),
+    /// Reverse-fit finished: the fitted recipe + a status note (fit.rs).
+    Fitted(Box<anyhow::Result<(EditRecipe, String)>>),
+    /// Style-prompt extraction finished: the reusable prompt text.
+    Styled(Box<anyhow::Result<String>>),
     /// A `GET /models` fetch finished: the account's model ids (Settings pick-list).
     Models(anyhow::Result<Vec<String>>),
 }
@@ -163,6 +169,8 @@ struct AutoshopApp {
     fill_quality: usize,                   // 0=high 1=medium 2=low
     fill_fullres: bool,                    // composite onto the full-res develop
     heal_fullres: bool,                    // heal the full-res develop
+    // --- reverse-fit ("match") ---
+    last_generated: Option<PathBuf>,       // this photo's last reimagine output (fit target)
 }
 
 impl Default for AutoshopApp {
@@ -212,6 +220,7 @@ impl Default for AutoshopApp {
             fill_quality: 0,
             fill_fullres: false,
             heal_fullres: false,
+            last_generated: None,
         }
     }
 }
@@ -736,6 +745,7 @@ impl AutoshopApp {
                         self.reset_history(); // a new photo starts a fresh undo history
                         self.region = None; // and a fresh local-edit selection
                         self.region_drag = None;
+                        self.last_generated = None; // a fit target belongs to ONE photo
                         self.verdict = None;
                         self.rationale.clear();
                         self.dirty = true; // render the (neutral) after
@@ -803,7 +813,7 @@ impl AutoshopApp {
                     }
                 }
                 Msg::Retouched(boxed) => match *boxed {
-                    Ok((img, msg)) => {
+                    Ok((img, msg, generated)) => {
                         // Show the saved master in the After pane (it's a separate
                         // ./out artifact, not the develop recipe — a slider edit
                         // re-develops over it, exactly like the web UI).
@@ -812,6 +822,12 @@ impl AutoshopApp {
                             to_color_image(&img),
                             egui::TextureOptions::LINEAR,
                         ));
+                        // A whole-frame reimagine output becomes the reverse-fit
+                        // target; fill/heal artifacts don't (they're mostly the
+                        // original pixels, so a fit would just be neutral).
+                        if let Some(p) = generated {
+                            self.last_generated = Some(p);
+                        }
                         self.clear_mask();
                         self.busy = false;
                         self.status = msg;
@@ -819,6 +835,37 @@ impl AutoshopApp {
                     Err(e) => {
                         self.busy = false;
                         self.status = format!("retouch failed: {e}");
+                    }
+                },
+                Msg::Fitted(boxed) => match *boxed {
+                    Ok((recipe, note)) => {
+                        // The fitted recipe replaces the working recipe like an AI
+                        // Analyze result — the undo history picks it up as one step
+                        // via the committed-snapshot diff, and the preview
+                        // re-develops through the normal dirty path.
+                        self.recipe = recipe;
+                        self.rationale = self.recipe.rationale.clone();
+                        self.verdict = None;
+                        self.dirty = true;
+                        self.busy = false;
+                        self.status = note;
+                    }
+                    Err(e) => {
+                        self.busy = false;
+                        self.status = format!("反推失败: {e}");
+                    }
+                },
+                Msg::Styled(boxed) => match *boxed {
+                    Ok(prompt) => {
+                        // Into the Direction box: ready to restyle OTHER photos.
+                        self.guidance = prompt;
+                        self.busy = false;
+                        self.status =
+                            "风格提示词已提取 → 已填入 Direction（同时存 ./out/<stem>.style.txt）".into();
+                    }
+                    Err(e) => {
+                        self.busy = false;
+                        self.status = format!("风格提取失败: {e}");
                     }
                 },
                 Msg::Models(res) => match res {
@@ -1204,7 +1251,7 @@ impl AutoshopApp {
         let quality = ["high", "medium", "low"][self.fill_quality.min(2)].to_string();
         let full_res = self.fill_fullres;
         std::thread::spawn(move || {
-            let res = (|| -> anyhow::Result<(image::DynamicImage, String)> {
+            let res = (|| -> anyhow::Result<(image::DynamicImage, String, Option<PathBuf>)> {
                 let cfg = autoshop::config::Config::load();
                 let out = autoshop::pipeline::default_out(&path, "retouch", "png");
                 let mask_tmp =
@@ -1214,7 +1261,9 @@ impl AutoshopApp {
                 let _ = std::fs::remove_file(&mask_tmp);
                 r?;
                 let img = autoshop::decode::load_image(&out)?.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE);
-                Ok((img, format!("filled → {} (saved to ./out)", out.display())))
+                // Not a fit target: a fill keeps most source pixels, so a reverse
+                // fit against it would just recover a neutral recipe.
+                Ok((img, format!("filled → {} (saved to ./out)", out.display()), None))
             })();
             let _ = tx.send(Msg::Retouched(Box::new(res)));
         });
@@ -1247,7 +1296,7 @@ impl AutoshopApp {
         let tx = self.tx.clone();
         let full_res = self.heal_fullres;
         std::thread::spawn(move || {
-            let res = (|| -> anyhow::Result<(image::DynamicImage, String)> {
+            let res = (|| -> anyhow::Result<(image::DynamicImage, String, Option<PathBuf>)> {
                 let cfg = autoshop::config::Config::load();
                 let out = autoshop::pipeline::default_out(&path, "heal", "png");
                 let mask_tmp = match mask_png {
@@ -1265,7 +1314,8 @@ impl AutoshopApp {
                 }
                 let rep = rep?;
                 let img = autoshop::decode::load_image(&out)?.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE);
-                Ok((img, format!("healed {} spot(s) → {}", rep.spots, out.display())))
+                // Not a fit target (pixel heal, not a whole-frame rendition).
+                Ok((img, format!("healed {} spot(s) → {}", rep.spots, out.display()), None))
             })();
             let _ = tx.send(Msg::Retouched(Box::new(res)));
         });
@@ -1274,8 +1324,10 @@ impl AutoshopApp {
     /// Full-frame generative re-render via gpt-image — the OPTIONAL "let GPT
     /// directly make the picture" path. Uses the Direction text as the look
     /// prompt. Unlike Analyze (a faithful parametric recipe), this REGENERATES
-    /// pixels: non-faithful, ~1.5K px, no XMP — a creative restyle, not a master.
-    /// Saved to ./out, shown in the After pane. Hits the gpt-image (image) endpoint.
+    /// pixels — a creative restyle, not a master (up to ~8 MP on flexible-size
+    /// models, ~1.5K on older ones). The saved path is remembered as the
+    /// reverse-fit ("反推配方") target, which turns the look back into sliders +
+    /// XMP at full resolution. Hits the gpt-image (image) endpoint.
     fn start_reimagine(&mut self) {
         let Some(path) = self.src_path.clone() else { return };
         if self.busy {
@@ -1292,18 +1344,90 @@ impl AutoshopApp {
             }
         };
         self.busy = true;
-        self.status = "AI 生成出片中… (gpt-image, ~15–40s)".into();
+        self.status = "AI 生成出片中… (gpt-image, ~15–60s; 高分辨率输入需先全幅显影)".into();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let res = (|| -> anyhow::Result<(image::DynamicImage, String)> {
+            let res = (|| -> anyhow::Result<(image::DynamicImage, String, Option<PathBuf>)> {
                 let cfg = autoshop::config::Config::load();
                 let out = autoshop::pipeline::default_out(&path, "reimagine", "png");
                 // fidelity "high" keeps it recognisably the same photo.
                 autoshop::generative::reimagine(&cfg, &path, &prompt, "high", &cfg.openai_image_quality, &out)?;
                 let img = autoshop::decode::load_image(&out)?.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE);
-                Ok((img, format!("generated → {} (gpt-image; saved to ./out)", out.display())))
+                let msg = format!("generated → {} (可再点「反推配方」得滑杆/XMP)", out.display());
+                Ok((img, msg, Some(out)))
             })();
             let _ = tx.send(Msg::Retouched(Box::new(res)));
+        });
+    }
+
+    /// Reverse-fit ("match"): statistically solve the develop parameters that map
+    /// the source preview onto the last reimagine output — the sliders update in
+    /// place (undo-able), and for a RAW the XMP sidecar is written immediately.
+    /// Deterministic, in-process, no API call (fit.rs).
+    fn start_fit(&mut self) {
+        let (Some(base), Some(tgt)) = (self.base_preview.clone(), self.last_generated.clone())
+        else {
+            return;
+        };
+        if self.busy {
+            return;
+        }
+        let src_path = self.src_path.clone();
+        self.busy = true;
+        self.status = "反推配方中…（统计拟合，本地运算）".into();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let res = (|| -> anyhow::Result<(EditRecipe, String)> {
+                let target = autoshop::decode::load_image(&tgt)?;
+                let rep = autoshop::fit::fit_recipe(&base, &target);
+                let mut note = format!(
+                    "反推完成：look 残差 {:.3}→{:.3}（滑杆已更新，可 undo）",
+                    rep.err_before, rep.err_after
+                );
+                if let Some(p) = src_path.filter(|p| autoshop::decode::is_raw(p)) {
+                    let x = autoshop::pipeline::write_xmp(&p, &rep.recipe)?;
+                    note.push_str(&format!(" · XMP → {}", x.display()));
+                }
+                Ok((rep.recipe, note))
+            })();
+            let _ = tx.send(Msg::Fitted(Box::new(res)));
+        });
+    }
+
+    /// Extract a reusable STYLE PROMPT from the before/after pair via the vision
+    /// model. The result lands in the Direction box (ready to reimagine OTHER
+    /// photos with the same look) and is saved to ./out/<stem>.style.txt.
+    fn start_style_prompt(&mut self) {
+        let (Some(base), Some(tgt)) = (self.base_preview.clone(), self.last_generated.clone())
+        else {
+            return;
+        };
+        if self.busy {
+            return;
+        }
+        let src_path = self.src_path.clone();
+        self.busy = true;
+        self.status = "提取风格提示词中… (vision, ~5-20s)".into();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let res = (|| -> anyhow::Result<String> {
+                let cfg = autoshop::config::Config::load();
+                let jpg = |img: &image::DynamicImage| -> anyhow::Result<Vec<u8>> {
+                    let mut buf = Vec::new();
+                    image::DynamicImage::ImageRgb8(img.thumbnail(768, 768).to_rgb8())
+                        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)?;
+                    Ok(buf)
+                };
+                let target = autoshop::decode::load_image(&tgt)?;
+                let prompt = autoshop::advisor::describe_style(&cfg, &jpg(&base)?, &jpg(&target)?)?;
+                if let Some(p) = &src_path {
+                    let out = autoshop::pipeline::default_out(p, "style", "txt");
+                    autoshop::pipeline::ensure_parent(&out)?;
+                    std::fs::write(&out, &prompt)?;
+                }
+                Ok(prompt)
+            })();
+            let _ = tx.send(Msg::Styled(Box::new(res)));
         });
     }
 
@@ -1313,23 +1437,54 @@ impl AutoshopApp {
 
         // Whole-image generative re-render: let gpt-image DIRECTLY produce the
         // picture (the optional "GPT makes the image" path). Distinct from
-        // AI Analyze, which emits a faithful parametric recipe.
+        // AI Analyze, which emits a faithful parametric recipe — but the
+        // reverse-fit button below closes the loop: generated look → recipe.
         ui.label(egui::RichText::new("整图 AI 生成 · Reimagine (gpt-image 直接出图)").strong());
         ui.add_enabled_ui(!self.busy, |ui| {
             if ui
                 .button("✨ AI 生成出片")
                 .on_hover_text(
-                    "用 gpt-image 直接重绘整张图（拿上方 Direction 文本当风格描述）。实验：重绘像素=非保真、约1.5K、无 XMP——创意改图，非精修。需 OPENAI_API_KEY",
+                    "用 gpt-image 直接重绘整张图（拿上方 Direction 文本当风格描述）。重绘像素=非保真；\
+                     支持任意尺寸的模型（gpt-image-2）可达 ~8MP，其余 ~1.5K。需 OPENAI_API_KEY",
                 )
                 .clicked()
             {
                 self.start_reimagine();
             }
         });
+        // Reverse-fit the generated look back into an editable recipe — this is
+        // how the low-res experiment becomes a full-resolution, XMP-able edit.
+        let can_fit = self.last_generated.is_some() && self.base_preview.is_some();
+        ui.add_enabled_ui(!self.busy && can_fit, |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .button("🎛 反推配方 → 滑杆/XMP")
+                    .on_hover_text(
+                        "统计拟合：把刚生成的观感反解成可编辑的 develop 参数（本地运算，无 API 费）。\
+                         滑杆会更新（可 undo），RAW 同时写 ./out XMP；再点 Save 可出全分辨率成品",
+                    )
+                    .clicked()
+                {
+                    self.start_fit();
+                }
+                if ui
+                    .button("📝 提取风格提示词")
+                    .on_hover_text(
+                        "对比 原图/生成图，让 vision 模型写一段可复用的风格 prompt：\
+                         自动填入 Direction（可直接给别的照片 Reimagine 用）并存 ./out/<stem>.style.txt",
+                    )
+                    .clicked()
+                {
+                    self.start_style_prompt();
+                }
+            });
+        });
         ui.label(
-            egui::RichText::new("拿上方 Direction 当风格描述；重绘像素=非保真、低分辨率、无 XMP。需 OPENAI_API_KEY (gpt-image)。")
-                .weak()
-                .small(),
+            egui::RichText::new(
+                "拿上方 Direction 当风格描述。生成后可「反推配方」把观感变成滑杆+XMP（全分辨率的正道）。",
+            )
+            .weak()
+            .small(),
         );
         ui.separator();
 

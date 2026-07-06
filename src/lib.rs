@@ -13,6 +13,7 @@ pub mod config;
 pub mod decode;
 pub mod denoise;
 pub mod eval;
+pub mod fit;
 pub mod generative;
 pub mod openai_models;
 pub mod pipeline;

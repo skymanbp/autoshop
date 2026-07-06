@@ -160,6 +160,67 @@ follow it closely): ");
     }
 }
 
+/// Reverse-engineer a reusable STYLE PROMPT from a before/after pair — the AI
+/// half of the reverse-fit ("match") feature. The deterministic fit (fit.rs)
+/// recovers the numbers; this recovers the *transferable description*: a prompt
+/// the user can hand back to `reimagine` (or any image model) to restyle OTHER
+/// photos the same way. Plain-text output on the same Responses endpoint the
+/// proposer uses; needs the image-role API key.
+pub fn describe_style(
+    cfg: &Config,
+    before_jpeg: &[u8],
+    after_jpeg: &[u8],
+) -> Result<String, AdvisorError> {
+    let key = cfg
+        .openai_api_key
+        .as_ref()
+        .ok_or_else(|| AdvisorError::Missing("OPENAI_API_KEY".into()))?;
+    let enc = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let (b_before, b_after) = (enc(before_jpeg), enc(after_jpeg));
+
+    let instruction = "You are a master photo colourist. IMAGE 1 is the untouched source; \
+IMAGE 2 is the finished look of the SAME frame. Write ONE reusable style prompt (2-4 sentences, \
+English) describing how IMAGE 2's LOOK differs from IMAGE 1 — tonality (exposure, contrast, \
+black/white points, highlight/shadow character), palette and colour casts (white balance lean, \
+split-toning, which colour families were shifted or muted), and finishing character (clarity, \
+softness, mood). Describe the GRADE, not the scene: never name the subjects, location or objects, \
+so the same prompt can restyle ANY other photograph. Output ONLY the prompt text, no preamble.";
+
+    let body = json!({
+        "model": cfg.openai_model,
+        "input": [{
+            "role": "user",
+            "content": [
+                { "type": "input_text", "text": instruction },
+                { "type": "input_image",
+                  "image_url": format!("data:image/jpeg;base64,{b_before}"),
+                  "detail": "low" },
+                { "type": "input_image",
+                  "image_url": format!("data:image/jpeg;base64,{b_after}"),
+                  "detail": "low" }
+            ]
+        }]
+    });
+
+    let url = format!("{}/responses", cfg.openai_base_url.trim_end_matches('/'));
+    let resp = ureq::post(&url)
+        .set("Authorization", &format!("Bearer {key}"))
+        .set("Content-Type", "application/json")
+        .send_json(body);
+    let value: Value = match resp {
+        Ok(r) => r.into_json().map_err(|e| AdvisorError::Transport(e.to_string()))?,
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            return Err(AdvisorError::Http { status: code, body });
+        }
+        Err(ureq::Error::Transport(t)) => return Err(AdvisorError::Transport(t.to_string())),
+    };
+    let text = extract_output_text(&value).ok_or_else(|| {
+        AdvisorError::Transport("could not locate output text in OpenAI response".into())
+    })?;
+    Ok(text.trim().to_string())
+}
+
 /// JSON Schema for [`EditRecipe`] in OpenAI strict mode: every property listed
 /// in `required`, `additionalProperties:false`, optionals expressed as nullable.
 /// Mirrors `src/recipe.rs` — keep in sync if the recipe changes.

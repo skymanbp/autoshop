@@ -14,7 +14,7 @@ use image::GenericImageView;
 
 // The engine modules now live in the `autoshop` library crate (src/lib.rs),
 // shared with the native GUI binary (src/bin/gui.rs).
-use autoshop::{decode, denoise, eval, generative, pipeline, render, retouch, serve};
+use autoshop::{decode, denoise, eval, fit, generative, pipeline, render, retouch, serve};
 use autoshop::advisor::Verdict;
 use autoshop::config::Config;
 use autoshop::pipeline::{default_out, ensure_parent, find_raws, produce_recipe, stem, write_recipe, write_xmp, xmp_target};
@@ -157,6 +157,29 @@ enum Command {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+    /// Reverse-fit a LOOK into an editable recipe: given the SAME shot twice —
+    /// the source and a target rendition (e.g. the `reimagine` output, or any
+    /// finished reference of this frame) — solve for the EditRecipe that
+    /// reproduces the target through the deterministic engine, and write the
+    /// recipe JSON + Lightroom XMP. No pixels are copied, so the result applies
+    /// at FULL sensor resolution. Deterministic; no API key needed.
+    Match {
+        /// Source RAW (or baked image) the look should be fitted onto.
+        raw: PathBuf,
+        /// The look to match — e.g. ./out/<stem>.reimagine.png.
+        target: PathBuf,
+        /// Also render the fitted recipe at full resolution
+        /// (./out/<stem>.matched.tif, 16-bit).
+        #[arg(long)]
+        render: bool,
+        /// Also extract a reusable style PROMPT from the pair via the vision
+        /// model (./out/<stem>.style.txt; needs OPENAI_API_KEY).
+        #[arg(long)]
+        style_prompt: bool,
+        /// Recipe JSON output (default: ./out/<stem>.matched.json).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
     /// EXPERIMENTAL: generative object removal via OpenAI Images. The mask is an
     /// RGBA PNG; transparent pixels mark the region to regenerate.
     Retouch {
@@ -234,6 +257,9 @@ fn main() -> Result<()> {
             pipeline::guard_readonly(&out, &raw)?; // never write into the source library
             let q = quality.unwrap_or_else(|| cfg.openai_image_quality.clone());
             generative::reimagine(&cfg, &raw, &prompt, &fidelity, &q, &out)
+        }
+        Command::Match { raw, target, render, style_prompt, out } => {
+            match_cmd(&raw, &target, render, style_prompt, out)
         }
         Command::Retouch { raw, mask, prompt, quality, full_res, out } => {
             let cfg = Config::load();
@@ -414,6 +440,67 @@ fn denoise_cmd(
         println!("denoising image {} ...", input.display());
         denoise::denoise_file(&opts, input, &out)?;
         println!("denoised -> {}", out.display());
+    }
+    Ok(())
+}
+
+/// Reverse-fit: solve for the EditRecipe that maps `raw`'s look onto `target`'s
+/// (the same frame, differently developed — e.g. the reimagine output). The
+/// deliverables are parametric (recipe JSON + XMP + optional full-res render),
+/// so the low-res generative experiment becomes a real, adjustable develop.
+fn match_cmd(
+    raw: &Path,
+    target: &Path,
+    render_full: bool,
+    style_prompt: bool,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    let src = decode::preview_only(raw)?;
+    let tgt = decode::load_image(target)?;
+    println!("reverse-fitting {} onto the look of {} …", raw.display(), target.display());
+    let rep = fit::fit_recipe(&src, &tgt);
+    println!(
+        "  look error {:.3} → {:.3}  (0 = identical distributions; masks/local edits are not recoverable)",
+        rep.err_before, rep.err_after
+    );
+    println!("--- fitted recipe ---");
+    println!("{}", serde_json::to_string_pretty(&rep.recipe)?);
+
+    let out = out.unwrap_or_else(|| default_out(raw, "matched", "json"));
+    pipeline::guard_readonly(&out, raw)?;
+    let recipe_path = write_recipe(raw, &rep.recipe, Some(out))?;
+    println!("recipe -> {}", recipe_path.display());
+    if decode::is_raw(raw) {
+        let xmp_path = write_xmp(raw, &rep.recipe)?;
+        let s = stem(raw);
+        println!("xmp    -> {} (copy {s}.xmp beside {s}.ARW for Lightroom)", xmp_path.display());
+    }
+    if render_full {
+        let img_out = default_out(raw, "matched", "tif");
+        pipeline::guard_readonly(&img_out, raw)?;
+        ensure_parent(&img_out)?;
+        println!("rendering the fitted recipe at full resolution …");
+        let (w, h) = render::render_to_file(raw, &rep.recipe, &img_out, None)?;
+        println!("render -> {} ({w} x {h})", img_out.display());
+    }
+    if style_prompt {
+        let cfg = Config::load();
+        // Small uploads are plenty for a style read (and cheap): ~0.5 MP each.
+        let jpg = |img: &image::DynamicImage| -> Result<Vec<u8>> {
+            let mut buf = Vec::new();
+            image::DynamicImage::ImageRgb8(img.thumbnail(768, 768).to_rgb8())
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+                .context("encode style-prompt jpeg")?;
+            Ok(buf)
+        };
+        println!("extracting a reusable style prompt ({}) …", cfg.openai_model);
+        let prompt = autoshop::advisor::describe_style(&cfg, &jpg(&src)?, &jpg(&tgt)?)?;
+        let p_out = default_out(raw, "style", "txt");
+        ensure_parent(&p_out)?;
+        std::fs::write(&p_out, &prompt).with_context(|| format!("write {}", p_out.display()))?;
+        println!("--- style prompt (reusable as a reimagine Direction) ---");
+        println!("{prompt}");
+        println!("style  -> {}", p_out.display());
     }
     Ok(())
 }

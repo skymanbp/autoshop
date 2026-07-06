@@ -169,11 +169,20 @@ pub fn xmp_target(raw: &Path) -> PathBuf {
 
 /// Guarantee the read-only library: refuse to write `out` if it lands inside the
 /// source RAW's own folder (or below it). Outputs belong in ./out.
+///
+/// The PROJECT's ./out is always writable, even when the source itself lives
+/// there (e.g. `match` fitting a look onto a previously exported preview) —
+/// the rule protects the photo LIBRARY, not our own output area. A folder that
+/// merely happens to be NAMED "out" inside the library is still refused.
 pub fn guard_readonly(out: &Path, raw: &Path) -> Result<()> {
     use std::path::absolute;
     let (Ok(out_abs), Ok(raw_abs)) = (absolute(out), absolute(raw)) else {
         return Ok(());
     };
+    if let Ok(own_out) = absolute(Path::new("out"))
+        && out_abs.starts_with(&own_out) {
+            return Ok(());
+        }
     if let Some(raw_dir) = raw_abs.parent()
         && out_abs.starts_with(raw_dir) {
             anyhow::bail!(
@@ -269,6 +278,11 @@ mod tests {
         // The default ./out (outside the library) is allowed.
         let safe = default_out(raw, "developed", "tif");
         assert!(guard_readonly(&safe, raw).is_ok(), "./out must be allowed");
+        // A source that itself lives in OUR ./out (e.g. `match` on an exported
+        // preview) may be written beside — the guard protects the library only.
+        let out_src = Path::new("out/DSC0001.preview.jpg");
+        let out_dst = Path::new("out/DSC0001.matched.json");
+        assert!(guard_readonly(out_dst, out_src).is_ok(), "our ./out is always writable");
     }
 
     #[test]

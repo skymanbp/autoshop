@@ -543,6 +543,60 @@ fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// Tone-model knot inputs. 0.66 is an explicit vertex so mid-bright water (≈0.66)
+/// stays separated from the midtone (0.50) under a strong −Highlights; 0.82 shapes
+/// the highlight shoulder; 0.92 is where whites concentrate. Shared with the
+/// reverse-fit (fit.rs), which solves slider values against this same model.
+pub(crate) const TONE_KNOTS_X: [f32; 8] = [0.0, 0.10, 0.25, 0.50, 0.66, 0.82, 0.92, 1.0];
+
+/// Per-slider knot-output basis at input `x`: how far a fully-pushed +100 slider
+/// moves the knot, in order `[contrast, highlights, shadows, whites, blacks]`.
+/// The knot output is `tone_exposure_curve(x, ev) + basis · sliders/100`; keeping
+/// this the ONLY definition means render and reverse-fit cannot drift apart.
+pub(crate) fn tone_slider_basis(x: f32) -> [f32; 5] {
+    // Authority: how far a fully-pushed ±100 slider moves its knot(s).
+    const A_SHADOW: f32 = 0.33;
+    const A_HIGHLIGHT: f32 = 0.34;
+    const A_CONTRAST: f32 = 0.20;
+    const A_WB: f32 = 0.32; // whites & blacks share it
+
+    // Region basis functions over knot input x (each ∈ [0,1]).
+    let w_shadow = smoothstep(0.0, 0.25, x) * (1.0 - smoothstep(0.25, 0.50, x));
+    // highlights: peak 0.82, ZERO at 0.50 and PINNED to 0 at 1.0 — so highlights can
+    // never move the white point; specular foam near white is never dragged down.
+    let w_high = smoothstep(0.60, 0.82, x) * (1.0 - smoothstep(0.82, 1.0, x));
+    // contrast: shoulder lobe minus toe lobe → antisymmetric, 0 at the ends and 0.50.
+    let w_contrast = smoothstep(0.50, 0.75, x) * (1.0 - smoothstep(0.75, 1.0, x)) - w_shadow;
+    // whites/blacks own the literal end knots (+ a touch of the adjacent knot).
+    let w_white = if x >= 0.999 {
+        1.0
+    } else if (x - 0.92).abs() < 1e-3 {
+        0.45
+    } else {
+        0.0
+    };
+    let w_black = if x <= 0.001 {
+        1.0
+    } else if (x - 0.10).abs() < 1e-3 {
+        0.45
+    } else {
+        0.0
+    };
+    [
+        A_CONTRAST * w_contrast,
+        A_HIGHLIGHT * w_high,
+        A_SHADOW * w_shadow,
+        A_WB * w_white,
+        A_WB * w_black,
+    ]
+}
+
+/// The exposure component of a knot output: a linear-light gain of `ev` stops
+/// applied under the sRGB transfer curve (the identity curve when ev = 0).
+pub(crate) fn tone_exposure_curve(x: f32, ev: f32) -> f32 {
+    linear_to_srgb((srgb_to_linear(x) * 2.0_f32.powf(ev)).clamp(0.0, 1.0))
+}
+
 /// Build the develop tone curve as a [`LUT_N`]-entry LUT over input gamma [0,1].
 ///
 /// It is an 8-knot control-point curve fit by a MONOTONE cubic Hermite spline
@@ -554,62 +608,25 @@ fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
 /// whites/blacks move the end knots. The recipe's own `tone_curve` is composed on
 /// top. This replaces a summed-region-hump model that could go non-monotonic and
 /// crush mid-bright water / near-white foam (which had needed ad-hoc patches).
-fn build_tone_lut(r: &EditRecipe) -> Vec<f32> {
-    // Knot inputs. 0.66 is an explicit vertex so mid-bright water (≈0.66) stays
-    // separated from the midtone (0.50) under a strong −Highlights; 0.82 shapes the
-    // highlight shoulder; 0.92 is where whites concentrate.
-    const KNOTS_X: [f32; 8] = [0.0, 0.10, 0.25, 0.50, 0.66, 0.82, 0.92, 1.0];
-    // Authority: how far a fully-pushed ±100 slider moves its knot(s).
-    const A_SHADOW: f32 = 0.33;
-    const A_HIGHLIGHT: f32 = 0.34;
-    const A_CONTRAST: f32 = 0.20;
-    const A_WB: f32 = 0.32; // whites & blacks share it
-
-    let gain = 2.0_f32.powf(r.exposure_ev);
+pub(crate) fn build_tone_lut(r: &EditRecipe) -> Vec<f32> {
+    // Knot OUTPUTS: exposure-mapped identity, then the slider offsets — all from
+    // the shared basis below so the reverse-fit (fit.rs) solves against the SAME
+    // model the engine renders.
     let contrast = (r.contrast / 100.0).clamp(-1.0, 1.0);
     let highlights = (r.highlights / 100.0).clamp(-1.0, 1.0);
     let shadows = (r.shadows / 100.0).clamp(-1.0, 1.0);
     let whites = (r.whites / 100.0).clamp(-1.0, 1.0);
     let blacks = (r.blacks / 100.0).clamp(-1.0, 1.0);
 
-    // Region basis functions over knot input x (each ∈ [0,1]).
-    let w_shadow = |x: f32| smoothstep(0.0, 0.25, x) * (1.0 - smoothstep(0.25, 0.50, x));
-    // highlights: peak 0.82, ZERO at 0.50 and PINNED to 0 at 1.0 — so highlights can
-    // never move the white point; specular foam near white is never dragged down.
-    let w_high = |x: f32| smoothstep(0.60, 0.82, x) * (1.0 - smoothstep(0.82, 1.0, x));
-    // contrast: shoulder lobe minus toe lobe → antisymmetric, 0 at the ends and 0.50.
-    let w_contrast =
-        |x: f32| smoothstep(0.50, 0.75, x) * (1.0 - smoothstep(0.75, 1.0, x)) - w_shadow(x);
-    // whites/blacks own the literal end knots (+ a touch of the adjacent knot).
-    let w_white = |x: f32| {
-        if x >= 0.999 {
-            1.0
-        } else if (x - 0.92).abs() < 1e-3 {
-            0.45
-        } else {
-            0.0
-        }
-    };
-    let w_black = |x: f32| {
-        if x <= 0.001 {
-            1.0
-        } else if (x - 0.10).abs() < 1e-3 {
-            0.45
-        } else {
-            0.0
-        }
-    };
-
-    // Knot OUTPUTS: exposure-mapped identity, then the slider offsets.
     let mut ys = [0.0f32; 8];
-    for (idx, &x) in KNOTS_X.iter().enumerate() {
-        let mut y = linear_to_srgb((srgb_to_linear(x) * gain).clamp(0.0, 1.0));
-        y += A_CONTRAST * contrast * w_contrast(x);
-        y += A_SHADOW * shadows * w_shadow(x);
-        y += A_HIGHLIGHT * highlights * w_high(x);
-        y += A_WB * whites * w_white(x);
-        y += A_WB * blacks * w_black(x);
-        ys[idx] = y;
+    for (idx, &x) in TONE_KNOTS_X.iter().enumerate() {
+        let b = tone_slider_basis(x);
+        ys[idx] = tone_exposure_curve(x, r.exposure_ev)
+            + b[0] * contrast
+            + b[1] * highlights
+            + b[2] * shadows
+            + b[3] * whites
+            + b[4] * blacks;
     }
     // Force the knot outputs non-decreasing (a tone curve cannot invert) then clamp.
     // Fritsch–Carlson on monotone data ⇒ the whole spline is monotone, so there is
@@ -624,12 +641,12 @@ fn build_tone_lut(r: &EditRecipe) -> Vec<f32> {
         *v = v.clamp(0.0, 1.0);
     }
 
-    let m = fc_tangents(&KNOTS_X, &ys);
+    let m = fc_tangents(&TONE_KNOTS_X, &ys);
     let curve = tone_curve_lut(r); // the recipe's own tone_curve, composed on top
     (0..LUT_N)
         .map(|i| {
             let x = i as f32 / (LUT_N - 1) as f32;
-            sample_lut(&curve, hermite_eval(&KNOTS_X, &ys, &m, x))
+            sample_lut(&curve, hermite_eval(&TONE_KNOTS_X, &ys, &m, x))
         })
         .collect()
 }
@@ -736,7 +753,7 @@ fn interp(pts: &[(f32, f32)], x: f32) -> f32 {
 }
 
 /// Sample a LUT (any length) at a normalised [0,1] position with linear interp.
-fn sample_lut(lut: &[f32], x: f32) -> f32 {
+pub(crate) fn sample_lut(lut: &[f32], x: f32) -> f32 {
     let n = lut.len();
     if n == 0 {
         return x;
@@ -808,8 +825,6 @@ fn apply_hsl(data: &mut [[f32; 3]], hsl: &crate::recipe::Hsl) {
     if hsl.is_neutral() {
         return;
     }
-    // ACR band centres in degrees (red..magenta), matching recipe::HSL_BANDS.
-    const CENTERS: [f32; 8] = [0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 270.0, 300.0];
     for px in data.iter_mut() {
         let (h, s, l) = rgb_to_hsl(px[0], px[1], px[2]);
         // Fade the WHOLE HSL effect out on low-CHROMA pixels. Gate on chroma
@@ -825,7 +840,7 @@ fn apply_hsl(data: &mut [[f32; 3]], hsl: &crate::recipe::Hsl) {
         if satw <= 0.0 {
             continue;
         }
-        let (b0, b1, w1) = bracket_bands(h * 360.0, &CENTERS);
+        let (b0, b1, w1) = bracket_bands(h * 360.0, &HSL_CENTERS);
         let w0 = 1.0 - w1;
         let hue_adj = (w0 * hsl.hue[b0] + w1 * hsl.hue[b1]) * satw;
         let sat_adj = (w0 * hsl.saturation[b0] + w1 * hsl.saturation[b1]) * satw;
@@ -839,10 +854,14 @@ fn apply_hsl(data: &mut [[f32; 3]], hsl: &crate::recipe::Hsl) {
     }
 }
 
+/// ACR band centres in degrees (red..magenta), matching recipe::HSL_BANDS.
+/// Shared with the reverse-fit so its per-band statistics use the SAME partition.
+pub(crate) const HSL_CENTERS: [f32; 8] = [0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 270.0, 300.0];
+
 /// The two band indices bracketing hue `deg` and the blend weight toward the
 /// second (partition of unity). Centres are non-uniform and wrap (magenta 300°
 /// → red 360°/0°), so the last segment spans 300..360 back to red.
-fn bracket_bands(deg: f32, centers: &[f32; 8]) -> (usize, usize, f32) {
+pub(crate) fn bracket_bands(deg: f32, centers: &[f32; 8]) -> (usize, usize, f32) {
     let d = deg.rem_euclid(360.0);
     for i in 0..8 {
         let lo = centers[i];
@@ -856,7 +875,7 @@ fn bracket_bands(deg: f32, centers: &[f32; 8]) -> (usize, usize, f32) {
 }
 
 /// sRGB-gamma RGB → HSL, all in [0,1] (hue normalised to turns).
-fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+pub(crate) fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let l = (max + min) / 2.0;

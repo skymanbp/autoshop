@@ -18,7 +18,7 @@ mod openai_verify;
 
 pub use claude::ClaudeProvider;
 pub use heuristic::HeuristicProposer;
-pub use openai::OpenAiProvider;
+pub use openai::{describe_style, OpenAiProvider};
 pub use openai_verify::OpenAiVerifier;
 
 use crate::decode::{Histogram, Meta};
