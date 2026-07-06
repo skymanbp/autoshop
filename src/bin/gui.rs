@@ -56,13 +56,36 @@ impl Toast {
 
 /// The prefs worth remembering across launches (stored via eframe persistence
 /// next to the window geometry). Everything here must stay cheap to re-apply.
+/// `serde(default)` so prefs saved by an older build (missing newer keys) still
+/// load instead of silently resetting everything.
 #[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct Prefs {
     gallery_dir: Option<PathBuf>,
     style_strength: f32,
     save_jpeg: bool,
     save_denoise: bool,
     view_mode: ViewMode,
+    exp_long_edge: u32,
+    exp_sharpen: f32,
+    exp_quality: f32,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        // Mirror AutoshopApp's own defaults (see its Default impl) so a pref
+        // key missing from an older save degrades to exactly the app default.
+        Self {
+            gallery_dir: None,
+            style_strength: 0.30,
+            save_jpeg: false,
+            save_denoise: false,
+            view_mode: ViewMode::SideBySide,
+            exp_long_edge: 0,
+            exp_sharpen: 0.0,
+            exp_quality: 95.0,
+        }
+    }
 }
 
 const PREVIEW_EDGE: u32 = 1280; // working preview size for fast live develop
@@ -453,6 +476,10 @@ struct AutoshopApp {
     // --- pixel-master ↔ recipe chaining (gap batch B) ---
     master: Option<PathBuf>,               // last ./out retouch master (fill/heal/clone/reimagine)
     keep_recipe: bool,                     // one-shot: next Opened keeps the recipe (continue-from-master)
+    // --- export pipeline (gap batch F) ---
+    exp_long_edge: u32,                    // resize long edge in px; 0 = full resolution
+    exp_sharpen: f32,                      // output sharpening 0..100, post-resize
+    exp_quality: f32,                      // JPEG quality 1..100 (f32 for the shared slider)
 }
 
 /// The two mask geometries a user can place by dragging.
@@ -574,6 +601,9 @@ impl Default for AutoshopApp {
             clone_fullres: false,
             master: None,
             keep_recipe: false,
+            exp_long_edge: 0,
+            exp_sharpen: 0.0,
+            exp_quality: 95.0,
         }
     }
 }
@@ -591,6 +621,9 @@ impl AutoshopApp {
             app.save_jpeg = prefs.save_jpeg;
             app.save_denoise = prefs.save_denoise;
             app.view_mode = prefs.view_mode;
+            app.exp_long_edge = prefs.exp_long_edge;
+            app.exp_sharpen = prefs.exp_sharpen.clamp(0.0, 100.0);
+            app.exp_quality = prefs.exp_quality.clamp(1.0, 100.0);
             if let Some(dir) = prefs.gallery_dir.filter(|d| d.is_dir()) {
                 app.open_folder(dir);
             }
@@ -1361,6 +1394,7 @@ impl AutoshopApp {
         let tx = self.tx.clone();
         let recipe = self.recipe.clone();
         let denoise = self.save_denoise;
+        let export = self.export_opts();
         std::thread::spawn(move || {
             let res = (|| {
                 if let Some(p) = out.parent() {
@@ -1370,8 +1404,74 @@ impl AutoshopApp {
                 let opts = denoise.then(|| {
                     autoshop::denoise::DenoiseOpts::from_config(&autoshop::config::Config::load(), None, 1.0)
                 });
-                autoshop::render::render_to_file(&path, &recipe, &out, opts.as_ref())?;
+                autoshop::render::render_to_file(&path, &recipe, &out, opts.as_ref(), Some(&export))?;
                 Ok::<String, anyhow::Error>(out.display().to_string())
+            })();
+            let _ = tx.send(Msg::Exported(res));
+        });
+    }
+
+    /// The delivery options the export UI currently dials in (gap batch F) —
+    /// shared by single export, Download… and batch render.
+    fn export_opts(&self) -> autoshop::render::ExportOpts {
+        autoshop::render::ExportOpts {
+            long_edge: (self.exp_long_edge > 0).then_some(self.exp_long_edge),
+            sharpen: self.exp_sharpen.clamp(0.0, 100.0),
+            jpeg_quality: self.exp_quality.round().clamp(1.0, 100.0) as u8,
+        }
+    }
+
+    /// Batch-render every Ctrl+click-selected photo through its own saved
+    /// ./out recipe JSON (falling back to a neutral develop when none exists)
+    /// with the current export options — Lightroom's "export selected".
+    /// Sequential on one worker: each full-res develop is already multi-second
+    /// and memory-heavy (61 MP frames), so parallelism would thrash, not speed
+    /// up. AI denoise is deliberately excluded (minutes per photo via the GPU
+    /// sidecar — run it per-photo from the export panel instead).
+    fn start_batch_render(&mut self) {
+        if self.busy {
+            return;
+        }
+        let targets: Vec<PathBuf> = {
+            let mut idx: Vec<usize> = self.multi_sel.iter().copied().collect();
+            idx.sort_unstable(); // report in gallery order, not hash order
+            idx.into_iter().filter_map(|i| self.gallery.get(i).cloned()).collect()
+        };
+        if targets.is_empty() {
+            return;
+        }
+        let ext = if self.save_jpeg { "jpg" } else { "tif" };
+        let export = self.export_opts();
+        self.busy = true;
+        self.status = format!("批量渲染 {} 张 → ./out …", targets.len());
+        let tx = self.tx.clone();
+        let ext = ext.to_string();
+        std::thread::spawn(move || {
+            let res = (|| {
+                let (mut okn, mut errs) = (0usize, Vec::<String>::new());
+                for p in &targets {
+                    let one = (|| -> anyhow::Result<()> {
+                        let rj = autoshop::pipeline::default_out(p, "recipe", "json");
+                        let recipe = if rj.exists() {
+                            serde_json::from_str::<EditRecipe>(&std::fs::read_to_string(&rj)?)?
+                        } else {
+                            EditRecipe::default()
+                        };
+                        let out = autoshop::pipeline::default_out(p, "developed", &ext);
+                        autoshop::pipeline::ensure_parent(&out)?;
+                        autoshop::render::render_to_file(p, &recipe, &out, None, Some(&export))?;
+                        Ok(())
+                    })();
+                    match one {
+                        Ok(()) => okn += 1,
+                        Err(e) => errs.push(format!("{}: {e}", autoshop::pipeline::stem(p))),
+                    }
+                }
+                if errs.is_empty() {
+                    Ok(format!("./out — 批量 {okn} 张完成"))
+                } else {
+                    anyhow::bail!("批量：{okn} 成功、{} 失败：{}", errs.len(), errs.join("; "))
+                }
             })();
             let _ = tx.send(Msg::Exported(res));
         });
@@ -1728,6 +1828,18 @@ impl AutoshopApp {
                     .clicked()
                 {
                     self.start_paste();
+                }
+            });
+            ui.add_enabled_ui(n > 0 && !self.busy, |ui| {
+                if ui
+                    .small_button(format!("🖼 渲染选中({n})"))
+                    .on_hover_text(
+                        "每张按它自己的 ./out 配方出图（没有配方则中性显影）→ \
+./out/<名>.developed.*，用当前格式/长边/锐化/质量；AI Denoise 不参与批量",
+                    )
+                    .clicked()
+                {
+                    self.start_batch_render();
                 }
             });
             if n > 0 && ui.small_button("✕").on_hover_text("清除多选").clicked() {
@@ -3495,6 +3607,27 @@ impl eframe::App for AutoshopApp {
                             ui.selectable_value(&mut self.save_jpeg, false, "16-bit TIFF");
                             ui.selectable_value(&mut self.save_jpeg, true, "JPEG");
                         });
+                    // --- delivery pipeline (gap batch F): resize → sharpen → quality ---
+                    ui.horizontal(|ui| {
+                        ui.label("长边");
+                        egui::ComboBox::from_id_salt("exp_long_edge")
+                            .selected_text(if self.exp_long_edge == 0 {
+                                "原尺寸".to_string()
+                            } else {
+                                format!("{} px", self.exp_long_edge)
+                            })
+                            .width(86.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.exp_long_edge, 0, "原尺寸");
+                                for px in [1600u32, 2048, 2560, 3840, 5120] {
+                                    ui.selectable_value(&mut self.exp_long_edge, px, format!("{px} px"));
+                                }
+                            });
+                    });
+                    Self::slider(ui, "输出锐化", &mut self.exp_sharpen, 0.0, 100.0, 0.0);
+                    if self.save_jpeg {
+                        Self::slider(ui, "JPEG 质量", &mut self.exp_quality, 60.0, 100.0, 95.0);
+                    }
                     ui.checkbox(&mut self.save_denoise, "AI Denoise").on_hover_text(
                         "SCUNet AI denoise before developing — high-ISO / astro (slow, GPU; needs the python sidecar)",
                     );
@@ -3711,6 +3844,9 @@ impl eframe::App for AutoshopApp {
                 save_jpeg: self.save_jpeg,
                 save_denoise: self.save_denoise,
                 view_mode: self.view_mode,
+                exp_long_edge: self.exp_long_edge,
+                exp_sharpen: self.exp_sharpen,
+                exp_quality: self.exp_quality,
             },
         );
     }

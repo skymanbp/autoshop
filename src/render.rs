@@ -160,22 +160,75 @@ pub fn render_baked_to_image(
     Ok(dynimg)
 }
 
+/// The output pipeline — Lightroom's export page distilled to the three
+/// controls that matter for delivery: resize to a long edge, output sharpening
+/// applied AFTER the resize (detail lost to downscaling can only be compensated
+/// post-resize), and JPEG quality. `None` / `Default` reproduce the classic
+/// full-resolution q95 behaviour exactly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExportOpts {
+    /// Resize so the LONG edge equals this many pixels (aspect kept, Lanczos3).
+    /// Never upscales. `None` = full resolution.
+    pub long_edge: Option<u32>,
+    /// Output sharpening 0..=100: small-radius luma unsharp on the (resized)
+    /// output. 0 = off. Screen-oriented (radius 1).
+    pub sharpen: f32,
+    /// JPEG quality 1..=100 (ignored by TIFF/PNG, which stay 16-bit lossless).
+    pub jpeg_quality: u8,
+}
+
+impl Default for ExportOpts {
+    fn default() -> Self {
+        Self { long_edge: None, sharpen: 0.0, jpeg_quality: 95 }
+    }
+}
+
 /// Render and save to `out` at the highest fidelity the format allows:
-/// `.tif`/`.png` keep the full **16-bit** depth; `.jpg` downconverts to 8-bit at
-/// quality 95. Extension picks the format. Dispatches RAW (demosaic engine) vs
-/// baked image (the PNG-source engine) automatically.
+/// `.tif`/`.png` keep the full **16-bit** depth; `.jpg` downconverts to 8-bit.
+/// Extension picks the format. Dispatches RAW (demosaic engine) vs baked image
+/// (the PNG-source engine) automatically. `export` adds the delivery pipeline
+/// (resize / output sharpen / JPEG quality); `None` = full-res q95 as always.
+/// Returns the SAVED dimensions (post-resize).
 pub fn render_to_file(
     src_path: &Path,
     recipe: &EditRecipe,
     out: &Path,
     denoise: Option<&crate::denoise::DenoiseOpts>,
+    export: Option<&ExportOpts>,
 ) -> Result<(u32, u32)> {
-    let img = if crate::decode::is_raw(src_path) {
+    let mut img = if crate::decode::is_raw(src_path) {
         render_to_image(src_path, recipe, denoise)?
     } else {
         let src = crate::decode::load_image(src_path)?;
         render_baked_to_image(&src, recipe, denoise)?
     };
+    let opts = export.copied().unwrap_or_default();
+    if let Some(le) = opts.long_edge
+        && le > 0
+        && img.width().max(img.height()) > le
+    {
+        // resize() fits within the box while keeping aspect → long edge == le.
+        img = img.resize(le, le, image::imageops::FilterType::Lanczos3);
+    }
+    if opts.sharpen > 0.0 {
+        // Same luma-unsharp the develop uses, run on the delivery-size pixels.
+        let rgb = img.to_rgb16();
+        let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+        let mut data: Vec<[f32; 3]> = rgb
+            .pixels()
+            .map(|p| [p[0] as f32 / 65535.0, p[1] as f32 / 65535.0, p[2] as f32 / 65535.0])
+            .collect();
+        unsharp_luma(&mut data, w, h, 1, (opts.sharpen / 100.0).clamp(0.0, 1.0), false);
+        let mut buf: Vec<u16> = Vec::with_capacity(w * h * 3);
+        for px in &data {
+            for c in px {
+                buf.push((c.clamp(0.0, 1.0) * 65535.0).round() as u16);
+            }
+        }
+        img = DynamicImage::ImageRgb16(
+            ImageBuffer::from_raw(w as u32, h as u32, buf).expect("sharpen buffer size matches"),
+        );
+    }
     let (w, h) = (img.width(), img.height());
     let ext = out
         .extension()
@@ -184,12 +237,12 @@ pub fn render_to_file(
         .to_ascii_lowercase();
     match ext.as_str() {
         "jpg" | "jpeg" => {
-            // JPEG is 8-bit only — downconvert from 16-bit and encode at q95.
+            // JPEG is 8-bit only — downconvert from 16-bit.
             let rgb8 = img.to_rgb8();
             let file = std::fs::File::create(out)
                 .with_context(|| format!("create {}", out.display()))?;
             let mut w = std::io::BufWriter::new(file);
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut w, 95)
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut w, opts.jpeg_quality.clamp(1, 100))
                 .write_image(rgb8.as_raw(), rgb8.width(), rgb8.height(), image::ExtendedColorType::Rgb8)
                 .with_context(|| format!("encode jpeg {}", out.display()))?;
         }
@@ -1393,6 +1446,45 @@ mod tests {
         assert!(spread(data[1]) < 0.05, "dark orange (same hue) must desaturate: {:?}", data[1]);
         assert_eq!(data[2], control[2], "opposite hue: the mask must skip it");
         assert_eq!(data[3], control[3], "neutral grey: the mask must skip it");
+    }
+
+    #[test]
+    fn export_opts_resize_sharpen_quality() {
+        // Synthetic 200×100 gradient source (baked path), rendered through the
+        // delivery pipeline. Long edge 50 → 50×25 saved AND reported; a long
+        // edge larger than the source never upscales; lower JPEG quality
+        // produces a smaller file than higher quality.
+        std::fs::create_dir_all("out").ok();
+        let src_p = std::path::Path::new("out/_export_src.png");
+        let img = RgbImage::from_fn(200, 100, |x, y| {
+            Rgb([(x % 256) as u8, (y * 2 % 256) as u8, ((x + y) % 256) as u8])
+        });
+        img.save(src_p).unwrap();
+        let neutral = EditRecipe::default();
+
+        let small = ExportOpts { long_edge: Some(50), sharpen: 25.0, ..Default::default() };
+        let (w, h) =
+            render_to_file(src_p, &neutral, std::path::Path::new("out/_export_le50.png"), None, Some(&small))
+                .unwrap();
+        assert_eq!((w, h), (50, 25), "long edge 50 must fit 200×100 to 50×25");
+        let saved = image::image_dimensions("out/_export_le50.png").unwrap();
+        assert_eq!(saved, (50, 25), "saved file dims must match the report");
+
+        let big = ExportOpts { long_edge: Some(400), ..Default::default() };
+        let (w, h) =
+            render_to_file(src_p, &neutral, std::path::Path::new("out/_export_le400.png"), None, Some(&big))
+                .unwrap();
+        assert_eq!((w, h), (200, 100), "long edge beyond source must NOT upscale");
+
+        for (q, name) in [(30u8, "out/_export_q30.jpg"), (95u8, "out/_export_q95.jpg")] {
+            let opts = ExportOpts { jpeg_quality: q, ..Default::default() };
+            render_to_file(src_p, &neutral, std::path::Path::new(name), None, Some(&opts)).unwrap();
+        }
+        let (s30, s95) = (
+            std::fs::metadata("out/_export_q30.jpg").unwrap().len(),
+            std::fs::metadata("out/_export_q95.jpg").unwrap().len(),
+        );
+        assert!(s30 < s95, "q30 ({s30} B) must be smaller than q95 ({s95} B)");
     }
 
     #[test]

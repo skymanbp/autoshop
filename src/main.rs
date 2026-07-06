@@ -374,7 +374,7 @@ fn apply_cmd(raw: &Path, recipe_path: &Path, out: &Path) -> Result<()> {
     pipeline::guard_readonly(out, raw)?;
     ensure_parent(out)?;
     println!("rendering {} with {} ...", raw.display(), recipe_path.display());
-    let (w, h) = render::render_to_file(raw, &recipe, out, None)?;
+    let (w, h) = render::render_to_file(raw, &recipe, out, None, None)?;
     println!("render -> {} ({} x {})", out.display(), w, h);
     Ok(())
 }
@@ -406,7 +406,7 @@ fn auto_cmd(
         verdict.decision,
         if denoise { " with AI denoise" } else { "" }
     );
-    let (w, h) = render::render_to_file(raw, &recipe, &out, dn.as_ref())?;
+    let (w, h) = render::render_to_file(raw, &recipe, &out, dn.as_ref(), None)?;
     println!("render -> {} ({} x {})", out.display(), w, h);
     // XMP only for a RAW (Lightroom reads it beside the RAW); a baked source
     // (PNG/TIFF) gets the recipe JSON only.
@@ -434,7 +434,7 @@ fn denoise_cmd(
     let opts = denoise::DenoiseOpts::from_config(&cfg, model, strength.unwrap_or(1.0));
     if decode::is_raw(input) {
         println!("denoising RAW {} (neutral develop) ...", input.display());
-        let (w, h) = render::render_to_file(input, &EditRecipe::default(), &out, Some(&opts))?;
+        let (w, h) = render::render_to_file(input, &EditRecipe::default(), &out, Some(&opts), None)?;
         println!("denoised -> {} ({} x {})", out.display(), w, h);
     } else {
         println!("denoising image {} ...", input.display());
@@ -480,7 +480,7 @@ fn match_cmd(
         pipeline::guard_readonly(&img_out, raw)?;
         ensure_parent(&img_out)?;
         println!("rendering the fitted recipe at full resolution …");
-        let (w, h) = render::render_to_file(raw, &rep.recipe, &img_out, None)?;
+        let (w, h) = render::render_to_file(raw, &rep.recipe, &img_out, None, None)?;
         println!("render -> {} ({w} x {h})", img_out.display());
     }
     if style_prompt {
@@ -575,7 +575,7 @@ fn process_one(raw: &Path, cfg: &Config, render_master: bool) -> Result<Verdict>
     if render_master {
         let out = default_out(raw, "developed", "tif"); // 16-bit master
         ensure_parent(&out)?;
-        render::render_to_file(raw, &recipe, &out, None)?;
+        render::render_to_file(raw, &recipe, &out, None, None)?;
     }
     Ok(verdict)
 }

@@ -479,7 +479,7 @@ fn api_export(mut request: Request, state: &AppState) -> Result<()> {
     let raw = state.at(req.id).ok_or_else(|| anyhow!("bad id"))?;
     let out = pipeline::default_out(&raw, "developed", fmt_ext(&req));
     pipeline::ensure_parent(&out)?;
-    render::render_to_file(&raw, &req.recipe, &out, denoise_opts(&req, &state.config()).as_ref())?;
+    render::render_to_file(&raw, &req.recipe, &out, denoise_opts(&req, &state.config()).as_ref(), None)?;
     respond_text(request, &out.display().to_string())
 }
 
@@ -494,7 +494,7 @@ fn api_download(mut request: Request, state: &AppState) -> Result<()> {
         std::process::id(),
         DL_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    render::render_to_file(&raw, &req.recipe, &tmp, denoise_opts(&req, &state.config()).as_ref())?;
+    render::render_to_file(&raw, &req.recipe, &tmp, denoise_opts(&req, &state.config()).as_ref(), None)?;
     let bytes = std::fs::read(&tmp).with_context(|| format!("read {}", tmp.display()))?;
     let _ = std::fs::remove_file(&tmp);
     let ctype = if ext == "jpg" { "image/jpeg" } else { "image/tiff" };
