@@ -439,6 +439,10 @@ struct AutoshopApp {
     paste_geometry: bool,                  // keep crop/straighten when pasting
     // --- WB eyedropper ---
     wb_picking: bool,                      // next image click samples a neutral point
+    // --- clone stamp ---
+    clone_mode: bool,                      // brush paints the clone target; Alt+click = source
+    clone_src: Option<(f32, f32)>,         // picked source point, original-frame normalized
+    clone_fullres: bool,                   // clone on the full-res develop (RAW only)
 }
 
 /// The two mask geometries a user can place by dragging.
@@ -554,6 +558,9 @@ impl Default for AutoshopApp {
             copied: None,
             paste_geometry: false,
             wb_picking: false,
+            clone_mode: false,
+            clone_src: None,
+            clone_fullres: false,
         }
     }
 }
@@ -1461,6 +1468,8 @@ impl AutoshopApp {
                         self.place_start = None;
                         self.curve_drag = None; // curve_channel is a UI pref, keep it
                         self.wb_picking = false;
+                        self.clone_mode = false;
+                        self.clone_src = None;
                         self.verdict = None;
                         self.rationale.clear();
                         self.dirty = true; // render the (neutral) after
@@ -1830,6 +1839,7 @@ impl AutoshopApp {
                             self.crop_mode = false;
                             self.paint_mode = false;
                             self.placing_mask = None;
+                            self.clone_mode = false;
                             self.status = "WB 吸管：点击图中应为中性灰/白的位置".into();
                         }
                     }
@@ -1961,6 +1971,7 @@ impl AutoshopApp {
                             self.paint_mode = false;
                             self.placing_mask = None;
                             self.wb_picking = false;
+                            self.clone_mode = false;
                         }
                     }
                     egui::ComboBox::from_id_salt("crop_aspect")
@@ -2009,6 +2020,7 @@ impl AutoshopApp {
                     self.paint_mode = false;
                     self.crop_mode = false;
                     self.wb_picking = false;
+                    self.clone_mode = false;
                     self.status = "在图上拖拽画出线性渐变（起点不受影响 → 终点完全生效）".into();
                 }
                 if ui.button("＋ 径向").on_hover_text("在图上拖拽画出椭圆范围").clicked() {
@@ -2016,6 +2028,7 @@ impl AutoshopApp {
                     self.paint_mode = false;
                     self.crop_mode = false;
                     self.wb_picking = false;
+                    self.clone_mode = false;
                     self.status = "在图上拖拽画出径向（椭圆）范围".into();
                 }
             });
@@ -2061,6 +2074,7 @@ impl AutoshopApp {
                         self.paint_mode = false;
                         self.crop_mode = false;
                         self.wb_picking = false;
+                        self.clone_mode = false;
                     }
                     let m = &mut self.recipe.masks[i];
                     ui.checkbox(&mut m.inverted, "反转");
@@ -2158,6 +2172,8 @@ impl AutoshopApp {
             "局部调整 — 在图上拖拽画出渐变范围"
         } else if self.wb_picking {
             "WB 吸管 — 点击应为中性灰/白的位置"
+        } else if self.clone_mode {
+            "图章 — Alt+点击取源点 · 拖动涂要覆盖的区域"
         } else if self.paint_mode {
             "After — paint over the area to fill / heal"
         } else {
@@ -2236,6 +2252,12 @@ impl AutoshopApp {
             self.handle_place_mask(ui, &resp, xf);
         } else if self.wb_picking {
             self.handle_wb_pick(ui, &resp, xf);
+        } else if self.clone_mode {
+            self.handle_clone(ui, &resp, xf);
+            self.ensure_mask_tex(ui.ctx());
+            if let Some(t) = &self.mask_tex {
+                ui.painter_at(rect).image(t.id(), rect, uv, egui::Color32::WHITE);
+            }
         } else if self.paint_mode {
             self.handle_paint(&resp, xf);
             self.ensure_mask_tex(ui.ctx());
@@ -2649,6 +2671,42 @@ impl AutoshopApp {
         }
     }
 
+    /// Clone-stamp interaction: Alt+click picks the SOURCE point (stored in
+    /// the original frame like every pixel-path coordinate); plain drags paint
+    /// the target with the shared brush. The picked source stays marked with
+    /// a crosshair ring so the offset is always visible.
+    fn handle_clone(&mut self, ui: &egui::Ui, resp: &egui::Response, xf: ViewXform) {
+        let alt = ui.input(|i| i.modifiers.alt);
+        if alt {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            if resp.clicked()
+                && let Some(q) = resp.interact_pointer_pos()
+            {
+                let (dims, deg) = self.straighten_ctx();
+                let (nx, ny) = xf.to_norm(q);
+                self.clone_src = Some(view_norm_to_orig(nx, ny, dims, deg));
+                self.status = "克隆源已取样 — 画笔涂要覆盖的区域，然后「⎘ 克隆已涂区域」".into();
+            }
+        } else {
+            self.handle_paint(resp, xf);
+        }
+        if let Some((sx, sy)) = self.clone_src {
+            let (dims, deg) = self.straighten_ctx();
+            let (vx, vy) = orig_norm_to_view(sx, sy, dims, deg);
+            let q = xf.to_screen(vx, vy);
+            let p = ui.painter_at(xf.rect);
+            p.circle_stroke(q, 9.0, egui::Stroke::new(2.0, PILL));
+            p.line_segment(
+                [q - egui::vec2(13.0, 0.0), q + egui::vec2(13.0, 0.0)],
+                egui::Stroke::new(1.0, PILL),
+            );
+            p.line_segment(
+                [q - egui::vec2(0.0, 13.0), q + egui::vec2(0.0, 13.0)],
+                egui::Stroke::new(1.0, PILL),
+            );
+        }
+    }
+
     /// Generative fill: regenerate the painted area (gpt-image), composite onto
     /// the source, save to ./out. Runs on a worker thread.
     fn start_fill(&mut self) {
@@ -2740,6 +2798,43 @@ impl AutoshopApp {
                 let img = autoshop::decode::load_image(&out)?.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE);
                 // Not a fit target (pixel heal, not a whole-frame rendition).
                 Ok((img, format!("healed {} spot(s) → {}", rep.spots, out.display()), None))
+            })();
+            let _ = tx.send(Msg::Retouched(Box::new(res)));
+        });
+    }
+
+    /// Run the clone stamp on a worker: painted target mask + the Alt+picked
+    /// source point → `retouch::clone_stamp` (deterministic, no AI) → ./out
+    /// pixel master shown in the After pane, exactly like heal.
+    fn start_clone(&mut self) {
+        let Some(path) = self.src_path.clone() else { return };
+        if self.busy {
+            return;
+        }
+        let Some(src_pt) = self.clone_src else {
+            self.status = "先 Alt+点击取克隆源点".into();
+            return;
+        };
+        let Some(mask_png) = self.export_mask_png() else {
+            self.status = "先用画笔涂要克隆覆盖的区域".into();
+            return;
+        };
+        self.busy = true;
+        self.status = "克隆中…（本地像素运算）".into();
+        let tx = self.tx.clone();
+        let full_res = self.clone_fullres;
+        std::thread::spawn(move || {
+            let res = (|| -> anyhow::Result<(image::DynamicImage, String, Option<PathBuf>)> {
+                let out = autoshop::pipeline::default_out(&path, "clone", "png");
+                let mask_tmp = std::env::temp_dir()
+                    .join(format!("autoshop_gui_clone_{}.png", std::process::id()));
+                std::fs::write(&mask_tmp, &mask_png)?;
+                let rep = autoshop::retouch::clone_stamp(&path, &mask_tmp, src_pt, full_res, &out);
+                let _ = std::fs::remove_file(&mask_tmp);
+                let rep = rep?;
+                let img = autoshop::decode::load_image(&out)?.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE);
+                // Not a fit target (pixel transplant, not a whole-frame look).
+                Ok((img, format!("克隆 {} 处 → {}", rep.spots, out.display()), None))
             })();
             let _ = tx.send(Msg::Retouched(Box::new(res)));
         });
@@ -2917,8 +3012,12 @@ impl AutoshopApp {
 
         // Mask tools shared by Fill AND Heal — one brush, two consumers.
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.paint_mode, "Paint mask")
+            let r = ui
+                .checkbox(&mut self.paint_mode, "Paint mask")
                 .on_hover_text("Brush over the area; box-select is paused while on. Fill 与 Heal 共用");
+            if r.changed() && self.paint_mode {
+                self.clone_mode = false; // the stamp has its own paint dispatch
+            }
             if ui.button("Clear").clicked() {
                 self.clear_mask();
             }
@@ -2977,6 +3076,43 @@ impl AutoshopApp {
                 ui.label(
                     egui::RichText::new(
                         "AI auto-detects dust / blemishes, or paint a mask and Heal it. Pixel retouch from surrounding pixels; saved to ./out.",
+                    )
+                    .weak()
+                    .small(),
+                );
+            });
+
+        egui::CollapsingHeader::new("仿制图章 · Clone Stamp")
+            .id_salt("sec_clone")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let label = if self.clone_mode { "✅ 完成" } else { "🖊 进入图章" };
+                    if ui.button(label).clicked() {
+                        self.clone_mode = !self.clone_mode;
+                        if self.clone_mode {
+                            // One canvas tool at a time; a fresh target mask.
+                            self.paint_mode = false;
+                            self.crop_mode = false;
+                            self.placing_mask = None;
+                            self.wb_picking = false;
+                            self.clear_mask();
+                            self.status =
+                                "图章：Alt+点击取源点 → 画笔涂目标区 → 「⎘ 克隆已涂区域」".into();
+                        }
+                    }
+                    ui.checkbox(&mut self.clone_fullres, "Full-res")
+                        .on_hover_text("在全分辨率显影上克隆（慢，仅 RAW）");
+                    ui.add_enabled_ui(!self.busy && self.clone_mode, |ui| {
+                        if ui.button("⎘ 克隆已涂区域").clicked() {
+                            self.start_clone();
+                        }
+                    });
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Photoshop 的仿制图章：Alt+点击取源（十字标记），画笔涂要覆盖的区域，\
+                         按源点原样搬运像素（羽化边缘、不做色调匹配）。本地运算，存 ./out 像素母版。",
                     )
                     .weak()
                     .small(),

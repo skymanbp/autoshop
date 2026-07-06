@@ -83,11 +83,17 @@
 - 已知近似（待真 LR 验证）：angle≠0 且带 crop 时 XMP 的 CropLeft…/CropAngle
   组合语义与我们的"先转后裁"是否逐像素一致未对照过真实 ACR 边车。
 
-## ⑤ 仿制图章（像素路径）
+## ⑤ 仿制图章（✅ 已完成）
 
-- 非 recipe：走 heal 的像素通路（retouch.rs，实现前先读）。
-- GUI：Alt+点击取源点 → 画笔涂目标区 → 按偏移克隆 → 存 ./out 像素母版
-  （同 heal，非 XMP）。与 ViewXform 兼容（画笔已走归一化坐标）。
+- 引擎：`HealSpot.clone_raw`（跳过 heal 的边界色调匹配 = 原样搬运 + 羽化）
+  + `retouch::clone_stamp(src, mask, source_norm, full_res, out)`——涂抹 blob
+  → spots，每个 spot 的供体偏移 = 源点 − blob 中心（PS 非对齐取样）。
+- GUI：Retouch「仿制图章」节——进入图章模式，Alt+点击取源（十字标记，
+  存原始帧坐标），共用画笔涂目标，「⎘ 克隆已涂区域」worker → ./out
+  像素母版（同 heal，非 XMP）。单测锁定 clone（原样）vs heal（色调匹配）
+  的语义差异。
+- 已知近似：拉直角≠0 时画笔 overlay 纹理按原始帧直贴（落点计算正确，
+  显示未旋转）——heal/clone/fill 共同的显示级问题，engine 结果不受影响。
 
 ## 完成每项后的例行动作
 

@@ -39,12 +39,24 @@ pub struct HealSpot {
     pub radius: f32,
     pub feather: f32,
     pub source: Option<[f32; 2]>,
+    /// CLONE semantics: copy the donor verbatim (feathered edge only), skipping
+    /// the border tone-matching that makes a *heal* blend. This is Photoshop's
+    /// clone stamp vs its healing brush — texture transplant vs seamless repair.
+    pub clone_raw: bool,
     pub label: String,
 }
 
 impl Default for HealSpot {
     fn default() -> Self {
-        Self { cx: 0.5, cy: 0.5, radius: 0.02, feather: 0.4, source: None, label: String::new() }
+        Self {
+            cx: 0.5,
+            cy: 0.5,
+            radius: 0.02,
+            feather: 0.4,
+            source: None,
+            clone_raw: false,
+            label: String::new(),
+        }
     }
 }
 
@@ -84,7 +96,7 @@ pub fn heal_image(img: &mut RgbImage, spots: &[HealSpot]) {
             Some([sx, sy]) => ((sx * w as f32).round() as i32, (sy * h as f32).round() as i32),
             None => find_donor(&src, cx, cy, r),
         };
-        heal_one(&src, img, cx, cy, r, s.feather.clamp(0.0, 1.0), off);
+        heal_one(&src, img, cx, cy, r, s.feather.clamp(0.0, 1.0), off, s.clone_raw);
     }
 }
 
@@ -155,7 +167,20 @@ fn find_donor(src: &RgbImage, cx: f32, cy: f32, r: f32) -> (i32, i32) {
 
 /// Copy the donor disk (spot centre + offset) over the spot, correcting its mean
 /// to the spot's border (the "heal" vs "clone" part) and feathering the edge.
-fn heal_one(src: &RgbImage, dst: &mut RgbImage, cx: f32, cy: f32, r: f32, feather: f32, off: (i32, i32)) {
+/// With `clone_raw` the correction is skipped — donor pixels land verbatim (the
+/// clone stamp), which is exactly what you want when transplanting texture and
+/// exactly wrong when repairing into different-toned surroundings.
+#[allow(clippy::too_many_arguments)] // internal helper mirroring HealSpot's fields
+fn heal_one(
+    src: &RgbImage,
+    dst: &mut RgbImage,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    feather: f32,
+    off: (i32, i32),
+    clone_raw: bool,
+) {
     if off == (0, 0) {
         return; // no donor found → honest no-op rather than cloning the spot onto itself
     }
@@ -164,17 +189,19 @@ fn heal_one(src: &RgbImage, dst: &mut RgbImage, cx: f32, cy: f32, r: f32, feathe
     // Low-frequency correction: shift the donor so its border matches the spot's
     // border — this is what makes a *heal* blend where a raw *clone* would seam.
     let mut corr = [0.0f32; 3];
-    for j in 0..24 {
-        let a = j as f32 / 24.0 * std::f32::consts::TAU;
-        let (dx, dy) = (a.cos() * r * 1.15, a.sin() * r * 1.15);
-        let tp = px(src, (cx + dx) as i32, (cy + dy) as i32);
-        let dp = px(src, (cx + dx) as i32 + ox, (cy + dy) as i32 + oy);
-        for c in 0..3 {
-            corr[c] += tp[c] - dp[c];
+    if !clone_raw {
+        for j in 0..24 {
+            let a = j as f32 / 24.0 * std::f32::consts::TAU;
+            let (dx, dy) = (a.cos() * r * 1.15, a.sin() * r * 1.15);
+            let tp = px(src, (cx + dx) as i32, (cy + dy) as i32);
+            let dp = px(src, (cx + dx) as i32 + ox, (cy + dy) as i32 + oy);
+            for c in 0..3 {
+                corr[c] += tp[c] - dp[c];
+            }
         }
-    }
-    for v in &mut corr {
-        *v /= 24.0;
+        for v in &mut corr {
+            *v /= 24.0;
+        }
     }
 
     let r_i = r.ceil() as i32;
@@ -267,6 +294,7 @@ pub fn plan_from_mask(mask: &RgbaImage) -> Vec<HealSpot> {
             radius: rad / short,
             feather: 0.4,
             source: None,
+            clone_raw: false,
             label: "painted".into(),
         });
     }
@@ -452,6 +480,50 @@ pub fn heal(
     Ok(HealReport { spots: n, rationale, dims: (w, h) })
 }
 
+/// Clone-stamp mode: copy pixels from a user-picked SOURCE point over every
+/// painted target blob — verbatim texture transplant (feathered edge, no tone
+/// matching), Photoshop's clone stamp beside heal's seamless repair. Each blob
+/// clones FROM the same picked point (PS "non-aligned" sampling), so the user
+/// picks clean texture once and paints any number of targets. Deterministic,
+/// no AI. Output is the same ./out pixel master as heal (non-XMP by nature).
+pub fn clone_stamp(
+    src_path: &Path,
+    mask_path: &Path,
+    source_norm: (f32, f32),
+    full_res: bool,
+    out: &Path,
+) -> Result<HealReport> {
+    let is_raw = decode::is_raw(src_path);
+    let base = if full_res && is_raw {
+        crate::render::render_to_image(src_path, &crate::recipe::EditRecipe::default(), None)?
+    } else {
+        decode::preview_only(src_path)?
+    };
+    let mut rgb = base.to_rgb8();
+    let (w, h) = rgb.dimensions();
+
+    let m = image::open(mask_path)
+        .with_context(|| format!("open mask {}", mask_path.display()))?
+        .to_rgba8();
+    let mut spots = plan_from_mask(&m);
+    if spots.is_empty() {
+        return Err(anyhow!("nothing painted — brush over the target area first"));
+    }
+    for s in spots.iter_mut() {
+        s.source = Some([source_norm.0 - s.cx, source_norm.1 - s.cy]);
+        s.clone_raw = true;
+        s.feather = 0.3;
+        s.label = "clone".into();
+    }
+    let n = spots.len();
+    heal_image(&mut rgb, &spots);
+    crate::pipeline::ensure_parent(out)?;
+    image::DynamicImage::ImageRgb8(rgb)
+        .save(out)
+        .with_context(|| format!("write {}", out.display()))?;
+    Ok(HealReport { spots: n, rationale: String::new(), dims: (w, h) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,7 +540,8 @@ mod tests {
             }
         }
         let spots = vec![HealSpot {
-            cx: 0.5, cy: 0.5, radius: 7.0 / 64.0, feather: 0.4, source: None, label: "x".into(),
+            cx: 0.5, cy: 0.5, radius: 7.0 / 64.0, feather: 0.4, source: None,
+            clone_raw: false, label: "x".into(),
         }];
         heal_image(&mut img, &spots);
         let c = img.get_pixel(32, 32).0;
@@ -488,11 +561,43 @@ mod tests {
         }
         let spots = vec![HealSpot {
             cx: 30.0 / 40.0, cy: 0.5, radius: 4.0 / 20.0, feather: 0.2,
-            source: Some([-0.3, 0.0]), label: "spot".into(),
+            source: Some([-0.3, 0.0]), clone_raw: false, label: "spot".into(),
         }];
         heal_image(&mut img, &spots);
         let c = img.get_pixel(30, 10).0;
         assert!(c[0] > 200, "defect should heal to the white surroundings, got {c:?}");
+    }
+
+    #[test]
+    fn clone_raw_transplants_verbatim_where_heal_tone_matches() {
+        // A white field with a gray donor patch on the left. Cloning the gray
+        // ONTO the white must land the donor's tone verbatim (clone_raw), while
+        // the same spot healed (clone_raw=false) tone-matches to the white
+        // surroundings — the defining difference between the two tools.
+        let mut base = RgbImage::from_pixel(60, 20, Rgb([255, 255, 255]));
+        for y in 6..14 {
+            for x in 6..14 {
+                base.put_pixel(x, y, Rgb([100, 100, 100])); // donor texture
+            }
+        }
+        let spot = |clone_raw: bool| HealSpot {
+            cx: 45.0 / 60.0,
+            cy: 0.5,
+            radius: 3.0 / 20.0,
+            feather: 0.2,
+            source: Some([(10.0 - 45.0) / 60.0, 0.0]), // donor centre at (10, 10)
+            clone_raw,
+            label: "clone".into(),
+        };
+        let mut cloned = base.clone();
+        heal_image(&mut cloned, &[spot(true)]);
+        let c = cloned.get_pixel(45, 10).0;
+        assert!(c[0] < 130, "clone must transplant the gray verbatim, got {c:?}");
+
+        let mut healed = base.clone();
+        heal_image(&mut healed, &[spot(false)]);
+        let hh = healed.get_pixel(45, 10).0;
+        assert!(hh[0] > 200, "heal must tone-match toward the white border, got {hh:?}");
     }
 
     #[test]
