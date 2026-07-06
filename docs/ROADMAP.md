@@ -1,38 +1,38 @@
 # ROADMAP — “一定程度直接取代 Photoshop” 路线（v0.2.0 之后）
 
-> 交接文档：按顺序推进下列条目。每项都附实现要点与 `file:line` 锚点，
-> 供新会话不重读全库即可开工。写于 2026-07-06，HEAD = `150c3f3`（已推送）。
+> 交接文档：每项都附实现要点与 `file:line` 锚点，供新会话不重读全库即可
+> 开工。更新于 2026-07-06，HEAD = `997de65`（已推送，local==origin）。
 
 ## 当前状态（已完成，勿重做）
 
 - **v0.2.0 已发布**（tag `v0.2.0` → `1bc57ff`，GitHub Release 带双 exe）。
-- 其后又推送 `150c3f3`：缩放/平移（ViewXform 统一坐标）、手动局部 mask
-  编辑器、交互式裁剪。**尚未发新 release**。
-- 反推配方（`fit.rs` + CLI `match` + GUI 按钮）、gpt-image-2 弹性高分辨率
-  （≤8.3MP + 400 回退）、风格提示词提取（`advisor::describe_style`）均已上线。
-- GUI 生产化（直方图/toast/快捷键/拖拽/持久化/分组折叠/双击归零）已上线。
-- **① 曲线编辑器已完成**：develop_panel「曲线 · Curves」，主/R/G/B 通道，
-  直方图背景 + 点击加点/拖动移点/拖出删点；预览线直接采样公开的
-  `render::curve_lut`（引擎同源）。
-- **② 批量复制/粘贴已完成**：gallery Ctrl+点击多选，「复制配方」/「粘贴到
-  选中(N)」按钮 + 可选含裁剪/拉直；worker 逐张写 ./out recipe JSON +（RAW）
-  XMP，部分失败走错误 toast。
-- **③ WB 吸管已完成**（含前置）：新共享阶段 `apply_recipe_wb` 接入
-  预览/RAW 导出/烘焙导出三条路径（Temp/Tint 预览即见；tint 无自定义色温
-  也生效）；`render::solve_wb_from_neutral` 反解器（对数网格 K + 解析 tint，
-  与 wb_gains 同模型）+ GUI 吸管按钮/点击取样。下一项从 **④ 拉直** 开始。
-- 待用户真机验收：缩放/裁剪/mask 手感；持久化“正常关闭→重启恢复”回路；
-  高分辨率生成与风格提示词的真实 API 行为（需付费调用，有 400 回退兜底）。
+  其后 `150c3f3`（缩放/mask/裁剪）与 **①-⑤ 整批 + 差距调查**
+  （`006b7d4`/`c0ac3e7`/`35a39e6`/`124f994`/`4154534`/`997de65`）均已推送，
+  **尚未发新 release**——内容已够 v0.3.0，等用户说"发布"。
+- **有序批次 ①-⑤ 全部完成**（详见各节 ✅ 小节，含实现锚点与已知近似）：
+  ①曲线编辑器 ②批量复制/粘贴 ③WB 吸管（含 WB 预览前置重构）
+  ④拉直（引擎真旋转+自动内接裁剪）⑤仿制图章（clone_raw 像素通路）。
+- 更早已上线：反推配方（`fit.rs` + CLI `match`）、gpt-image-2 弹性高分辨率
+  （≤8.3MP + 400 回退）、风格提示词提取、GUI 生产化（直方图/toast/快捷键/
+  拖拽/持久化/折叠分组/双击归零）。
+- **下一批按 §与 Photoshop 的核心差距 的顺序：A 范围蒙版 → B 双轨打通 →
+  F 导出管线 → E 高分预览 → C 镜头校正 → D 色管 → G 版本。**
+- 待用户真机验收：曲线拖拽/吸管/图章/拉直手感；持久化"正常关闭→重启恢复"；
+  高分辨率生成与风格提示词的真实 API 行为（付费调用，有 400 回退兜底）。
 
 ## 关键架构事实（新会话必读）
 
-- 所有图上交互经 `ViewXform`（屏幕↔全幅归一化，gui.rs，struct 在
-  `CROP_ASPECTS` 之后）；工具互斥分发在 `after_view`。
-- `develop_preview`（render.rs）跑 `apply_recipe_wb` + `apply_develop`（③起
-  WB 已接入预览，三条渲染路径共用同一 WB 阶段），**不应用裁剪/旋转**；
-  裁剪由 GUI 用 uv 窗显示、导出端 `render_to_image` 真裁。
+- 所有图上交互经 `ViewXform`（屏幕↔全幅归一化，gui.rs）；工具互斥分发在
+  `after_view`（crop > placing > wb_pick > clone > paint > box-select）。
+- `develop_preview`（render.rs）跑 `apply_recipe_wb` + `apply_develop`；
+  **不应用裁剪**（GUI 用 uv 窗显示、导出端真裁）。**拉直**由 GUI `redevelop`
+  在 develop_preview 之后调引擎 `rotate_straighten` 完成（导出路径同函数）。
+- **坐标空间约定（④起）**：`recipe.crop` 存拉直后空间；masks/画笔/吸管/
+  region 存原始空间——gui.rs `view_norm_to_orig / orig_norm_to_view /
+  geom_to_view` 在数据边界换算，共用引擎 `inscribed_dims`，0° 恒等。
 - tone 模型单一事实来源：`render::TONE_KNOTS_X / tone_slider_basis /
-  tone_exposure_curve`（pub(crate)，fit.rs 逆着它解）。
+  tone_exposure_curve`（pub(crate)，fit.rs 逆着它解）；曲线采样单一事实来源
+  `render::curve_lut`（pub，GUI 曲线编辑器直接画它）。
 - `recipe.masks` 是 AI 与手动共用的同一列表；引擎 `apply_masks` 实时渲染
   tone+saturation+NR，clarity/dehaze/texture/temp/tint 仅进 XMP（GUI 已如实分组）。
 - 照片库 `D:/Photography` 只读；输出一律 `./out`（`pipeline::guard_readonly`，
