@@ -484,6 +484,10 @@ struct AutoshopApp {
     show_mask_overlay: bool,               // translucent red coverage of the selected mask (O)
     mask_overlay_tex: Option<egui::TextureHandle>,
     overlay_stale: bool,                   // rebuild the coverage texture next frame
+    // Cached masks-cleared develop the coverage's range weights are judged
+    // on — reused while the global (non-mask) recipe is unchanged, so a
+    // mask-slider drag rebuilds only the coverage map, not a second develop.
+    overlay_ref: Option<(EditRecipe, image::DynamicImage)>,
     show_clipping: bool,                   // clipping warnings: red blown / blue crushed (J)
     clip_tex: Option<egui::TextureHandle>,
     // --- zoom / pan (per-photo, reset on open) ---
@@ -654,6 +658,7 @@ impl Default for AutoshopApp {
             show_mask_overlay: true,
             mask_overlay_tex: None,
             overlay_stale: false,
+            overlay_ref: None,
             show_clipping: false,
             clip_tex: None,
         }
@@ -1257,17 +1262,25 @@ impl AutoshopApp {
     /// in the view. Cleared when the toggle is off or nothing is selected.
     fn refresh_mask_overlay(&mut self, ctx: &egui::Context) {
         self.mask_overlay_tex = None;
-        if !self.show_mask_overlay {
+        if !self.show_mask_overlay || self.base_preview.is_none() {
             return;
         }
         let Some(i) = self.sel_mask.filter(|&i| i < self.recipe.masks.len()) else { return };
-        let Some(base) = &self.base_preview else { return };
         let mut pre = self.recipe.clone();
         pre.masks.clear();
-        let reference = autoshop::render::develop_preview(base, &pre);
+        // Reuse the cached masks-cleared develop while the global recipe is
+        // unchanged — a mask-slider drag then rebuilds only the coverage map.
+        if !matches!(&self.overlay_ref, Some((r, _)) if *r == pre) {
+            let img = {
+                let Some(base) = &self.base_preview else { return };
+                autoshop::render::develop_preview(base, &pre)
+            };
+            self.overlay_ref = Some((pre, img));
+        }
+        let reference = &self.overlay_ref.as_ref().expect("cache filled above").1;
         let mut cov = image::DynamicImage::ImageLuma8(autoshop::render::mask_coverage(
             &self.recipe.masks[i],
-            &reference,
+            reference,
         ));
         if self.recipe.lens_distortion != 0.0 {
             cov = autoshop::render::apply_lens_distortion(&cov, self.recipe.lens_distortion);
@@ -1849,6 +1862,8 @@ impl AutoshopApp {
                         self.crop_mode = false;
                         self.crop_drag = None;
                         self.sel_mask = None;
+                        self.overlay_ref = None; // the reference develop belongs to ONE base
+                        self.overlay_stale = true;
                         self.placing_mask = None;
                         self.place_start = None;
                         self.curve_drag = None; // curve_channel is a UI pref, keep it
