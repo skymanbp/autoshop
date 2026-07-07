@@ -484,6 +484,8 @@ struct AutoshopApp {
     exp_quality: f32,                      // JPEG quality 1..100 (f32 for the shared slider)
     // --- preview resolution (gap batch E) ---
     preview_edge: u32,                     // working-preview long edge: 1280 fluid / 2560 / 4096 detail
+    // --- recipe versions (gap batch G): ./out/<stem>.v<N>.recipe.json ---
+    versions: Vec<u32>,                    // snapshot numbers found for the open photo (sorted)
 }
 
 /// The two mask geometries a user can place by dragging.
@@ -609,6 +611,7 @@ impl Default for AutoshopApp {
             exp_sharpen: 0.0,
             exp_quality: 95.0,
             preview_edge: PREVIEW_EDGE,
+            versions: Vec::new(),
         }
     }
 }
@@ -775,6 +778,67 @@ impl AutoshopApp {
         }
         self.keep_recipe = true; // consumed by the next Msg::Opened
         self.open_path(p);
+    }
+
+    /// Recipe snapshot path for version `n` — `./out/<stem>.v<n>.recipe.json`
+    /// (gap batch G, ≈ Lightroom virtual copies: cheap parametric versions,
+    /// never touching the library or the working `<stem>.recipe.json`).
+    fn version_path(src: &std::path::Path, n: u32) -> PathBuf {
+        PathBuf::from("out").join(format!("{}.v{n}.recipe.json", autoshop::pipeline::stem(src)))
+    }
+
+    /// Rescan ./out for this photo's version snapshots (cached in
+    /// `self.versions`; called on photo open and after saving a version — NOT
+    /// every frame, ./out can hold thousands of artifacts).
+    fn refresh_versions(&mut self) {
+        self.versions.clear();
+        let Some(src) = self.src_path.as_deref() else { return };
+        let prefix = format!("{}.v", autoshop::pipeline::stem(src));
+        if let Ok(dir) = std::fs::read_dir("out") {
+            for entry in dir.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if let Some(rest) = name.strip_prefix(&prefix)
+                    && let Some(nums) = rest.strip_suffix(".recipe.json")
+                    && let Ok(n) = nums.parse::<u32>()
+                {
+                    self.versions.push(n);
+                }
+            }
+        }
+        self.versions.sort_unstable();
+    }
+
+    /// Save the CURRENT develop as the next numbered version snapshot.
+    fn save_version(&mut self) {
+        let Some(src) = self.src_path.clone() else { return };
+        let n = self.versions.last().map_or(1, |m| m + 1);
+        match autoshop::pipeline::write_recipe(&src, &self.recipe, Some(Self::version_path(&src, n))) {
+            Ok(p) => {
+                self.refresh_versions();
+                self.status = format!("版本 v{n} 已存 → {}", p.display());
+            }
+            Err(e) => self.status = format!("存版本失败: {e}"),
+        }
+    }
+
+    /// Load version `n` as the working recipe (one undo step, like AI Analyze).
+    fn load_version(&mut self, n: u32) {
+        let Some(src) = self.src_path.clone() else { return };
+        let p = Self::version_path(&src, n);
+        match std::fs::read_to_string(&p)
+            .map_err(anyhow::Error::from)
+            .and_then(|s| Ok(serde_json::from_str::<EditRecipe>(&s)?))
+        {
+            Ok(mut r) => {
+                r.clamp();
+                self.recipe = r;
+                self.rationale = self.recipe.rationale.clone();
+                self.dirty = true;
+                self.status = format!("已载入版本 v{n} — Ctrl+Z 可回到载入前");
+            }
+            Err(e) => self.status = format!("载入 v{n} 失败: {e}"),
+        }
     }
 
     /// Open one of the gallery photos by index (keeps the thumbnail highlighted).
@@ -1632,6 +1696,7 @@ impl AutoshopApp {
                         self.clone_src = None;
                         self.verdict = None;
                         self.rationale.clear();
+                        self.refresh_versions(); // version snapshots are per-photo
                         self.dirty = true; // render the (neutral) after
                         self.busy = false;
                         self.status = if keep {
@@ -2400,6 +2465,40 @@ impl AutoshopApp {
                 );
             }
         });
+
+        // --- 版本: recipe snapshots ≈ LR virtual copies (gap batch G) --------
+        let n_ver = self.versions.len();
+        egui::CollapsingHeader::new(section_title(&format!("版本 · Versions ({n_ver})"), n_ver > 0))
+            .id_salt("sec_versions")
+            .default_open(false)
+            .show(ui, |ui| {
+                if ui
+                    .button("＋ 存为版本")
+                    .on_hover_text("把当前全部 develop 参数存为一个编号快照（./out/<名>.v<N>.recipe.json），随时可回")
+                    .clicked()
+                {
+                    self.save_version();
+                }
+                let mut load: Option<u32> = None;
+                for &n in &self.versions {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("v{n}"));
+                        if ui.small_button("载入").on_hover_text("替换当前参数（一步 Ctrl+Z 可撤销）").clicked() {
+                            load = Some(n);
+                        }
+                    });
+                }
+                if let Some(n) = load {
+                    self.load_version(n);
+                }
+                if n_ver == 0 {
+                    ui.label(
+                        egui::RichText::new("像 LR 虚拟副本：一张照片存多套参数（黑白版/裁剪版…），互不覆盖。")
+                            .weak()
+                            .small(),
+                    );
+                }
+            });
 
         if changed {
             self.recipe.clamp();
