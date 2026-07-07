@@ -357,6 +357,16 @@ pub enum MaskGeometry {
         roundness: f32,
         flipped: bool,
     },
+    /// Free-form raster mask — the carrier for AI subject/sky segmentation and
+    /// any painted selection. `path` names an 8-bit image whose LUMINANCE is
+    /// the weight (white = full effect), sampled bilinearly in normalised
+    /// coordinates so one file drives both the small preview and the full-res
+    /// export. Lives in the ORIGINAL frame like the parametric geometries.
+    /// Classic ACR XMP cannot express raster masks — the sidecar writer skips
+    /// these (parametric masks still round-trip; positioning tradeoff like the
+    /// §B retouch-master limitation). A missing/unreadable file renders the
+    /// mask inert (weight 0) with a stderr warning rather than failing.
+    Bitmap { path: String },
 }
 
 /// Lightroom's Range Mask: a per-pixel refinement INTERSECTED with the mask's
@@ -632,5 +642,27 @@ mod tests {
         assert_eq!(recipe.contrast, 100.0);
         assert_eq!(recipe.exposure_ev, -5.0);
         assert_eq!(recipe.lens_distortion, -100.0);
+    }
+
+    #[test]
+    fn bitmap_mask_geometry_round_trips_via_json() {
+        // The raster variant must serialise under the same "kind" tag family
+        // as linear/radial and survive a JSON round-trip byte-faithfully —
+        // it is the carrier for AI segmentation masks (gap batch A②).
+        let mut r = EditRecipe::default();
+        r.masks.push(LocalAdjustment {
+            mask: MaskGeometry::Bitmap { path: "out/photo.mask1.png".into() },
+            exposure_ev: -0.8,
+            ..Default::default()
+        });
+        let j = serde_json::to_string(&r).unwrap();
+        assert!(j.contains(r#""kind":"bitmap""#), "tagged form: {j}");
+        assert!(j.contains("out/photo.mask1.png"));
+        let back: EditRecipe = serde_json::from_str(&j).unwrap();
+        assert_eq!(r, back);
+        // clamp() must pass through untouched (no numeric fields to clamp).
+        let mut c = back.clone();
+        c.clamp();
+        assert_eq!(c.masks[0].mask, r.masks[0].mask);
     }
 }

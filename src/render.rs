@@ -579,9 +579,12 @@ fn apply_masks(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
         let lut = build_tone_lut(&local);
         let sat = m.saturation / 100.0;
         let amount = m.amount.clamp(0.0, 1.0);
+        // Bitmap geometry: decode the raster ONCE per mask per develop (never
+        // inside the pixel loop); both the tone and the NR pass share it.
+        let bmp = load_mask_bitmap(&m.mask);
         // mask coverage × master amount at a pixel (with optional inversion).
         let weight_at = |x: usize, y: usize| -> f32 {
-            let mut wgt = mask_weight(&m.mask, x as f32 / w as f32, y as f32 / h as f32);
+            let mut wgt = mask_weight(&m.mask, x as f32 / w as f32, y as f32 / h as f32, bmp.as_ref());
             if m.inverted {
                 wgt = 1.0 - wgt;
             }
@@ -649,7 +652,7 @@ fn apply_masks(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
 }
 
 /// Mask coverage [0,1] at normalised frame coordinate (nx, ny).
-fn mask_weight(g: &MaskGeometry, nx: f32, ny: f32) -> f32 {
+fn mask_weight(g: &MaskGeometry, nx: f32, ny: f32, bmp: Option<&image::GrayImage>) -> f32 {
     match g {
         MaskGeometry::Linear { zero_x, zero_y, full_x, full_y } => {
             let (vx, vy) = (full_x - zero_x, full_y - zero_y);
@@ -674,7 +677,44 @@ fn mask_weight(g: &MaskGeometry, nx: f32, ny: f32) -> f32 {
                 wgt
             }
         }
+        // Raster mask: bilinear lookup in the pre-decoded bitmap (normalised
+        // coords, so the mask's own resolution is independent of the render's).
+        // No bitmap = the load failed → inert, warned once by the loader.
+        MaskGeometry::Bitmap { .. } => match bmp {
+            Some(b) => sample_gray_norm(b, nx, ny),
+            None => 0.0,
+        },
     }
+}
+
+/// Decode the raster of a Bitmap mask geometry, greyscale. Called once per
+/// mask per develop by `apply_masks` — never per pixel. Failure warns and
+/// returns None (the mask renders inert instead of killing the develop).
+fn load_mask_bitmap(g: &MaskGeometry) -> Option<image::GrayImage> {
+    let MaskGeometry::Bitmap { path } = g else { return None };
+    match image::open(path) {
+        Ok(img) => Some(img.to_luma8()),
+        Err(e) => {
+            eprintln!("⚠ bitmap mask '{path}' could not be loaded ({e}) — mask is inert");
+            None
+        }
+    }
+}
+
+/// Bilinear weight lookup in an 8-bit greyscale mask at normalised (nx, ny).
+fn sample_gray_norm(b: &image::GrayImage, nx: f32, ny: f32) -> f32 {
+    let (w, h) = (b.width() as f32, b.height() as f32);
+    let sx = (nx.clamp(0.0, 1.0) * (w - 1.0)).max(0.0);
+    let sy = (ny.clamp(0.0, 1.0) * (h - 1.0)).max(0.0);
+    let x0 = sx.floor().min(w - 1.0);
+    let y0 = sy.floor().min(h - 1.0);
+    let x1 = (x0 + 1.0).min(w - 1.0);
+    let y1 = (y0 + 1.0).min(h - 1.0);
+    let (fx, fy) = (sx - x0, sy - y0);
+    let g = |x: f32, y: f32| b.get_pixel(x as u32, y as u32)[0] as f32 / 255.0;
+    let top = g(x0, y0) * (1.0 - fx) + g(x1, y0) * fx;
+    let bot = g(x0, y1) * (1.0 - fx) + g(x1, y1) * fx;
+    top * (1.0 - fy) + bot * fy
 }
 
 /// Per-pixel Range Mask weight [0,1] — Lightroom's 范围蒙版, multiplied into the
@@ -2178,6 +2218,51 @@ mod tests {
             moved.get_pixel(bright_x, 40)[0] > 30000 && bright_x <= 29,
             "barrel fix must move the dot outward (x<30), got x={bright_x}"
         );
+    }
+
+    #[test]
+    fn bitmap_masks_gate_by_the_raster_and_fail_inert() {
+        use crate::recipe::{LocalAdjustment, MaskGeometry};
+        // A left-white / right-black raster driving an exposure-up local mask:
+        // the white half must brighten vs a control render through the SAME
+        // pipeline, the black half must stay byte-identical to the control.
+        std::fs::create_dir_all("out").ok();
+        let mask_p = "out/_bitmap_mask.png";
+        image::GrayImage::from_fn(40, 20, |x, _| image::Luma([if x < 20 { 255u8 } else { 0 }]))
+            .save(mask_p)
+            .unwrap();
+        let base = DynamicImage::ImageRgb8(RgbImage::from_pixel(40, 20, image::Rgb([100, 100, 100])));
+        let control = develop_preview(&base, &EditRecipe::default()).to_rgb8();
+        let masked = EditRecipe {
+            masks: vec![LocalAdjustment {
+                mask: MaskGeometry::Bitmap { path: mask_p.into() },
+                exposure_ev: 1.5,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let out = develop_preview(&base, &masked).to_rgb8();
+        let (white_side, ctrl_w) = (out.get_pixel(5, 10)[0], control.get_pixel(5, 10)[0]);
+        let (black_side, ctrl_b) = (out.get_pixel(35, 10)[0], control.get_pixel(35, 10)[0]);
+        assert!(
+            white_side as i32 > ctrl_w as i32 + 25,
+            "white half must brighten: {white_side} vs control {ctrl_w}"
+        );
+        assert_eq!(black_side, ctrl_b, "black half must be untouched by the mask");
+
+        // A missing raster renders the mask INERT (weight 0, stderr warning),
+        // never a crash and never a stuck full-frame adjustment.
+        let missing = EditRecipe {
+            masks: vec![LocalAdjustment {
+                mask: MaskGeometry::Bitmap { path: "out/_no_such_mask_xyz.png".into() },
+                exposure_ev: 1.5,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let inert = develop_preview(&base, &missing).to_rgb8();
+        assert_eq!(inert.get_pixel(5, 10)[0], ctrl_w, "missing raster ⇒ mask inert");
+        assert_eq!(inert.get_pixel(35, 10)[0], ctrl_b);
     }
 
     #[test]

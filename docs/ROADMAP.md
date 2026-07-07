@@ -15,9 +15,13 @@
 - **~~D2 P3/AdobeRGB 输出~~ ✅ 完成（2026-07-06 深夜，见 §D）**——真
   gamut 变换（色度推矩阵 + 双 TRC）+ CC0 profile 双件 + GUI 色彩空间
   下拉 + Prefs，69 lib + 4 gui 测试。
-- **下一批 = 最后一个大项**：**A② AI 主体/天空分割**——前置是引擎位图
-  mask 通路（recipe 里的 MaskGeometry 加 Bitmap 变体或旁路），python
-  sidecar 循 SCUNet 模式或云 API，见 §A。
+- **~~A② AI 主体/天空分割~~ ✅ 完成（2026-07-07 凌晨，见 §A）**——
+  引擎位图 mask 通路（MaskGeometry::Bitmap + 双线性采样 + XMP 跳过）+
+  `python/segment.py` sidecar（subject=rembg U²-Net / sky=SegFormer
+  ADE20K，实测均通）+ GUI 两键入口，72 lib + 4 gui 测试。
+- **三大项至此全部触底。** 剩余工作 = 各节「未做/已知边界」小项（去紫边、
+  Upright、lensfun、位图 overlay 半透明显示、tile 金字塔、水印等）+
+  真机验收清单；无未开工的大工程。
 - v0.3.0 → `fa9add8`，v0.2.0 → `1bc57ff`。
 - **有序批次 ①-⑤ 全部完成**（详见各节 ✅ 小节，含实现锚点与已知近似）：
   ①曲线编辑器 ②批量复制/粘贴 ③WB 吸管（含 WB 预览前置重构）
@@ -135,7 +139,7 @@
 > 定位前提：目标是"日常出片替代"（LR/ACR + PS 修图子集），不是 PS 的
 > 设计/合成全集。按对日常出片的影响排序；「现状」均为当日代码实测。
 
-### A. 智能选区 / 范围蒙版（① ✅ 已完成 2026-07-06 · ② 未做）
+### A. 智能选区 / 范围蒙版（① ✅ 2026-07-06 · ② ✅ 2026-07-07）
 - PS/LR：Select Subject / Sky、亮度/颜色范围蒙版。
 - **① 亮度/颜色范围蒙版 ✅**：五层打通，权重 = 几何 × 范围（相交）。
   - recipe.rs：`RangeMask` 枚举（Luminance 4 数梯形 = ACR LumRange 原样；
@@ -159,8 +163,32 @@
     全分辨率快照内存不可行，已注释）；(b) 颜色 PointModels 第 4-6 数
     按"取样点坐标+保留位"假设写出，未与真 ACR 对照语义；(c) 真 LR 打开
     效果待用户验收。
-- **② 主体/天空 AI 分割（未做）**：python sidecar 循 SCUNet 模式或云 API，
-  前置是引擎加位图 mask 通路。
+- **② 主体/天空 AI 分割 ✅（2026-07-07 凌晨）**：位图 mask 通路 + python
+  sidecar 两层全通。
+  - **位图通路**：recipe.rs `MaskGeometry::Bitmap { path }`（`kind`-tag 序列化，
+    JSON 往返测试）；render.rs `load_mask_bitmap`（每 mask 每次 develop 解码
+    一次，绝不进像素循环；缺文件=惰性 + stderr 警告）+ `sample_gray_norm`
+    （归一坐标双线性 → 1280 mask 驱动 61MP 导出）+ `mask_weight` 第三臂，
+    tone/NR 双 pass 共享；xmp.rs 位图 mask 跳过（经典 ACR XMP 无法表达；
+    全位图时不发空壳块——参数 mask 照常写出，§B 式定位取舍）；GUI 列表
+    「位图」标签、overlay 徽标（不假装形状）、重画按钮对位图隐藏。
+  - **sidecar**（`python/segment.py` + `src/segment.rs` 桥，循 denoise.py
+    模式；config `segment_script` / `AUTOSHOP_SEGMENT_SCRIPT`）：
+    `--target subject` = rembg U²-Net 显著主体软 alpha（`pip install rembg`，
+    模型首跑自动下载 ~/.u2net，176MB）；`--target sky` = SegFormer-B0
+    ADE20K 天空类概率（transformers，~14MB 自动下载；sky 类号从模型
+    id2label 解析、不硬编码）。缺依赖时 exit 2 + 打印确切 pip 命令。
+  - **GUI**：局部调整区「🤖 AI 选主体」「☁ AI 选天空」→ worker 喂
+    ORIGINAL 帧预览 → `./out/<stem>.mask-<target>.png`（同 target 重跑
+    覆盖同文件）→ 推入 Bitmap mask 并选中，undo 一步回退；软 alpha 即
+    天然羽化。
+  - **实测（2026-07-07，用户环境 Python313）**：天空 = Lundy 真照片
+    天侧均值 254/地侧 0；主体 = 合成主体中心 255/背景 0/覆盖 18.7%
+    （与真实面积一致）；纯风景无主体时主体 mask 近空属模型正常行为。
+    rembg 需装进 `python` 对应环境（用户机上 `pip`≠`python -m pip`，
+    后者才对）。
+  - 已知边界：mask 位图不进 XMP（LR 侧丢 AI 选区）；位图 overlay 暂为
+    徽标而非半透明叠加显示；分割跑在预览分辨率（对羽化选区足够）。
 
 ### B. 像素母版 ↔ 参数配方双轨打通（✅ 已完成 2026-07-06）
 - 现状（旧）：fill/heal/clone 输出 ./out 像素母版，仅在 After 显示一次；

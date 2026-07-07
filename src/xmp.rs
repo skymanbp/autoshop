@@ -56,24 +56,27 @@ fn guid(seed: &str) -> String {
     format!("{a:016X}{b:016X}")
 }
 
-/// `(crs:What value, extra geometry attributes)` for a mask geometry.
+/// `(crs:What value, extra geometry attributes)` for a mask geometry, or
+/// `None` for geometries classic ACR XMP cannot express (raster bitmaps —
+/// the writer skips those corrections; the render still applies them).
 /// Coordinates are written raw (unclamped) — ACR gradients legitimately use
 /// values outside [0,1].
-fn mask_geom_xml(g: &MaskGeometry) -> (&'static str, String) {
+fn mask_geom_xml(g: &MaskGeometry) -> Option<(&'static str, String)> {
     match g {
-        MaskGeometry::Linear { zero_x, zero_y, full_x, full_y } => (
+        MaskGeometry::Linear { zero_x, zero_y, full_x, full_y } => Some((
             "Mask/Gradient",
             format!(
                 " crs:ZeroX=\"{zero_x}\" crs:ZeroY=\"{zero_y}\" crs:FullX=\"{full_x}\" crs:FullY=\"{full_y}\""
             ),
-        ),
-        MaskGeometry::Radial { top, left, bottom, right, feather, roundness, flipped } => (
+        )),
+        MaskGeometry::Radial { top, left, bottom, right, feather, roundness, flipped } => Some((
             "Mask/CircularGradient",
             format!(
                 " crs:Top=\"{top}\" crs:Left=\"{left}\" crs:Bottom=\"{bottom}\" crs:Right=\"{right}\" \
 crs:Feather=\"{feather}\" crs:Roundness=\"{roundness}\" crs:Flipped=\"{flipped}\""
             ),
-        ),
+        )),
+        MaskGeometry::Bitmap { .. } => None,
     }
 }
 
@@ -149,7 +152,9 @@ fn masks_xml(r: &EditRecipe) -> String {
         let name = if m.name.is_empty() { format!("Autoshop {}", i + 1) } else { m.name.clone() };
         let corr_id = guid(&format!("corr-{i}-{name}"));
         let mask_id = guid(&format!("mask-{i}-{name}"));
-        let (what, geom) = mask_geom_xml(&m.mask);
+        // Raster (bitmap) masks have no classic-XMP encoding — skip this
+        // correction; the deterministic render still applies it (§A tradeoff).
+        let Some((what, geom)) = mask_geom_xml(&m.mask) else { continue };
         items.push_str(&format!(
             "     <rdf:li>\n\
       <rdf:Description\n\
@@ -198,6 +203,10 @@ fn masks_xml(r: &EditRecipe) -> String {
             mask_id = mask_id,
             geom = geom,
         ));
+    }
+    // All masks may have been raster-skipped — no empty wrapper block then.
+    if items.is_empty() {
+        return String::new();
     }
     format!(
         "\n   <crs:MaskGroupBasedCorrections>\n    <rdf:Seq>\n{items}    </rdf:Seq>\n   </crs:MaskGroupBasedCorrections>"
@@ -422,6 +431,40 @@ mod tests {
         assert!(recipe_to_xmp(&pos).contains(r#"crs:LensManualDistortionAmount="+80""#));
         // Zero amount emits no key at all (byte-compatible with the old writer).
         assert!(!recipe_to_xmp(&EditRecipe::default()).contains("LensManualDistortionAmount"));
+    }
+
+    #[test]
+    fn bitmap_masks_are_skipped_by_the_xmp_writer() {
+        use crate::recipe::MaskGeometry;
+        // Mixed parametric + raster: only the parametric mask is written.
+        let mixed = EditRecipe {
+            masks: vec![
+                LocalAdjustment {
+                    mask: MaskGeometry::Linear { zero_x: 0.5, zero_y: 0.35, full_x: 0.5, full_y: 0.0 },
+                    exposure_ev: -1.0,
+                    ..Default::default()
+                },
+                LocalAdjustment {
+                    mask: MaskGeometry::Bitmap { path: "out/subject.png".into() },
+                    exposure_ev: 0.6,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let xmp = recipe_to_xmp(&mixed);
+        assert!(xmp.contains("Mask/Gradient"), "the parametric mask must survive");
+        assert_eq!(xmp.matches("crs:What=\"Correction\"").count(), 1, "raster correction skipped");
+        assert!(!xmp.contains("subject.png"), "no raster path may leak into the sidecar");
+        // All-raster: the whole corrections block disappears (no empty shell).
+        let all_bitmap = EditRecipe {
+            masks: vec![LocalAdjustment {
+                mask: MaskGeometry::Bitmap { path: "out/sky.png".into() },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!recipe_to_xmp(&all_bitmap).contains("MaskGroupBasedCorrections"));
     }
 
     #[test]

@@ -125,6 +125,9 @@ enum Msg {
     Thumb { generation: u64, idx: usize, img: Box<anyhow::Result<image::DynamicImage>> },
     /// A generative-fill / heal / clone / reimagine result — see [`RetouchDone`].
     Retouched(Box<RetouchDone>),
+    /// AI segmentation finished: (mask display name, grayscale raster path)
+    /// — attached to the recipe as a `MaskGeometry::Bitmap` local mask.
+    Segmented(anyhow::Result<(String, PathBuf)>),
     /// Reverse-fit finished: the fitted recipe + a status note (fit.rs).
     Fitted(Box<anyhow::Result<(EditRecipe, String)>>),
     /// Style-prompt extraction finished: the reusable prompt text.
@@ -212,6 +215,18 @@ fn draw_mask_overlay(ui: &egui::Ui, xf: ViewXform, geom: &MaskGeometry) {
             let ry = (xf.to_screen(0.0, *bottom).y - xf.to_screen(0.0, *top).y).abs() / 2.0;
             p.add(egui::Shape::ellipse_stroke(c, egui::vec2(rx, ry), stroke));
             p.circle_filled(c, 3.0, ACCENT);
+        }
+        // Raster masks have no parametric outline to draw — mark the selection
+        // with a badge instead of pretending a shape (rendering the raster as a
+        // live translucent overlay is the A② follow-up).
+        MaskGeometry::Bitmap { .. } => {
+            p.text(
+                xf.rect.left_top() + egui::vec2(10.0, 10.0),
+                egui::Align2::LEFT_TOP,
+                "▨ 位图蒙版",
+                egui::FontId::proportional(14.0),
+                ACCENT,
+            );
         }
     }
 }
@@ -354,6 +369,9 @@ fn geom_to_view(geom: &MaskGeometry, dims: (f32, f32), deg: f32, dist: f32) -> M
         return geom.clone();
     }
     match *geom {
+        // Raster masks carry no parametric anchor points to remap; their
+        // overlay is a screen-anchored badge (see draw_mask_overlay).
+        MaskGeometry::Bitmap { .. } => geom.clone(),
         MaskGeometry::Linear { zero_x, zero_y, full_x, full_y } => {
             let a = orig_norm_to_view(zero_x, zero_y, dims, deg, dist);
             let b = orig_norm_to_view(full_x, full_y, dims, deg, dist);
@@ -1511,6 +1529,42 @@ impl AutoshopApp {
         });
     }
 
+    /// Run the AI segmentation sidecar on the ORIGINAL-frame preview and attach
+    /// the resulting raster as a Bitmap local mask (gap batch A②). The AI only
+    /// picks WHERE — every actual edit stays a deterministic recipe slider.
+    fn start_segment(&mut self, target: &'static str, label: &'static str) {
+        if self.busy {
+            return;
+        }
+        let Some(base) = self.base_preview.clone() else { return };
+        let Some(src) = self.src_path.clone() else { return };
+        self.busy = true;
+        self.status = format!("AI {label}分割中…（首次运行会自动下载模型，看控制台日志）");
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let res = (|| -> anyhow::Result<(String, PathBuf)> {
+                let cfg = autoshop::config::Config::load();
+                let opts = autoshop::segment::SegmentOpts::from_config(&cfg, target);
+                // The sidecar sees the ORIGINAL-frame preview — the space recipe
+                // masks live in. Preview resolution is enough: the engine samples
+                // the raster bilinearly in normalised coords at any render size.
+                let mut tmp = std::env::temp_dir();
+                tmp.push(format!("autoshop_seg_{}_{target}.png", std::process::id()));
+                base.to_rgb8()
+                    .save(&tmp)
+                    .map_err(|e| anyhow::anyhow!("write segmentation input {}: {e}", tmp.display()))?;
+                // One raster per (photo, target): re-running a segmentation
+                // refreshes the same file, and the existing mask follows it.
+                let mask = autoshop::pipeline::default_out(&src, &format!("mask-{target}"), "png");
+                let run = autoshop::segment::segment_file(&opts, &tmp, &mask);
+                let _ = std::fs::remove_file(&tmp);
+                run?;
+                Ok((label.to_string(), mask))
+            })();
+            let _ = tx.send(Msg::Segmented(res));
+        });
+    }
+
     /// The delivery options the export UI currently dials in (gap batch F) —
     /// shared by single export, Download… and batch render.
     fn export_opts(&self) -> autoshop::render::ExportOpts {
@@ -1755,6 +1809,25 @@ impl AutoshopApp {
                 Msg::Exported(Err(e)) => {
                     self.fail("export failed", e);
                 }
+                Msg::Segmented(res) => match res {
+                    Ok((label, path)) => {
+                        self.recipe.masks.push(autoshop::recipe::LocalAdjustment {
+                            mask: autoshop::recipe::MaskGeometry::Bitmap {
+                                path: path.to_string_lossy().into_owned(),
+                            },
+                            name: label.clone(),
+                            ..Default::default()
+                        });
+                        self.sel_mask = Some(self.recipe.masks.len() - 1);
+                        self.dirty = true; // committed-snapshot makes this one undo step
+                        self.busy = false;
+                        self.status =
+                            format!("AI「{label}」蒙版已加入 — 调它的滑杆（曝光/对比/饱和…）即刻生效");
+                    }
+                    Err(e) => {
+                        self.fail("AI 分割失败", e);
+                    }
+                },
                 Msg::Folder(boxed) => match *boxed {
                     Ok((dir, list)) => {
                         let n = list.len();
@@ -2325,6 +2398,30 @@ impl AutoshopApp {
                     self.status = "在图上拖拽画出径向（椭圆）范围".into();
                 }
             });
+            // --- AI segmentation → bitmap masks (gap batch A②) ---------------
+            ui.horizontal(|ui| {
+                let can_seg = !self.busy && self.base_preview.is_some();
+                if ui
+                    .add_enabled(can_seg, egui::Button::new("🤖 AI 选主体"))
+                    .on_hover_text(
+                        "U²-Net 显著主体分割 → 位图蒙版（python sidecar：pip install rembg，\
+                         首次运行自动下载模型到 ~/.u2net）",
+                    )
+                    .clicked()
+                {
+                    self.start_segment("subject", "主体");
+                }
+                if ui
+                    .add_enabled(can_seg, egui::Button::new("☁ AI 选天空"))
+                    .on_hover_text(
+                        "SegFormer-ADE20K 天空分割 → 位图蒙版（python sidecar：pip install \
+                         transformers，首次运行自动下载 ~14MB 模型）",
+                    )
+                    .clicked()
+                {
+                    self.start_segment("sky", "天空");
+                }
+            });
             // Mask list: click to select (shows overlay + sliders), 🗑 deletes.
             let mut delete: Option<usize> = None;
             for i in 0..n_masks {
@@ -2333,6 +2430,7 @@ impl AutoshopApp {
                     let kind = match m.mask {
                         MaskGeometry::Linear { .. } => "线性",
                         MaskGeometry::Radial { .. } => "径向",
+                        MaskGeometry::Bitmap { .. } => "位图",
                     };
                     let label = format!("{} · {}", if m.name.is_empty() { "mask" } else { &m.name }, kind);
                     if ui.selectable_label(self.sel_mask == Some(i), label).clicked() {
@@ -2358,11 +2456,15 @@ impl AutoshopApp {
                 ui.horizontal(|ui| {
                     let m = &mut self.recipe.masks[i];
                     ui.add(egui::TextEdit::singleline(&mut m.name).desired_width(110.0).hint_text("名称"));
+                    // Raster masks have no drag-to-place geometry — no 重画.
                     let kind = match m.mask {
-                        MaskGeometry::Linear { .. } => MaskKind::Linear,
-                        MaskGeometry::Radial { .. } => MaskKind::Radial,
+                        MaskGeometry::Linear { .. } => Some(MaskKind::Linear),
+                        MaskGeometry::Radial { .. } => Some(MaskKind::Radial),
+                        MaskGeometry::Bitmap { .. } => None,
                     };
-                    if ui.small_button("↻ 重画").on_hover_text("在图上重新拖拽这个 mask 的范围").clicked() {
+                    if let Some(kind) = kind
+                        && ui.small_button("↻ 重画").on_hover_text("在图上重新拖拽这个 mask 的范围").clicked()
+                    {
                         self.placing_mask = Some((kind, Some(i)));
                         self.paint_mode = false;
                         self.crop_mode = false;

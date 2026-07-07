@@ -20,6 +20,7 @@ pub mod pipeline;
 pub mod recipe;
 pub mod render;
 pub mod retouch;
+pub mod segment;
 pub mod serve;
 pub mod style;
 pub mod xmp;

@@ -87,12 +87,14 @@ pub struct Config {
     pub analysis_base_url: String,
 
     // --- AI denoise sidecar ---------------------------------------------------
-    /// Python interpreter for the AI-denoise sidecar (`python/denoise.py`).
+    /// Python interpreter for the AI sidecars (`python/denoise.py`, `segment.py`).
     pub python_bin: String,
     /// SCUNet weight set (color_real_psnr default; see python/denoise.py).
     pub denoise_model: String,
     pub denoise_script: String,
     pub denoise_cache: String,
+    /// AI segmentation sidecar (`python/segment.py`) — subject/sky bitmap masks.
+    pub segment_script: String,
 
     /// How strongly to lean on the user's historical edit style, 0.0..1.0.
     pub style_strength: f32,
@@ -159,6 +161,8 @@ impl Config {
                 .unwrap_or_else(|| "python/denoise.py".to_string()),
             denoise_cache: nonempty("AUTOSHOP_DENOISE_CACHE")
                 .unwrap_or_else(|| "python/weights".to_string()),
+            segment_script: nonempty("AUTOSHOP_SEGMENT_SCRIPT")
+                .unwrap_or_else(|| "python/segment.py".to_string()),
             style_strength: nonempty("AUTOSHOP_STYLE_STRENGTH")
                 .and_then(|s| s.parse::<f32>().ok())
                 .unwrap_or(0.3)
