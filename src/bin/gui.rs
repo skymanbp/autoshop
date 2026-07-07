@@ -1279,6 +1279,13 @@ impl AutoshopApp {
         let Some(i) = target else { return };
         let mut pre = self.recipe.clone();
         pre.masks.clear();
+        // develop_preview never reads the geometry fields (straighten /
+        // distortion / crop are applied by its CALLERS) — neutralise them in
+        // the cache key so dragging those sliders doesn't rebuild the
+        // reference for nothing. lens_vignette stays: it IS a develop stage.
+        pre.straighten_deg = 0.0;
+        pre.lens_distortion = 0.0;
+        pre.crop = None;
         // Reuse the cached masks-cleared develop while the global recipe is
         // unchanged — a mask-slider drag then rebuilds only the coverage map.
         if !matches!(&self.overlay_ref, Some((r, _)) if *r == pre) {
@@ -2650,6 +2657,29 @@ impl AutoshopApp {
                     {
                         self.overlay_stale = true;
                     }
+                    // Mask ORDER is render semantics (masks stack sequentially;
+                    // a later mask's range sees earlier masks' output) — so the
+                    // list order is editable, not just cosmetic.
+                    if ui
+                        .add_enabled(i > 0, egui::Button::new("⬆").small())
+                        .on_hover_text("上移（更早渲染）")
+                        .clicked()
+                    {
+                        self.recipe.masks.swap(i, i - 1);
+                        self.sel_mask = Some(i - 1);
+                        self.overlay_stale = true;
+                        changed = true;
+                    }
+                    if ui
+                        .add_enabled(i + 1 < self.recipe.masks.len(), egui::Button::new("⬇").small())
+                        .on_hover_text("下移（更晚渲染）")
+                        .clicked()
+                    {
+                        self.recipe.masks.swap(i, i + 1);
+                        self.sel_mask = Some(i + 1);
+                        self.overlay_stale = true;
+                        changed = true;
+                    }
                     let m = &mut self.recipe.masks[i];
                     ui.checkbox(&mut m.inverted, "反转");
                 });
@@ -2978,6 +3008,19 @@ impl AutoshopApp {
                 d.x / rect.width().max(1.0) * ext,
                 d.y / rect.height().max(1.0) * ext,
             );
+        }
+
+        // Cursor language: say what a click/drag would do right now. The pick
+        // tools (WB / range / clone-source) set their own crosshair in their
+        // handlers; this covers the hand for panning and the drawing tools.
+        if panning {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if space && resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        } else if resp.hovered()
+            && (self.paint_mode || self.placing_mask.is_some() || self.crop_mode)
+        {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         }
 
         if comparing || panning {
