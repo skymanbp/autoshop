@@ -717,6 +717,44 @@ fn sample_gray_norm(b: &image::GrayImage, nx: f32, ny: f32) -> f32 {
     top * (1.0 - fy) + bot * fy
 }
 
+/// Coverage map of ONE local adjustment for on-screen display: geometry ×
+/// inversion × amount × range, evaluated with the SAME primitives
+/// `apply_masks` uses (`mask_weight` / `range_weight`), so the overlay the
+/// GUI paints is the weight the render actually applies. `reference`
+/// supplies the pixels the range mask is judged on — pass a masks-cleared
+/// develop for the closest match to render semantics (the same source the
+/// range sampler uses). Output is an 8-bit map at the reference's size
+/// (255 = full effect), in the ORIGINAL frame like every mask.
+pub fn mask_coverage(
+    m: &crate::recipe::LocalAdjustment,
+    reference: &DynamicImage,
+) -> image::GrayImage {
+    let rgb = reference.to_rgb8();
+    let (w, h) = rgb.dimensions();
+    let bmp = load_mask_bitmap(&m.mask);
+    let amount = m.amount.clamp(0.0, 1.0);
+    let mut out = image::GrayImage::new(w, h);
+    for (x, y, px) in out.enumerate_pixels_mut() {
+        // Same normalisation as apply_masks' weight_at (x/w, not x/(w-1)).
+        let mut wgt = mask_weight(&m.mask, x as f32 / w as f32, y as f32 / h as f32, bmp.as_ref());
+        if m.inverted {
+            wgt = 1.0 - wgt;
+        }
+        wgt *= amount;
+        if wgt > 0.001
+            && let Some(rm) = &m.range
+        {
+            let p = rgb.get_pixel(x, y);
+            wgt *= range_weight(
+                rm,
+                &[p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0],
+            );
+        }
+        *px = image::Luma([(wgt.clamp(0.0, 1.0) * 255.0).round() as u8]);
+    }
+    out
+}
+
 /// Per-pixel Range Mask weight [0,1] — Lightroom's 范围蒙版, multiplied into the
 /// geometric mask weight (intersection).
 ///
@@ -2263,6 +2301,46 @@ mod tests {
         let inert = develop_preview(&base, &missing).to_rgb8();
         assert_eq!(inert.get_pixel(5, 10)[0], ctrl_w, "missing raster ⇒ mask inert");
         assert_eq!(inert.get_pixel(35, 10)[0], ctrl_b);
+    }
+
+    #[test]
+    fn mask_coverage_reports_the_engine_weight() {
+        use crate::recipe::{LocalAdjustment, MaskGeometry, RangeMask};
+        // (a) A top→bottom linear gradient over a flat grey reference: zero at
+        // the top row, ~full at the bottom, ~half in the middle.
+        let grey = DynamicImage::ImageRgb8(RgbImage::from_pixel(20, 20, image::Rgb([120, 120, 120])));
+        let grad = LocalAdjustment {
+            mask: MaskGeometry::Linear { zero_x: 0.5, zero_y: 0.0, full_x: 0.5, full_y: 1.0 },
+            ..Default::default()
+        };
+        let cov = mask_coverage(&grad, &grey);
+        assert_eq!(cov.get_pixel(10, 0)[0], 0, "zero end must be 0");
+        assert!(cov.get_pixel(10, 19)[0] > 235, "full end: {}", cov.get_pixel(10, 19)[0]);
+        let mid = cov.get_pixel(10, 10)[0];
+        assert!((mid as i32 - 128).abs() < 15, "midpoint ≈ half: {mid}");
+
+        // (b) amount halves the whole map; inversion flips its direction.
+        let half = LocalAdjustment { amount: 0.5, ..grad.clone() };
+        assert!((mask_coverage(&half, &grey).get_pixel(10, 19)[0] as i32 - 128).abs() < 15);
+        let inv = LocalAdjustment { inverted: true, ..grad.clone() };
+        let icov = mask_coverage(&inv, &grey);
+        assert!(icov.get_pixel(10, 0)[0] > 235 && icov.get_pixel(10, 19)[0] < 20);
+
+        // (c) A luminance range gates the map by the REFERENCE pixels: with a
+        // bright-only range, the dark half of the reference reads 0 even where
+        // the geometry is at full strength.
+        let split = DynamicImage::ImageRgb8(RgbImage::from_fn(20, 20, |x, _| {
+            if x < 10 { image::Rgb([30, 30, 30]) } else { image::Rgb([220, 220, 220]) }
+        }));
+        let ranged = LocalAdjustment {
+            // Degenerate linear (zero == full) = weight 1 everywhere.
+            mask: MaskGeometry::Linear { zero_x: 0.5, zero_y: 0.5, full_x: 0.5, full_y: 0.5 },
+            range: Some(RangeMask::Luminance { lo_outer: 0.5, lo: 0.6, hi: 1.0, hi_outer: 1.0 }),
+            ..Default::default()
+        };
+        let rcov = mask_coverage(&ranged, &split);
+        assert_eq!(rcov.get_pixel(3, 10)[0], 0, "dark side gated out");
+        assert!(rcov.get_pixel(16, 10)[0] > 235, "bright side kept: {}", rcov.get_pixel(16, 10)[0]);
     }
 
     #[test]

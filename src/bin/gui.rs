@@ -71,6 +71,7 @@ struct Prefs {
     exp_quality: f32,
     exp_space: u8,
     preview_edge: u32,
+    show_clipping: bool,
 }
 
 impl Default for Prefs {
@@ -88,6 +89,7 @@ impl Default for Prefs {
             exp_quality: 95.0,
             exp_space: 0,
             preview_edge: PREVIEW_EDGE,
+            show_clipping: false,
         }
     }
 }
@@ -478,6 +480,12 @@ struct AutoshopApp {
     toasts: Vec<Toast>,                    // transient corner notifications
     histogram: Option<Vec<[f32; 4]>>,      // live RGB+luma histogram of the After preview
     last_title: String,                    // window title cache (send only on change)
+    // --- diagnostic view layers (UX batch) ---
+    show_mask_overlay: bool,               // translucent red coverage of the selected mask (O)
+    mask_overlay_tex: Option<egui::TextureHandle>,
+    overlay_stale: bool,                   // rebuild the coverage texture next frame
+    show_clipping: bool,                   // clipping warnings: red blown / blue crushed (J)
+    clip_tex: Option<egui::TextureHandle>,
     // --- zoom / pan (per-photo, reset on open) ---
     zoom: f32,                             // 1.0 = fit; up to 12×
     pan: egui::Vec2,                       // visible-window centre in crop-window coords
@@ -643,6 +651,11 @@ impl Default for AutoshopApp {
             exp_space: 0,
             preview_edge: PREVIEW_EDGE,
             versions: Vec::new(),
+            show_mask_overlay: true,
+            mask_overlay_tex: None,
+            overlay_stale: false,
+            show_clipping: false,
+            clip_tex: None,
         }
     }
 }
@@ -663,6 +676,7 @@ impl AutoshopApp {
             app.exp_long_edge = prefs.exp_long_edge;
             app.exp_sharpen = prefs.exp_sharpen.clamp(0.0, 100.0);
             app.exp_quality = prefs.exp_quality.clamp(1.0, 100.0);
+            app.show_clipping = prefs.show_clipping;
             // Only known color spaces — an out-of-range pref falls back to sRGB.
             if prefs.exp_space <= 2 {
                 app.exp_space = prefs.exp_space;
@@ -735,6 +749,24 @@ fn to_color_image(img: &image::DynamicImage) -> egui::ColorImage {
     let rgba = img.to_rgba8();
     let (w, h) = img.dimensions();
     egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw())
+}
+
+/// Clipping-warning layer over the DEVELOPED preview (what the export would
+/// clip): red where any channel blows out (≥254), blue where all channels
+/// crush to black (≤1), transparent elsewhere. Lightroom's J toggle.
+fn clipping_overlay(img: &image::DynamicImage) -> egui::ColorImage {
+    let rgb = img.to_rgb8();
+    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+    let mut rgba = vec![0u8; w * h * 4];
+    for (i, p) in rgb.pixels().enumerate() {
+        let px = &mut rgba[i * 4..i * 4 + 4];
+        if p[0] >= 254 || p[1] >= 254 || p[2] >= 254 {
+            px.copy_from_slice(&[255, 40, 40, 255]);
+        } else if p[0] <= 1 && p[1] <= 1 && p[2] <= 1 {
+            px.copy_from_slice(&[70, 110, 255, 255]);
+        }
+    }
+    egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba)
 }
 
 /// Stamp a filled brush dot into the paint mask (painted = translucent red).
@@ -1204,9 +1236,58 @@ impl AutoshopApp {
                 after = autoshop::render::rotate_straighten(&after, self.recipe.straighten_deg);
             }
             self.histogram = Some(compute_histogram(&after));
+            // Clipping warnings read the same developed pixels the export
+            // will encode — rebuilt with every develop while enabled.
+            self.clip_tex = self.show_clipping.then(|| {
+                ctx.load_texture("clip", clipping_overlay(&after), egui::TextureOptions::NEAREST)
+            });
             self.after_tex = Some(ctx.load_texture("after", to_color_image(&after), egui::TextureOptions::LINEAR));
         }
+        // Any recipe change can move the selected mask's coverage (geometry,
+        // range, amount, straighten, distortion) — refresh the overlay too.
+        self.overlay_stale = true;
         self.dirty = false;
+    }
+
+    /// (Re)build the translucent red coverage layer for the selected mask —
+    /// Lightroom's mask overlay. The map is the ENGINE's own weight math
+    /// ([`autoshop::render::mask_coverage`]) evaluated on a masks-cleared
+    /// develop (the same reference the range sampler uses), then run through
+    /// the same geometric chain as the image so it lands on the same content
+    /// in the view. Cleared when the toggle is off or nothing is selected.
+    fn refresh_mask_overlay(&mut self, ctx: &egui::Context) {
+        self.mask_overlay_tex = None;
+        if !self.show_mask_overlay {
+            return;
+        }
+        let Some(i) = self.sel_mask.filter(|&i| i < self.recipe.masks.len()) else { return };
+        let Some(base) = &self.base_preview else { return };
+        let mut pre = self.recipe.clone();
+        pre.masks.clear();
+        let reference = autoshop::render::develop_preview(base, &pre);
+        let mut cov = image::DynamicImage::ImageLuma8(autoshop::render::mask_coverage(
+            &self.recipe.masks[i],
+            &reference,
+        ));
+        if self.recipe.lens_distortion != 0.0 {
+            cov = autoshop::render::apply_lens_distortion(&cov, self.recipe.lens_distortion);
+        }
+        if self.recipe.straighten_deg != 0.0 {
+            cov = autoshop::render::rotate_straighten(&cov, self.recipe.straighten_deg);
+        }
+        let g = cov.to_luma8();
+        let (w, h) = (g.width() as usize, g.height() as usize);
+        let mut rgba = vec![0u8; w * h * 4];
+        for (i, p) in g.pixels().enumerate() {
+            // LR-style red wash, alpha ∝ engine weight (max ≈ 55% opacity).
+            rgba[i * 4..i * 4 + 4]
+                .copy_from_slice(&[255, 40, 40, (p[0] as u16 * 140 / 255) as u8]);
+        }
+        self.mask_overlay_tex = Some(ctx.load_texture(
+            "mask_overlay",
+            egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba),
+            egui::TextureOptions::LINEAR,
+        ));
     }
 
     /// The geometric mapping context every interaction boundary needs:
@@ -2435,6 +2516,7 @@ impl AutoshopApp {
                     let label = format!("{} · {}", if m.name.is_empty() { "mask" } else { &m.name }, kind);
                     if ui.selectable_label(self.sel_mask == Some(i), label).clicked() {
                         self.sel_mask = if self.sel_mask == Some(i) { None } else { Some(i) };
+                        self.overlay_stale = true; // coverage follows the selection
                     }
                     if ui.small_button("🗑").clicked() {
                         delete = Some(i);
@@ -2448,6 +2530,7 @@ impl AutoshopApp {
                     Some(s) if s > i => Some(s - 1),
                     other => other,
                 };
+                self.overlay_stale = true;
                 changed = true;
             }
             // Selected mask: its full slider set.
@@ -2471,6 +2554,13 @@ impl AutoshopApp {
                         self.wb_picking = false;
                         self.range_picking = None;
                         self.clone_mode = false;
+                    }
+                    if ui
+                        .checkbox(&mut self.show_mask_overlay, "叠加")
+                        .on_hover_text("红色半透明显示这个蒙版的实际作用范围（几何×范围×强度，快捷键 O）")
+                        .changed()
+                    {
+                        self.overlay_stale = true;
                     }
                     let m = &mut self.recipe.masks[i];
                     ui.checkbox(&mut m.inverted, "反转");
@@ -2710,6 +2800,14 @@ impl AutoshopApp {
                     self.zoom = 1.0;
                     self.pan = egui::vec2(0.5, 0.5);
                 }
+                if ui
+                    .selectable_label(self.show_clipping, "▲")
+                    .on_hover_text("削波警告 (J)：红 = 高光溢出，蓝 = 阴影死黑（按导出像素判定）")
+                    .clicked()
+                {
+                    self.show_clipping = !self.show_clipping;
+                    self.dirty = true; // the layer is rebuilt inside redevelop
+                }
                 ui.label(egui::RichText::new(format!("{:.0}%", scale * 100.0)).weak().small());
                 // --- preview resolution (gap batch E): 1:1 that actually
                 // resolves detail. Switching re-decodes the current photo with
@@ -2738,6 +2836,16 @@ impl AutoshopApp {
 
         let (rect, resp) = ui.allocate_exact_size(disp, egui::Sense::click_and_drag());
         ui.painter_at(rect).image(id, rect, uv, egui::Color32::WHITE);
+        // Diagnostic layers, uv-synced with the image (hidden while comparing):
+        // clipping warnings, then the selected mask's coverage on top.
+        if !comparing {
+            if let Some(t) = &self.clip_tex {
+                ui.painter_at(rect).image(t.id(), rect, uv, egui::Color32::WHITE);
+            }
+            if let Some(t) = &self.mask_overlay_tex {
+                ui.painter_at(rect).image(t.id(), rect, uv, egui::Color32::WHITE);
+            }
+        }
         let xf = ViewXform { rect, uv };
 
         // --- zoom to cursor (scroll) -----------------------------------------
@@ -3758,6 +3866,7 @@ impl eframe::App for AutoshopApp {
         if ctx.memory(|m| m.focused()).is_none() {
             let (mut do_undo, mut do_redo, mut do_open, mut do_export, mut do_xmp) =
                 (false, false, false, false, false);
+            let (mut do_escape, mut do_overlay, mut do_clip) = (false, false, false);
             let mut nav: i32 = 0;
             ctx.input_mut(|i| {
                 if i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z) { do_redo = true; }
@@ -3768,9 +3877,42 @@ impl eframe::App for AutoshopApp {
                 if i.consume_key(egui::Modifiers::COMMAND, egui::Key::S) { do_xmp = true; }
                 if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) { nav = 1; }
                 if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) { nav = -1; }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) { do_escape = true; }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::O) { do_overlay = true; }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::J) { do_clip = true; }
             });
             if do_undo { self.undo(); }
             if do_redo { self.redo(); }
+            // Esc = leave whatever on-image tool is active (the universal
+            // editor exit); painted canvases/samples stay for resuming.
+            if do_escape {
+                let any = self.crop_mode
+                    || self.placing_mask.is_some()
+                    || self.wb_picking
+                    || self.range_picking.is_some()
+                    || self.clone_mode
+                    || self.paint_mode
+                    || self.region_drag.is_some();
+                if any {
+                    self.crop_mode = false;
+                    self.placing_mask = None;
+                    self.place_start = None;
+                    self.wb_picking = false;
+                    self.range_picking = None;
+                    self.clone_mode = false;
+                    self.paint_mode = false;
+                    self.region_drag = None;
+                    self.status = "已退出当前工具（Esc）".into();
+                }
+            }
+            if do_overlay {
+                self.show_mask_overlay = !self.show_mask_overlay;
+                self.overlay_stale = true;
+            }
+            if do_clip {
+                self.show_clipping = !self.show_clipping;
+                self.dirty = true; // the layer is rebuilt inside redevelop
+            }
             if do_open && !self.busy
                 && let Some(path) = photo_file_dialog()
             {
@@ -3991,6 +4133,10 @@ impl eframe::App for AutoshopApp {
         if self.dirty {
             self.redevelop(ctx);
         }
+        // The mask coverage overlay follows develop / selection / toggle.
+        if std::mem::take(&mut self.overlay_stale) {
+            self.refresh_mask_overlay(ctx);
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // Empty state: a real landing surface instead of a blank canvas.
@@ -4145,6 +4291,7 @@ impl eframe::App for AutoshopApp {
                 exp_quality: self.exp_quality,
                 exp_space: self.exp_space,
                 preview_edge: self.preview_edge,
+                show_clipping: self.show_clipping,
             },
         );
     }
