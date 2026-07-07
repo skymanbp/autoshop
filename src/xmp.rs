@@ -286,6 +286,15 @@ pub fn recipe_to_xmp(r: &EditRecipe) -> String {
         attr(&mut a, "VignetteMidpoint", &(r.lens_vignette_mid.round() as i64).to_string());
     }
 
+    // Manual distortion correction — key name verified against the user's
+    // sidecars (`LensManualDistortionAmount="0"` in 148 of them). Same
+    // only-when-set policy as the vignette pair. NB: our render's amount→curve
+    // gain is our own calibration; Adobe's is unpublished, so LR's slider at
+    // the same number may correct a somewhat different physical strength.
+    if r.lens_distortion != 0.0 {
+        attr(&mut a, "LensManualDistortionAmount", &signed(r.lens_distortion));
+    }
+
     // Crop (normalised [0,1]); only applied by Lightroom when HasCrop is True.
     if let Some(c) = &r.crop {
         attr(&mut a, "HasCrop", "True");
@@ -403,6 +412,16 @@ mod tests {
         // A neutral recipe emits neither key (byte-compatible with the old writer).
         let neutral = recipe_to_xmp(&EditRecipe::default());
         assert!(!neutral.contains("VignetteAmount") && !neutral.contains("VignetteMidpoint"));
+    }
+
+    #[test]
+    fn renders_manual_distortion_only_when_set() {
+        let r = EditRecipe { lens_distortion: -24.0, ..Default::default() };
+        assert!(recipe_to_xmp(&r).contains(r#"crs:LensManualDistortionAmount="-24""#));
+        let pos = EditRecipe { lens_distortion: 80.0, ..Default::default() };
+        assert!(recipe_to_xmp(&pos).contains(r#"crs:LensManualDistortionAmount="+80""#));
+        // Zero amount emits no key at all (byte-compatible with the old writer).
+        assert!(!recipe_to_xmp(&EditRecipe::default()).contains("LensManualDistortionAmount"));
     }
 
     #[test]

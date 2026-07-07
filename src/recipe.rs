@@ -77,6 +77,12 @@ pub struct EditRecipe {
     /// reaches toward the centre, higher confines it to the corners.
     /// → `crs:VignetteMidpoint`.
     pub lens_vignette_mid: f32,
+    /// Manual geometric distortion correction, -100..=100 (ACR convention):
+    /// positive straightens BARREL distortion (wide-angle bulge), negative
+    /// straightens PINCUSHION (tele pinch). A radial resample of the frame
+    /// applied after develop, before straighten — see `render::distort_norm`
+    /// for the model. → `crs:LensManualDistortionAmount`.
+    pub lens_distortion: f32,
 
     // --- Geometry (optional) ------------------------------------------------
     /// Clockwise straighten angle in degrees, e.g. -2.5..=2.5 for horizons.
@@ -131,6 +137,7 @@ impl Default for EditRecipe {
             noise_reduction: 0.0,
             lens_vignette: 0.0,
             lens_vignette_mid: 50.0,
+            lens_distortion: 0.0,
             straighten_deg: 0.0,
             crop: None,
             tone_curve: Vec::new(),
@@ -398,6 +405,7 @@ impl EditRecipe {
         self.noise_reduction = c(self.noise_reduction, 0.0, 100.0);
         self.lens_vignette = c(self.lens_vignette, -100.0, 100.0);
         self.lens_vignette_mid = c(self.lens_vignette_mid, 0.0, 100.0);
+        self.lens_distortion = c(self.lens_distortion, -100.0, 100.0);
         self.straighten_deg = c(self.straighten_deg, -45.0, 45.0);
         self.confidence = c(self.confidence, 0.0, 1.0);
         if let Some(k) = self.temperature_k {
@@ -614,9 +622,15 @@ mod tests {
 
     #[test]
     fn clamp_pulls_out_of_range_values_back() {
-        let mut recipe = EditRecipe { contrast: 999.0, exposure_ev: -42.0, ..Default::default() };
+        let mut recipe = EditRecipe {
+            contrast: 999.0,
+            exposure_ev: -42.0,
+            lens_distortion: -250.0,
+            ..Default::default()
+        };
         recipe.clamp();
         assert_eq!(recipe.contrast, 100.0);
         assert_eq!(recipe.exposure_ev, -5.0);
+        assert_eq!(recipe.lens_distortion, -100.0);
     }
 }

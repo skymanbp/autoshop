@@ -82,6 +82,14 @@ pub fn render_to_image(
         .ok_or_else(|| anyhow!("pixel buffer size mismatch"))?;
     let mut dynimg = oriented(DynamicImage::ImageRgb16(img), orientation);
 
+    // --- manual lens distortion: radial resample FIRST in the geometric chain
+    // (masks were applied above, in the original frame). The map depends only
+    // on the radius normalised by the half-diagonal, so it is orientation-
+    // invariant and identical between the small preview and this full render.
+    if recipe.lens_distortion != 0.0 {
+        dynimg = apply_lens_distortion(&dynimg, recipe.lens_distortion);
+    }
+
     // --- straighten: rotate + auto-crop BEFORE the user crop, in display
     // space (after orientation) so the slider means what the user sees. The
     // user crop below is therefore defined on the straightened frame — same
@@ -141,7 +149,11 @@ pub fn render_baked_to_image(
         .ok_or_else(|| anyhow!("baked pixel buffer size mismatch"))?;
     let mut dynimg = DynamicImage::ImageRgb16(out);
 
-    // Straighten before the user crop — same order as the RAW path.
+    // Distortion, then straighten, before the user crop — same order as the
+    // RAW path (the geometric chain is original → corrected → view).
+    if recipe.lens_distortion != 0.0 {
+        dynimg = apply_lens_distortion(&dynimg, recipe.lens_distortion);
+    }
     if recipe.straighten_deg != 0.0 {
         dynimg = rotate_straighten(&dynimg, recipe.straighten_deg);
     }
@@ -1263,22 +1275,160 @@ pub fn rotate_straighten(img: &DynamicImage, deg: f32) -> DynamicImage {
         let sy = -s * dx + c * dy + cy_src;
         // Bilinear sample, clamped to the frame (the inscribed crop keeps
         // samples in-bounds up to float rounding at the very edge).
-        let x0 = sx.floor().clamp(0.0, w - 1.0);
-        let y0 = sy.floor().clamp(0.0, h - 1.0);
-        let x1 = (x0 + 1.0).min(w - 1.0);
-        let y1 = (y0 + 1.0).min(h - 1.0);
-        let (fx, fy) = ((sx - x0).clamp(0.0, 1.0), (sy - y0).clamp(0.0, 1.0));
-        let p00 = src.get_pixel(x0 as u32, y0 as u32);
-        let p10 = src.get_pixel(x1 as u32, y0 as u32);
-        let p01 = src.get_pixel(x0 as u32, y1 as u32);
-        let p11 = src.get_pixel(x1 as u32, y1 as u32);
-        let mut v = [0u16; 3];
-        for (ch_i, out_v) in v.iter_mut().enumerate() {
-            let top = p00[ch_i] as f32 * (1.0 - fx) + p10[ch_i] as f32 * fx;
-            let bot = p01[ch_i] as f32 * (1.0 - fx) + p11[ch_i] as f32 * fx;
-            *out_v = (top * (1.0 - fy) + bot * fy).round().clamp(0.0, 65535.0) as u16;
+        *px = sample_bilinear_rgb16(&src, sx, sy);
+    }
+    DynamicImage::ImageRgb16(out)
+}
+
+/// Clamped bilinear lookup in a 16-bit RGB buffer — the shared resampling core
+/// of the geometric ops ([`rotate_straighten`], [`apply_lens_distortion`]).
+fn sample_bilinear_rgb16(src: &ImageBuffer<Rgb<u16>, Vec<u16>>, sx: f32, sy: f32) -> Rgb<u16> {
+    let (w, h) = (src.width() as f32, src.height() as f32);
+    let x0 = sx.floor().clamp(0.0, w - 1.0);
+    let y0 = sy.floor().clamp(0.0, h - 1.0);
+    let x1 = (x0 + 1.0).min(w - 1.0);
+    let y1 = (y0 + 1.0).min(h - 1.0);
+    let (fx, fy) = ((sx - x0).clamp(0.0, 1.0), (sy - y0).clamp(0.0, 1.0));
+    let p00 = src.get_pixel(x0 as u32, y0 as u32);
+    let p10 = src.get_pixel(x1 as u32, y0 as u32);
+    let p01 = src.get_pixel(x0 as u32, y1 as u32);
+    let p11 = src.get_pixel(x1 as u32, y1 as u32);
+    let mut v = [0u16; 3];
+    for (ch_i, out_v) in v.iter_mut().enumerate() {
+        let top = p00[ch_i] as f32 * (1.0 - fx) + p10[ch_i] as f32 * fx;
+        let bot = p01[ch_i] as f32 * (1.0 - fx) + p11[ch_i] as f32 * fx;
+        *out_v = (top * (1.0 - fy) + bot * fy).round().clamp(0.0, 65535.0) as u16;
+    }
+    Rgb(v)
+}
+
+// --- Manual lens distortion (gap batch C, 第二片) ----------------------------
+//
+// Coordinate-space contract (the C2 design). The geometric pipeline is
+//
+//   original ──apply_lens_distortion──▶ corrected ──rotate_straighten──▶ view
+//
+// Masks / brush strokes / droppers / clone points live in the ORIGINAL frame
+// (`apply_develop` runs before this remap); `recipe.crop` lives in the VIEW
+// frame. The GUI maps every interaction through
+// view → (un-rotate) → corrected → [`distort_norm`] → original, and displays
+// stored original-frame geometry via [`undistort_norm`] → (rotate) → view, so
+// a mask painted on screen lands on the same CONTENT in the export regardless
+// of the slider values.
+//
+// Model: a pure radial resample about the frame centre, radius normalised by
+// the half-diagonal (r = 1 exactly at the corners — invariant to the EXIF
+// orientation step and identical between the 1280 px preview and the 61 MP
+// export). Every corrected-frame point at radius r samples the original at
+//
+//   r_src = s · r · (1 + k · (s·r)²),      k = −amount/100 · DISTORT_STRENGTH
+//
+// Sign: ACR's Distortion slider is "+ straightens barrel", which must push
+// edge content OUTWARD, i.e. pull samples INWARD ⇒ k < 0 for amount > 0
+// (derived twice independently: pinhole magnification recovery, and the
+// bow-direction of a mapped straight line — both agree). |k| ≤ 0.25 keeps
+// d(r_src)/dr = s(1 + 3k(sr)²) > 0 on the frame, so the map stays monotonic
+// and invertible. `s` is a fill scale: for k > 0 (pincushion fix) the Newton
+// root of k·s³ + s − 1 = 0 zooms in just enough that corner samples stay
+// inside the source (no black corners — the same auto-fill policy as
+// `rotate_straighten`); for k ≤ 0 the map fills the frame as-is (s = 1) and
+// the outermost source corners crop away instead, like LR's constrained crop.
+// The amount → k gain is our calibration, not Adobe's published one (they
+// don't publish it); ±100 ⇒ up to 25 % radial remap at the corners.
+
+/// Slider-to-curvature gain: |k| at amount = ±100. Must stay < 1/3 or the
+/// radial map loses monotonicity inside the frame (see module notes above).
+const DISTORT_STRENGTH: f32 = 0.25;
+
+/// amount → (k, fill scale s). See the coordinate-space contract above.
+fn distort_params(amount: f32) -> (f32, f32) {
+    let k = -amount.clamp(-100.0, 100.0) / 100.0 * DISTORT_STRENGTH;
+    let s = if k > 0.0 {
+        // Newton on f(s) = k·s³ + s − 1: strictly increasing ⇒ unique root,
+        // convex ⇒ monotone convergence from s = 1.
+        let mut s = 1.0f32;
+        for _ in 0..8 {
+            s -= (k * s * s * s + s - 1.0) / (3.0 * k * s * s + 1.0);
         }
-        *px = Rgb(v);
+        s
+    } else {
+        1.0
+    };
+    (k, s)
+}
+
+/// Corrected-frame normalised point → ORIGINAL-frame normalised point: the
+/// forward sampling map of the manual distortion correction. Identity when
+/// the amount rounds to zero. Public — the GUI composes it into its
+/// view→original interaction mapping.
+pub fn distort_norm(nx: f32, ny: f32, dims: (f32, f32), amount: f32) -> (f32, f32) {
+    if amount.abs() < 1e-3 {
+        return (nx, ny);
+    }
+    let (w, h) = dims;
+    let (k, s) = distort_params(amount);
+    let rr = (0.5 * (w * w + h * h).sqrt()).max(1e-6);
+    let (dx, dy) = ((nx - 0.5) * w, (ny - 0.5) * h);
+    let rn = (dx * dx + dy * dy).sqrt() / rr;
+    let f = s * (1.0 + k * (s * rn) * (s * rn));
+    ((dx * f) / w.max(1e-6) + 0.5, (dy * f) / h.max(1e-6) + 0.5)
+}
+
+/// ORIGINAL-frame normalised point → corrected-frame normalised point (Newton
+/// inverse of [`distort_norm`]). Original content the correction crops away
+/// (a barrel fix pulls the outermost corners out of frame) has no preimage;
+/// those points clamp to the map's monotonic limit and land OUTSIDE the unit
+/// square, where the GUI's overlay painter clips them — honestly off-screen.
+pub fn undistort_norm(nx: f32, ny: f32, dims: (f32, f32), amount: f32) -> (f32, f32) {
+    if amount.abs() < 1e-3 {
+        return (nx, ny);
+    }
+    let (w, h) = dims;
+    let (k, s) = distort_params(amount);
+    let rr = (0.5 * (w * w + h * h).sqrt()).max(1e-6);
+    let (dx, dy) = ((nx - 0.5) * w, (ny - 0.5) * h);
+    let rho = (dx * dx + dy * dy).sqrt() / rr;
+    if rho < 1e-6 {
+        return (nx, ny); // centre is a fixed point
+    }
+    // Solve u(1 + k·u²) = ρ for u = s·r_corrected. g is concave-increasing up
+    // to u_max for k < 0 (monotone Newton from the left, never overshoots) and
+    // convex-increasing for k > 0 (monotone from the right); ρ beyond the k<0
+    // reachable maximum clamps to u_max (the cropped-away case above).
+    let u_max = if k < 0.0 { (1.0 / (3.0 * -k)).sqrt() } else { f32::INFINITY };
+    let mut u = rho.min(u_max);
+    for _ in 0..12 {
+        let g = k * u * u * u + u - rho;
+        let dg = 3.0 * k * u * u + 1.0;
+        if dg.abs() < 1e-6 {
+            break;
+        }
+        u = (u - g / dg).clamp(0.0, u_max);
+    }
+    let f = (u / s) / rho; // radial scale: r_corrected / r_original
+    ((dx * f) / w.max(1e-6) + 0.5, (dy * f) / h.max(1e-6) + 0.5)
+}
+
+/// Resample the frame through the manual distortion correction (bilinear,
+/// 16-bit — the same precision policy as [`rotate_straighten`], so the export
+/// path loses nothing and the 8-bit preview survives exactly). Output has the
+/// SAME dimensions: the fill scale inside the map guarantees every output
+/// pixel has an in-frame source sample. Identity when the amount rounds to 0.
+pub fn apply_lens_distortion(img: &DynamicImage, amount: f32) -> DynamicImage {
+    if amount.abs() < 1e-3 {
+        return img.clone();
+    }
+    let src = img.to_rgb16();
+    let (w, h) = (src.width() as f32, src.height() as f32);
+    let (k, s) = distort_params(amount);
+    let rr = (0.5 * (w * w + h * h).sqrt()).max(1e-6);
+    let (cx, cy) = ((w - 1.0) * 0.5, (h - 1.0) * 0.5);
+    let mut out: ImageBuffer<Rgb<u16>, Vec<u16>> = ImageBuffer::new(src.width(), src.height());
+    for (x, y, px) in out.enumerate_pixels_mut() {
+        let (dx, dy) = (x as f32 - cx, y as f32 - cy);
+        let rn = (dx * dx + dy * dy).sqrt() / rr;
+        let f = s * (1.0 + k * (s * rn) * (s * rn));
+        *px = sample_bilinear_rgb16(&src, cx + dx * f, cy + dy * f);
     }
     DynamicImage::ImageRgb16(out)
 }
@@ -1701,6 +1851,103 @@ mod tests {
         let (rw, _rh) = rot.dimensions();
         let probe = rot.get_pixel(rw / 2 + 3, 1);
         assert!(probe[0] > probe[2], "clockwise tilt must move red over top-centre-right: {probe:?}");
+    }
+
+    #[test]
+    fn distortion_maps_are_inverse_and_directionally_correct() {
+        let dims = (120.0, 80.0);
+        // (a) amount = 0 is the exact identity, both directions.
+        assert_eq!(distort_norm(0.31, 0.77, dims, 0.0), (0.31, 0.77));
+        assert_eq!(undistort_norm(0.31, 0.77, dims, 0.0), (0.31, 0.77));
+        // (b) the centre is a fixed point at any amount.
+        for amt in [-100.0f32, -45.0, 60.0, 100.0] {
+            let (cx, cy) = distort_norm(0.5, 0.5, dims, amt);
+            assert!((cx - 0.5).abs() < 1e-5 && (cy - 0.5).abs() < 1e-5, "centre moved at {amt}");
+        }
+        // (c) Round-trips. view→orig→view must hold everywhere in the frame;
+        // orig→view→orig only for content the correction keeps (interior
+        // points — a +100 barrel fix legitimately crops the outermost corners,
+        // and those originals have no preimage by design).
+        for amt in [-100.0f32, -45.0, 60.0, 100.0] {
+            for (nx, ny) in [(0.0, 0.0), (1.0, 0.0), (0.1, 0.9), (0.3, 0.4), (0.62, 0.85), (0.5, 0.5)] {
+                let (ox, oy) = distort_norm(nx, ny, dims, amt);
+                let (bx, by) = undistort_norm(ox, oy, dims, amt);
+                assert!(
+                    (bx - nx).abs() < 2e-3 && (by - ny).abs() < 2e-3,
+                    "view roundtrip @{amt}: ({nx},{ny}) → ({ox},{oy}) → ({bx},{by})"
+                );
+            }
+            for (nx, ny) in [(0.3, 0.4), (0.6, 0.35), (0.25, 0.7), (0.45, 0.52)] {
+                let (vx, vy) = undistort_norm(nx, ny, dims, amt);
+                let (bx, by) = distort_norm(vx, vy, dims, amt);
+                assert!(
+                    (bx - nx).abs() < 2e-3 && (by - ny).abs() < 2e-3,
+                    "orig roundtrip @{amt}: ({nx},{ny}) → ({vx},{vy}) → ({bx},{by})"
+                );
+            }
+        }
+        // (d) Direction, via the radial sampling ratio f = r_src/r_dst probed
+        // along the x-axis: a barrel fix (+) pulls samples INWARD, harder at
+        // the edge (f < 1, decreasing); a pincushion fix (−) samples RELATIVELY
+        // further out at the edge than at the centre (f increasing).
+        let ratio = |nx: f32, amt: f32| {
+            let (ox, _) = distort_norm(nx, 0.5, dims, amt);
+            (ox - 0.5) / (nx - 0.5)
+        };
+        assert!(
+            ratio(0.95, 100.0) < ratio(0.6, 100.0) && ratio(0.6, 100.0) < 1.0,
+            "barrel fix direction: f(edge)={} f(mid)={}",
+            ratio(0.95, 100.0),
+            ratio(0.6, 100.0)
+        );
+        assert!(
+            ratio(0.95, -100.0) > ratio(0.6, -100.0),
+            "pincushion fix direction: f(edge)={} f(mid)={}",
+            ratio(0.95, -100.0),
+            ratio(0.6, -100.0)
+        );
+    }
+
+    #[test]
+    fn apply_lens_distortion_fills_the_frame_and_moves_content_radially() {
+        // (a) 0 is the identity (pixels untouched); dims always preserved.
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(121, 81, image::Rgb([9, 200, 30])));
+        assert_eq!(apply_lens_distortion(&img, 0.0).to_rgb8().as_raw(), img.to_rgb8().as_raw());
+        let out = apply_lens_distortion(&img, 70.0);
+        assert_eq!((out.width(), out.height()), (121, 81));
+
+        // (b) No un-sampled (black) pixels for EITHER sign: k ≤ 0 fills by
+        // construction, k > 0 relies on the Newton fill scale.
+        let white = DynamicImage::ImageRgb8(RgbImage::from_pixel(121, 81, image::Rgb([255, 255, 255])));
+        for amt in [100.0f32, -100.0, 55.0, -55.0] {
+            let r = apply_lens_distortion(&white, amt).to_rgb16();
+            let min = r.pixels().flat_map(|p| p.0).min().unwrap();
+            assert!(min >= 65000, "unfilled pixels at amount {amt}: min {min}");
+        }
+
+        // (c) The exact centre is a fixed point of the resample.
+        let mut cdot = RgbImage::from_pixel(121, 81, image::Rgb([0, 0, 0]));
+        cdot.put_pixel(60, 40, image::Rgb([255, 255, 255]));
+        for amt in [100.0f32, -100.0] {
+            let m = apply_lens_distortion(&DynamicImage::ImageRgb8(cdot.clone()), amt).to_rgb16();
+            assert!(m.get_pixel(60, 40)[0] > 30000, "centre must be a fixed point at {amt}");
+        }
+
+        // (d) A +100 barrel fix (fill scale = 1) pushes content OUTWARD: a
+        // white 3×3 dot centred at x=30 on the horizontal centreline (frame
+        // centre x=60) must land further LEFT (predicted ≈ x 28.6).
+        let mut dot = RgbImage::from_pixel(121, 81, image::Rgb([0, 0, 0]));
+        for yy in 39..=41 {
+            for xx in 29..=31 {
+                dot.put_pixel(xx, yy, image::Rgb([255, 255, 255]));
+            }
+        }
+        let moved = apply_lens_distortion(&DynamicImage::ImageRgb8(dot), 100.0).to_rgb16();
+        let bright_x = (0..121u32).max_by_key(|&x| moved.get_pixel(x, 40)[0]).unwrap();
+        assert!(
+            moved.get_pixel(bright_x, 40)[0] > 30000 && bright_x <= 29,
+            "barrel fix must move the dot outward (x<30), got x={bright_x}"
+        );
     }
 
     #[test]

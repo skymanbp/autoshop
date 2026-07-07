@@ -9,14 +9,14 @@
 - **v0.4.0 已发布**（tag `v0.4.0` → `e175bf8`，GitHub Release "Autoshop
   v0.4.0" 带双 exe，资产字节数已核对）：范围蒙版 / 双轨续接 / 导出管线 /
   高分预览 / 暗角补偿 / sRGB ICC / 版本快照——即 A-G 差距批次整批。
-- **下一批 = 三个大项（compact 后从这里继续，任选或按序）**：
-  1. **C2 k1/k2 径向畸变**——几何重映射；动手前先做坐标映射整体设计
-     （view_norm_to_orig 链加去畸变项，波及 wb 吸管/画笔/mask 放置/region
-     等 6 处映射 + roundtrip 单测），见 §C。
-  2. **A② AI 主体/天空分割**——前置是引擎位图 mask 通路（recipe 里的
+- **~~C2 手动畸变校正~~ ✅ 完成（2026-07-06 深夜，见 §C）**——坐标映射
+  整体设计（original→corrected→view 三空间合约）+ 引擎径向重映射 + GUI
+  全调用点接入 + XMP，67 lib + 4 gui 测试。
+- **下一批 = 剩余两个大项（任选或按序）**：
+  1. **A② AI 主体/天空分割**——前置是引擎位图 mask 通路（recipe 里的
      MaskGeometry 加 Bitmap 变体或旁路），python sidecar 循 SCUNet 模式
      或云 API，见 §A。
-  3. **D2 P3/AdobeRGB 输出**——需真 gamut 变换（矩阵 + TRC），不是换
+  2. **D2 P3/AdobeRGB 输出**——需真 gamut 变换（矩阵 + TRC），不是换
      标签；profile 仍可循 CC0 紧凑系列，见 §D。
 - v0.3.0 → `fa9add8`，v0.2.0 → `1bc57ff`。
 - **有序批次 ①-⑤ 全部完成**（详见各节 ✅ 小节，含实现锚点与已知近似）：
@@ -31,9 +31,10 @@
   批量渲染 worker，61 lib 测试）。
 - **差距批次 E 高分预览已完成**（见 §E ✅ 小节：1280/2560/4096 预览分辨率
   下拉，切换保配方重解码）。
-- **差距批次 C 第一片 暗角补偿已完成**（见 §C ◐ 小节：线性光域径向增益 +
-  GUI 镜头校正区 + XMP VignetteAmount/Midpoint，63 lib 测试）。C 第二片
-  （k1/k2 畸变）牵动坐标空间约定，须整体设计。
+- **差距批次 C 两片全部完成**（见 §C ✅ 小节）：暗角补偿（线性光域径向
+  增益 + GUI 镜头校正区 + XMP VignetteAmount/Midpoint）+ C2 手动畸变校正
+  （三空间坐标合约 + 引擎径向重映射 + GUI 映射链全接入 + XMP
+  LensManualDistortionAmount，67 lib 测试）。
 - **差距批次 D 第一步 导出嵌 sRGB ICC 已完成**（见 §D ◐ 小节：三格式
   显式编码器 + CC0 profile 入库，64 lib 测试）。
 - **差距批次 G 版本快照已完成**（见 §G ✅ 小节：`<stem>.v<N>.recipe.json`
@@ -55,11 +56,15 @@
   `after_view`（crop > placing > wb_pick > range_pick > clone > paint >
   box-select）。
 - `develop_preview`（render.rs）跑 `apply_recipe_wb` + `apply_develop`；
-  **不应用裁剪**（GUI 用 uv 窗显示、导出端真裁）。**拉直**由 GUI `redevelop`
-  在 develop_preview 之后调引擎 `rotate_straighten` 完成（导出路径同函数）。
-- **坐标空间约定（④起）**：`recipe.crop` 存拉直后空间；masks/画笔/吸管/
-  region 存原始空间——gui.rs `view_norm_to_orig / orig_norm_to_view /
-  geom_to_view` 在数据边界换算，共用引擎 `inscribed_dims`，0° 恒等。
+  **不应用裁剪**（GUI 用 uv 窗显示、导出端真裁）。**几何链**由 GUI `redevelop`
+  在 develop_preview 之后依次调引擎 `apply_lens_distortion`（C2 畸变）→
+  `rotate_straighten`（拉直）完成（导出路径同函数、同顺序）。
+- **坐标空间约定（④起，C2 扩展）**：original →（畸变校正）→ corrected →
+  （旋转+内接裁剪）→ view；`recipe.crop` 存 view 空间；masks/画笔/吸管/
+  region 存 original 空间——gui.rs `view_norm_to_orig / orig_norm_to_view /
+  geom_to_view`（三者带 `dist` 参数，来源 `geom_ctx`）在数据边界换算，共用
+  引擎 `inscribed_dims / distort_norm / undistort_norm`，全零恒等。完整
+  合约见 render.rs "Manual lens distortion" 注释块。
 - tone 模型单一事实来源：`render::TONE_KNOTS_X / tone_slider_basis /
   tone_exposure_curve`（pub(crate)，fit.rs 逆着它解）；曲线采样单一事实来源
   `render::curve_lut`（pub，GUI 曲线编辑器直接画它）。
@@ -171,7 +176,7 @@
   的 Lightroom 出口停在原 RAW 一侧，属定位内取舍。GUI 态逻辑无单测
   （egui app 态），入真机验收列表。
 
-### C. 镜头/几何校正（◐ 第一片 暗角补偿 ✅ 2026-07-06）
+### C. 镜头/几何校正（✅ 暗角 + C2 手动畸变均完成 2026-07-06）
 - **暗角补偿 ✅**：`recipe.lens_vignette / lens_vignette_mid`（-100..100 /
   0..100，clamp 齐全）；引擎 `apply_vignette`（render.rs）——**线性光域**
   径向增益 `1 + k·rⁿ`，midpoint 经指数 0.6..3.0 控制作用范围，apply_develop
@@ -180,10 +185,23 @@
   `VignetteMidpoint`（ACR 文档配对键，用户边车中无非零实例，语义待真 LR
   验证），amount=0 时零键写出（与旧 writer 字节兼容）。单测：中心不动/
   径向单调/负值压暗/高中点收缩作用域；XMP 条件写出。
-- **未做（第二片）**：k1/k2 径向畸变——是**几何重映射**，会牵动 ④ 的坐标
-  空间约定（view_norm_to_orig 链需加去畸变项，波及 wb 吸管/画笔/mask 放置/
-  region 六处映射 + roundtrip 单测），须整体设计后动手，勿零敲碎打；
-  去紫边（需边缘邻近门控，防误伤紫色主体）；透视 Upright；lensfun 长期项。
+- **手动畸变校正 ✅（C2，2026-07-06 深夜）**：`recipe.lens_distortion`
+  （-100..100，ACR 语义：正修桶形、负修枕形）；引擎（render.rs）
+  `distort_norm / undistort_norm / apply_lens_distortion`——半对角线归一的
+  单系数径向模型 `r_src = s·r·(1+k(sr)²)`，`k = −amount/100·0.25`（|k|<1/3
+  保单调可逆；方向经两条独立推导交叉验证），负 amount 走 Newton 填满缩放
+  （无黑角，同拉直的 auto-fill 策略）、正 amount 角部内容自然裁出；逆映射
+  Newton 求三次根、被裁内容钳到单调极限落在视野外。管线插入点：三条路径
+  （RAW 导出/baked/GUI redevelop）统一 develop 之后、拉直之前。GUI 映射链
+  `view_norm_to_orig/orig_norm_to_view/geom_to_view` 全部带 `dist` 项
+  （wb 吸管/范围取样/画笔/mask 放置/region/克隆 全调用点接入），镜头面板
+  第三滑杆；XMP `LensManualDistortionAmount`（键名从用户 148 份真边车实证，
+  仅非零写出）。已知近似：amount→k 增益是我方标定（Adobe 未公开），同数值
+  下 LR 的校正强度可能不同——入真机验收单。单测：映射双向 roundtrip
+  （4 幅度）/方向性/双符号无黑角/中心不动点/内容径向外移。
+- **未做**：per-lens profile 校正（lensfun / 厂商 k1+k2 多项式——手动滑杆
+  已覆盖目测校正，按镜头自动化留长期项）；去紫边（需边缘邻近门控，防误伤
+  紫色主体）；透视 Upright。
 - AI advisor 暂不暴露镜头字段（校正是测量性操作，非审美建议；schema 未加）。
 
 ### D. 色彩管理（◐ 第一步 导出嵌 sRGB ICC ✅ 2026-07-06）
@@ -244,7 +262,7 @@
 
 ### 建议批次顺序（v0.3.x 起 · 2026-07-06 收官状态）
 ~~A①（范围蒙版）~~ ✅ → ~~B（双轨打通）~~ ✅ → ~~F（导出管线）~~ ✅ →
-~~E（高分预览）~~ ✅ → C（◐ 暗角 ✅，畸变待坐标设计）→
+~~E（高分预览）~~ ✅ → ~~C（暗角 + C2 手动畸变）~~ ✅ →
 D（◐ sRGB ICC ✅，P3/AdobeRGB 待 gamut 变换）→ ~~G（版本）~~ ✅；
 A②（AI 分割）待引擎位图 mask 通路。
 
