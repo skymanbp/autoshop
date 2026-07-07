@@ -57,7 +57,15 @@ pub fn render_to_image(
         Intermediate::FourColor(_) => bail!("4-colour develop output not supported by render v1"),
     };
     let (w, h) = (rgb.width, rgb.height);
-    let mut data: Vec<[f32; 3]> = rgb.data; // sRGB-gamma, ~[0,1]; owned (no copy)
+    let data: Vec<[f32; 3]> = rgb.data; // sRGB-gamma, ~[0,1]; owned (no copy)
+
+    // --- EXIF orientation FIRST, so the whole pipeline works in the DISPLAY
+    // frame. Masks / crop / straighten are all defined against what the user
+    // sees (the C2 coordinate contract's "original" frame); orienting at the
+    // end — as this pipeline once did — made portrait RAWs apply crop and
+    // straighten in the wrong axis vs the un-oriented GUI preview (the decode
+    // side now orients too, see decode.rs). Identity for landscape shots.
+    let (mut data, w, h) = orient_f32(data, w, h, orientation);
 
     // --- AI denoise (opt-in) on the clean demosaiced pixels, before tone/sharpen
     if let Some(opts) = denoise {
@@ -80,7 +88,9 @@ pub fn render_to_image(
     }
     let img: ImageBuffer<Rgb<u16>, _> = ImageBuffer::from_raw(w as u32, h as u32, buf)
         .ok_or_else(|| anyhow!("pixel buffer size mismatch"))?;
-    let mut dynimg = oriented(DynamicImage::ImageRgb16(img), orientation);
+    // Orientation was applied BEFORE develop (see orient_f32 above), so the
+    // buffer is already in the display frame — no tail rotation.
+    let mut dynimg = DynamicImage::ImageRgb16(img);
 
     // --- manual lens distortion: radial resample FIRST in the geometric chain
     // (masks were applied above, in the original frame). The map depends only
@@ -1430,7 +1440,10 @@ fn to_u16(v: f32) -> u16 {
 }
 
 /// Apply the RAW's stored orientation so portraits/flips display correctly.
-fn oriented(img: DynamicImage, o: Orientation) -> DynamicImage {
+/// pub(crate): the decode side orients the embedded previews with the SAME
+/// function, so GUI display and render pipeline can never disagree about
+/// which way is up.
+pub(crate) fn oriented(img: DynamicImage, o: Orientation) -> DynamicImage {
     match o {
         Orientation::Normal | Orientation::Unknown => img,
         Orientation::HorizontalFlip => img.fliph(),
@@ -1441,6 +1454,29 @@ fn oriented(img: DynamicImage, o: Orientation) -> DynamicImage {
         Orientation::Transpose => img.rotate90().fliph(),
         Orientation::Transverse => img.rotate270().fliph(),
     }
+}
+
+/// Orient the demosaiced f32 buffer BEFORE develop, so masks / crop /
+/// straighten all live in the display frame (the C2 contract's "original").
+/// Implemented by round-tripping through [`oriented`] on a lossless Rgb32F
+/// image — one function owns the orientation semantics, no hand-derived
+/// index math to drift. Identity (no copy) for Normal/Unknown.
+fn orient_f32(
+    data: Vec<[f32; 3]>,
+    w: usize,
+    h: usize,
+    o: Orientation,
+) -> (Vec<[f32; 3]>, usize, usize) {
+    if matches!(o, Orientation::Normal | Orientation::Unknown) {
+        return (data, w, h);
+    }
+    let flat: Vec<f32> = data.into_iter().flatten().collect();
+    let img = ImageBuffer::<Rgb<f32>, Vec<f32>>::from_raw(w as u32, h as u32, flat)
+        .expect("orient_f32: buffer size matches dims");
+    let out = oriented(DynamicImage::ImageRgb32F(img), o).to_rgb32f();
+    let (ow, oh) = out.dimensions();
+    let data = out.pixels().map(|p| [p[0], p[1], p[2]]).collect();
+    (data, ow as usize, oh as usize)
 }
 
 /// The largest axis-aligned rectangle (same aspect freedom as Lightroom's
@@ -2301,6 +2337,23 @@ mod tests {
         let inert = develop_preview(&base, &missing).to_rgb8();
         assert_eq!(inert.get_pixel(5, 10)[0], ctrl_w, "missing raster ⇒ mask inert");
         assert_eq!(inert.get_pixel(35, 10)[0], ctrl_b);
+    }
+
+    #[test]
+    fn orient_f32_matches_the_display_orientation_semantics() {
+        // A 3×2 buffer with a unique corner: Rotate90 (clockwise) must swap
+        // dims and move the top-left pixel to the top-right — the same
+        // convention `oriented` (and thus the GUI preview) uses. Normal is a
+        // pass-through with no copy semantics to break.
+        let mut data = vec![[0.0f32; 3]; 6];
+        data[0] = [1.0, 0.5, 0.25]; // top-left of the 3×2 frame
+        let (same, w, h) = orient_f32(data.clone(), 3, 2, Orientation::Normal);
+        assert_eq!((w, h), (3, 2));
+        assert_eq!(same[0], [1.0, 0.5, 0.25]);
+        let (rot, w, h) = orient_f32(data, 3, 2, Orientation::Rotate90);
+        assert_eq!((w, h), (2, 3), "90° swaps dimensions");
+        assert_eq!(rot[1], [1.0, 0.5, 0.25], "top-left → top-right under clockwise 90°");
+        assert_eq!(rot[0], [0.0, 0.0, 0.0]);
     }
 
     #[test]

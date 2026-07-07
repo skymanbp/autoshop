@@ -215,6 +215,11 @@ pub fn decode_raw(path: &Path) -> Result<Decoded> {
         },
     };
 
+    // Orient the preview into the display frame (embedded previews are stored
+    // in sensor orientation; see preview_only for the full rationale). Uses
+    // the dummy raw's orientation, which is already decoded above for Meta.
+    let preview = crate::render::oriented(preview, raw.orientation);
+
     // Histogram on a downscaled copy of the preview — representative and fast
     // even for a 60 MP embedded JPEG.
     let small = preview.resize(1024, 1024, image::imageops::FilterType::Triangle);
@@ -241,22 +246,33 @@ pub fn preview_only(path: &Path) -> Result<DynamicImage> {
     let params = RawDecodeParams { image_index: 0 };
     // Same 3-level fallback as decode_raw: embedded preview → thumbnail → a full
     // raw render (some ARWs lack both embedded images).
-    if let Some(p) = decoder
+    let img = if let Some(p) = decoder
         .preview_image(&src, &params)
         .map_err(|e| anyhow!("preview_image: {e}"))?
     {
-        return Ok(p);
-    }
-    if let Some(t) = decoder
+        p
+    } else if let Some(t) = decoder
         .thumbnail_image(&src, &params)
         .map_err(|e| anyhow!("thumbnail_image: {e}"))?
     {
-        return Ok(t);
-    }
-    decoder
-        .full_image(&src, &params)
-        .map_err(|e| anyhow!("full_image: {e}"))?
-        .ok_or_else(|| anyhow!("no preview/thumbnail/full image in {}", path.display()))
+        t
+    } else {
+        decoder
+            .full_image(&src, &params)
+            .map_err(|e| anyhow!("full_image: {e}"))?
+            .ok_or_else(|| anyhow!("no preview/thumbnail/full image in {}", path.display()))?
+    };
+    // Embedded previews come back in SENSOR orientation (rawler's ARW path
+    // decodes the JPEG bytes verbatim — verified in the crate source). Orient
+    // here with the render engine's own function so masks / crop / straighten,
+    // which are all defined against the displayed preview, mean the same
+    // thing in the full-res render (it orients before develop now too).
+    // The dummy raw_image decodes metadata only — no sensor decompression.
+    let orientation = decoder
+        .raw_image(&src, &params, true)
+        .map_err(|e| anyhow!("raw_image(dummy): {e}"))?
+        .orientation;
+    Ok(crate::render::oriented(img, orientation))
 }
 
 fn compute_histogram(img: &DynamicImage) -> Histogram {

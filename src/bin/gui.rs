@@ -2590,8 +2590,11 @@ impl AutoshopApp {
             });
             // Mask list: click to select (shows overlay + sliders), 🗑 deletes;
             // HOVERING a row previews that mask's coverage without selecting.
+            // hover_mask lives ONE frame: update() takes it each frame and this
+            // list re-sets it while the cursor is on a row — so leaving the
+            // panel, collapsing this section or switching photos all fall back
+            // to the selection with no stale index to chase.
             let mut delete: Option<usize> = None;
-            let mut hover_now: Option<usize> = None;
             for i in 0..n_masks {
                 ui.horizontal(|ui| {
                     let m = &self.recipe.masks[i];
@@ -2603,7 +2606,7 @@ impl AutoshopApp {
                     let label = format!("{} · {}", if m.name.is_empty() { "mask" } else { &m.name }, kind);
                     let row = ui.selectable_label(self.sel_mask == Some(i), label);
                     if row.hovered() {
-                        hover_now = Some(i);
+                        self.hover_mask = Some(i);
                     }
                     if row.clicked() {
                         self.sel_mask = if self.sel_mask == Some(i) { None } else { Some(i) };
@@ -2613,10 +2616,6 @@ impl AutoshopApp {
                         delete = Some(i);
                     }
                 });
-            }
-            if hover_now != self.hover_mask {
-                self.hover_mask = hover_now; // leave = falls back to the selection
-                self.overlay_stale = true;
             }
             if let Some(i) = delete {
                 self.recipe.masks.remove(i);
@@ -3989,6 +3988,10 @@ impl AutoshopApp {
 impl eframe::App for AutoshopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_workers(ctx);
+        // Hover-to-preview is frame-scoped: take last frame's target; the mask
+        // list re-sets it below if the cursor is still on a row. The diff is
+        // checked right before the overlay refresh at the end of update().
+        let hover_prev = self.hover_mask.take();
 
         // Global shortcuts. Skip while a widget is focused so the Direction text
         // field keeps its own text editing / undo. Ctrl+Z/Y = undo/redo,
@@ -4274,7 +4277,11 @@ impl eframe::App for AutoshopApp {
         if self.dirty {
             self.redevelop(ctx);
         }
-        // The mask coverage overlay follows develop / selection / toggle.
+        // The mask coverage overlay follows develop / selection / toggle /
+        // hover (a changed hover target includes "left the list entirely").
+        if self.hover_mask != hover_prev {
+            self.overlay_stale = true;
+        }
         if std::mem::take(&mut self.overlay_stale) {
             self.refresh_mask_overlay(ctx);
         }
