@@ -235,6 +235,35 @@ fn draw_mask_overlay(ui: &egui::Ui, xf: ViewXform, geom: &MaskGeometry) {
     }
 }
 
+/// Pick radius (px) for on-image mask knobs — matches the crop handles' feel.
+const HANDLE_HIT: f32 = 12.0;
+
+/// Screen-space knob positions for on-image mask editing (geometry given in
+/// VIEW space, i.e. already through geom_to_view). Handle ids: 0 = move
+/// (linear midpoint / radial centre); linear 1 = zero end, 2 = full end;
+/// radial 1..4 = left/top/right/bottom edge midpoints. Bitmap masks carry no
+/// parametric knobs (empty).
+fn mask_handle_points(geom: &MaskGeometry, xf: ViewXform) -> Vec<(u8, egui::Pos2)> {
+    match *geom {
+        MaskGeometry::Linear { zero_x, zero_y, full_x, full_y } => {
+            let a = xf.to_screen(zero_x, zero_y);
+            let b = xf.to_screen(full_x, full_y);
+            vec![(0, a + (b - a) * 0.5), (1, a), (2, b)]
+        }
+        MaskGeometry::Radial { top, left, bottom, right, .. } => {
+            let (cx, cy) = ((left + right) / 2.0, (top + bottom) / 2.0);
+            vec![
+                (0, xf.to_screen(cx, cy)),
+                (1, xf.to_screen(left, cy)),
+                (2, xf.to_screen(cx, top)),
+                (3, xf.to_screen(right, cy)),
+                (4, xf.to_screen(cx, bottom)),
+            ]
+        }
+        MaskGeometry::Bitmap { .. } => Vec::new(),
+    }
+}
+
 /// Scale `tex_size` to fit a `max_w` × `avail_y` box (both dimensions — width
 /// alone lets a portrait overflow the panel), never upscaling past 4×.
 fn fit_in(tex_size: egui::Vec2, max_w: f32, avail_y: f32) -> egui::Vec2 {
@@ -519,6 +548,7 @@ struct AutoshopApp {
     crop_mode: bool,                       // the crop overlay is active on the After image
     crop_aspect: usize,                    // index into CROP_ASPECTS
     crop_drag: Option<(u8, egui::Pos2, [f32; 4])>, // (handle, drag start, crop at start)
+    mask_drag: Option<(u8, (f32, f32))>, // on-image mask knob drag: (handle, last pos in ORIG norm)
     // --- manual local adjustments (masks) ---
     sel_mask: Option<usize>,               // selected recipe.masks index (overlay + sliders)
     placing_mask: Option<(MaskKind, Option<usize>)>, // next image drag defines a mask (replace idx)
@@ -656,6 +686,7 @@ impl Default for AutoshopApp {
             crop_mode: false,
             crop_aspect: 0,
             crop_drag: None,
+            mask_drag: None,
             sel_mask: None,
             placing_mask: None,
             place_start: None,
@@ -3071,10 +3102,36 @@ impl AutoshopApp {
             }
         }
 
-        // --- pan: middle-drag, or Space + left-drag (the Photoshop gesture) ---
+        // --- pan: middle-drag, Space + left-drag, or (the LR gesture) a plain
+        // left-drag while ZOOMED IN — a zoomed-in drag means "pan" in every
+        // photo editor, and requiring Space for it was a top "feels off".
+        // Box-select stays reachable while zoomed via Ctrl+drag; an active
+        // tool, a mask-knob hover/drag or a box drag in flight all take
+        // priority over the implicit pan.
         let space = ui.input(|i| i.key_down(egui::Key::Space));
+        let ctrl = ui.input(|i| i.modifiers.command);
+        let tool_active = self.crop_mode
+            || self.placing_mask.is_some()
+            || self.wb_picking
+            || self.range_picking.is_some()
+            || self.clone_mode
+            || self.paint_mode;
+        let over_knob = self.mask_drag.is_some()
+            || self.sel_mask.and_then(|i| self.recipe.masks.get(i)).is_some_and(|m| {
+                let (dims, deg, dist) = self.geom_ctx();
+                resp.hover_pos().is_some_and(|p| {
+                    mask_handle_points(&geom_to_view(&m.mask, dims, deg, dist), xf)
+                        .iter()
+                        .any(|(_, hp)| hp.distance(p) <= HANDLE_HIT)
+                })
+            });
+        let zoom_pan = self.zoom > 1.001
+            && !tool_active
+            && !ctrl
+            && !over_knob
+            && self.region_drag.is_none();
         let panning = resp.dragged_by(egui::PointerButton::Middle)
-            || (space && resp.dragged_by(egui::PointerButton::Primary));
+            || ((space || zoom_pan) && resp.dragged_by(egui::PointerButton::Primary));
         if panning {
             let d = resp.drag_delta();
             let ext = 1.0 / self.zoom; // visible extent in crop-window coords
@@ -3089,7 +3146,7 @@ impl AutoshopApp {
         // handlers; this covers the hand for panning and the drawing tools.
         if panning {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-        } else if space && resp.hovered() {
+        } else if (space || zoom_pan) && resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         } else if resp.hovered()
             && (self.paint_mode || self.placing_mask.is_some() || self.crop_mode)
@@ -3123,17 +3180,29 @@ impl AutoshopApp {
                 ui.painter_at(rect).image(t.id(), rect, uv, egui::Color32::WHITE);
             }
         } else {
-            self.handle_region_select(ui, &resp, xf);
+            // The selected mask's on-image knobs take priority over box-select
+            // (a knob hit means "edit the mask", never "start a region").
+            if !self.handle_mask_edit(ui, &resp, xf) {
+                self.handle_region_select(ui, &resp, xf);
+            }
         }
 
         // Selected mask stays visualised so its sliders have visual feedback
-        // (geometry is stored in the original frame → map into the view).
+        // (geometry is stored in the original frame → map into the view),
+        // with the editing knobs on top (drag = reshape/move, handle_mask_edit).
         if !self.crop_mode
             && self.placing_mask.is_none()
             && let Some(m) = self.sel_mask.and_then(|i| self.recipe.masks.get(i))
         {
             let (dims, deg, dist) = self.geom_ctx();
-            draw_mask_overlay(ui, xf, &geom_to_view(&m.mask, dims, deg, dist));
+            let vg = geom_to_view(&m.mask, dims, deg, dist);
+            draw_mask_overlay(ui, xf, &vg);
+            let p = ui.painter_at(xf.rect);
+            for (h, pos) in mask_handle_points(&vg, xf) {
+                let r = if h == 0 { 5.5 } else { 4.5 }; // centre knob reads bigger
+                p.circle_filled(pos, r, egui::Color32::WHITE);
+                p.circle_stroke(pos, r, egui::Stroke::new(1.5, ACCENT));
+            }
         }
     }
 
@@ -3250,6 +3319,93 @@ impl AutoshopApp {
     /// there (mirrors the web region→mask prompt). A plain click — or a tiny
     /// drag — clears the selection. Coordinates are full-frame normalized (the
     /// AI mask space), mapped through the view transform.
+    /// On-image editing of the SELECTED mask's geometry (the LR gesture):
+    /// drag an end/edge knob to reshape, the centre knob to move the whole
+    /// mask — no more redraw-from-scratch via 重画. Geometry lives in the
+    /// ORIGINAL frame, so every write maps the pointer back through
+    /// view_norm_to_orig — the same chain placement uses. Returns true while
+    /// it owns the pointer (hovering a knob or mid-drag) so box-select
+    /// doesn't also react; a box-select drag already in flight keeps
+    /// priority (else its live rectangle would freeze mid-air whenever the
+    /// pointer crossed a knob).
+    fn handle_mask_edit(&mut self, ui: &egui::Ui, resp: &egui::Response, xf: ViewXform) -> bool {
+        if self.region_drag.is_some() {
+            return false;
+        }
+        let Some(i) = self.sel_mask.filter(|&i| i < self.recipe.masks.len()) else {
+            self.mask_drag = None;
+            return false;
+        };
+        let (dims, deg, dist) = self.geom_ctx();
+        let view_geom = geom_to_view(&self.recipe.masks[i].mask, dims, deg, dist);
+        let handles = mask_handle_points(&view_geom, xf);
+        if handles.is_empty() {
+            self.mask_drag = None; // bitmap: nothing parametric to drag
+            return false;
+        }
+        let hover_h = resp.hover_pos().and_then(|p| {
+            handles.iter().find(|(_, hp)| hp.distance(p) <= HANDLE_HIT).map(|(h, _)| *h)
+        });
+        let orig_at = |p: egui::Pos2| {
+            let (nx, ny) = xf.to_norm(p);
+            view_norm_to_orig(nx, ny, dims, deg, dist)
+        };
+        if resp.drag_started()
+            && let (Some(h), Some(p)) = (hover_h, resp.interact_pointer_pos())
+        {
+            self.mask_drag = Some((h, orig_at(p)));
+        }
+        if resp.dragged()
+            && let (Some((h, last)), Some(p)) = (self.mask_drag, resp.interact_pointer_pos())
+        {
+            let cur = orig_at(p);
+            let (dx, dy) = (cur.0 - last.0, cur.1 - last.1);
+            // LR allows geometry to start off-canvas; a generous band keeps
+            // knobs recoverable instead of letting them fly to infinity.
+            let cl = |v: f32| v.clamp(-0.5, 1.5);
+            match &mut self.recipe.masks[i].mask {
+                MaskGeometry::Linear { zero_x, zero_y, full_x, full_y } => match h {
+                    1 => (*zero_x, *zero_y) = (cl(cur.0), cl(cur.1)),
+                    2 => (*full_x, *full_y) = (cl(cur.0), cl(cur.1)),
+                    _ => {
+                        *zero_x = cl(*zero_x + dx);
+                        *zero_y = cl(*zero_y + dy);
+                        *full_x = cl(*full_x + dx);
+                        *full_y = cl(*full_y + dy);
+                    }
+                },
+                MaskGeometry::Radial { top, left, bottom, right, .. } => {
+                    const MIN_SIZE: f32 = 0.01;
+                    match h {
+                        1 => *left = cl(cur.0).min(*right - MIN_SIZE),
+                        2 => *top = cl(cur.1).min(*bottom - MIN_SIZE),
+                        3 => *right = cl(cur.0).max(*left + MIN_SIZE),
+                        4 => *bottom = cl(cur.1).max(*top + MIN_SIZE),
+                        _ => {
+                            *left = cl(*left + dx);
+                            *right = cl(*right + dx);
+                            *top = cl(*top + dy);
+                            *bottom = cl(*bottom + dy);
+                        }
+                    }
+                }
+                MaskGeometry::Bitmap { .. } => {}
+            }
+            self.mask_drag = Some((h, cur));
+            self.dirty = true; // masks are develop stages — live preview
+            self.overlay_stale = true;
+        }
+        if resp.drag_stopped() {
+            self.mask_drag = None; // commit_if_settled turns the drag into ONE undo step
+        }
+        if self.mask_drag.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if hover_h.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+        self.mask_drag.is_some() || hover_h.is_some()
+    }
+
     fn handle_region_select(&mut self, ui: &egui::Ui, resp: &egui::Response, xf: ViewXform) {
         let rect = xf.rect;
         if resp.drag_started() {
@@ -4192,7 +4348,13 @@ impl eframe::App for AutoshopApp {
         }
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            // BOTH toolbar rows wrap: a plain horizontal row CLIPS whatever
+            // falls past the window edge (the "shrink the window and lose
+            // the buttons" bug). horizontal_wrapped only wraps between
+            // ATOMIC widget allocations — nested add_enabled_ui scopes get
+            // squeezed at the row edge instead of wrapping — so the enabled
+            // gating is per-widget (ui.add_enabled) rather than per-group.
+            ui.horizontal_wrapped(|ui| {
                 ui.heading("Autoshop");
                 ui.separator();
                 // Live batch-render progress (full-res develops take seconds
@@ -4212,29 +4374,31 @@ impl eframe::App for AutoshopApp {
                     self.open_path(path);
                 }
                 let ready = self.src_path.is_some() && !self.busy;
-                ui.add_enabled_ui(ready, |ui| {
-                    if ui.button("✨ AI Analyze").clicked() {
-                        self.start_analyze();
-                    }
-                    ui.checkbox(&mut self.refine, "Refine")
-                        .on_hover_text("Adjust the CURRENT edit instead of proposing from scratch");
-                    if ui.button("Reset").clicked() {
-                        self.recipe = EditRecipe::default();
-                        self.region = None;
-                        self.dirty = true;
-                    }
-                    ui.separator();
-                    ui.add_enabled_ui(!self.undo_stack.is_empty(), |ui| {
-                        if ui.button("↶ Undo").on_hover_text("Ctrl+Z").clicked() {
-                            self.undo();
-                        }
-                    });
-                    ui.add_enabled_ui(!self.redo_stack.is_empty(), |ui| {
-                        if ui.button("↷ Redo").on_hover_text("Ctrl+Y").clicked() {
-                            self.redo();
-                        }
-                    });
-                });
+                if ui.add_enabled(ready, egui::Button::new("✨ AI Analyze")).clicked() {
+                    self.start_analyze();
+                }
+                ui.add_enabled(ready, egui::Checkbox::new(&mut self.refine, "Refine"))
+                    .on_hover_text("Adjust the CURRENT edit instead of proposing from scratch");
+                if ui.add_enabled(ready, egui::Button::new("Reset")).clicked() {
+                    self.recipe = EditRecipe::default();
+                    self.region = None;
+                    self.dirty = true;
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(ready && !self.undo_stack.is_empty(), egui::Button::new("↶ Undo"))
+                    .on_hover_text("Ctrl+Z")
+                    .clicked()
+                {
+                    self.undo();
+                }
+                if ui
+                    .add_enabled(ready && !self.redo_stack.is_empty(), egui::Button::new("↷ Redo"))
+                    .on_hover_text("Ctrl+Y")
+                    .clicked()
+                {
+                    self.redo();
+                }
                 ui.separator();
                 ui.label("Style");
                 ui.add(egui::Slider::new(&mut self.style_strength, 0.0..=1.0).show_value(false));
@@ -4251,8 +4415,12 @@ impl eframe::App for AutoshopApp {
                     self.load_settings_form();
                 }
             });
-            // AI direction (free text) + save options.
-            ui.horizontal(|ui| {
+            // AI direction (free text) + save options. Export SETTINGS
+            // (format / size / sharpen / colour space) stay editable with no
+            // photo open — they're persisted preferences; only the ACTIONS
+            // (Export / Download / Save XMP) gate on a ready photo. That also
+            // keeps every widget an atomic allocation so the row can wrap.
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Direction:");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.guidance)
@@ -4260,76 +4428,70 @@ impl eframe::App for AutoshopApp {
                         .hint_text("e.g. warmer and moodier, lift the shadows"),
                 );
                 let ready = self.src_path.is_some() && !self.busy;
-                ui.add_enabled_ui(ready, |ui| {
-                    ui.separator();
-                    egui::ComboBox::from_id_salt("save_fmt")
-                        .selected_text(if self.save_jpeg { "JPEG" } else { "16-bit TIFF" })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.save_jpeg, false, "16-bit TIFF");
-                            ui.selectable_value(&mut self.save_jpeg, true, "JPEG");
-                        });
-                    // --- delivery pipeline (gap batch F): resize → sharpen → quality ---
-                    ui.horizontal(|ui| {
-                        ui.label("长边");
-                        egui::ComboBox::from_id_salt("exp_long_edge")
-                            .selected_text(if self.exp_long_edge == 0 {
-                                "原尺寸".to_string()
-                            } else {
-                                format!("{} px", self.exp_long_edge)
-                            })
-                            .width(86.0)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.exp_long_edge, 0, "原尺寸");
-                                for px in [1600u32, 2048, 2560, 3840, 5120] {
-                                    ui.selectable_value(&mut self.exp_long_edge, px, format!("{px} px"));
-                                }
-                            });
+                ui.separator();
+                egui::ComboBox::from_id_salt("save_fmt")
+                    .selected_text(if self.save_jpeg { "JPEG" } else { "16-bit TIFF" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.save_jpeg, false, "16-bit TIFF");
+                        ui.selectable_value(&mut self.save_jpeg, true, "JPEG");
                     });
-                    Self::slider(ui, "输出锐化", &mut self.exp_sharpen, 0.0, 100.0, 0.0);
-                    if self.save_jpeg {
-                        Self::slider(ui, "JPEG 质量", &mut self.exp_quality, 60.0, 100.0, 95.0);
-                    }
-                    // --- delivery color space (gap batch D2): a real gamut
-                    // transform + matching embedded profile, not a tag swap.
-                    ui.horizontal(|ui| {
-                        ui.label("色彩空间");
-                        const SPACES: [&str; 3] = ["sRGB（通用）", "Display P3（广色域屏）", "Adobe RGB（印刷）"];
-                        egui::ComboBox::from_id_salt("exp_space")
-                            .selected_text(SPACES[(self.exp_space as usize).min(2)])
-                            .width(170.0)
-                            .show_ui(ui, |ui| {
-                                for (i, name) in SPACES.iter().enumerate() {
-                                    ui.selectable_value(&mut self.exp_space, i as u8, *name);
-                                }
-                            });
-                    });
-                    ui.checkbox(&mut self.save_denoise, "AI Denoise").on_hover_text(
-                        "SCUNet AI denoise before developing — high-ISO / astro (slow, GPU; needs the python sidecar)",
-                    );
-                    if ui.button("Export → ./out").clicked() {
-                        self.start_export();
-                    }
-                    if ui.button("Download…").clicked() {
-                        let ext = if self.save_jpeg { "jpg" } else { "tif" };
-                        let stem = self
-                            .src_path
-                            .as_deref()
-                            .and_then(|p| p.file_stem())
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("photo")
-                            .to_string();
-                        if let Some(p) = rfd::FileDialog::new()
-                            .add_filter(ext, &[ext])
-                            .set_file_name(format!("{stem}.developed.{ext}"))
-                            .save_file()
-                        {
-                            self.start_render_to(p);
+                // --- delivery pipeline (gap batch F): resize → sharpen → quality ---
+                ui.label("长边");
+                egui::ComboBox::from_id_salt("exp_long_edge")
+                    .selected_text(if self.exp_long_edge == 0 {
+                        "原尺寸".to_string()
+                    } else {
+                        format!("{} px", self.exp_long_edge)
+                    })
+                    .width(86.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.exp_long_edge, 0, "原尺寸");
+                        for px in [1600u32, 2048, 2560, 3840, 5120] {
+                            ui.selectable_value(&mut self.exp_long_edge, px, format!("{px} px"));
                         }
+                    });
+                Self::slider(ui, "输出锐化", &mut self.exp_sharpen, 0.0, 100.0, 0.0);
+                if self.save_jpeg {
+                    Self::slider(ui, "JPEG 质量", &mut self.exp_quality, 60.0, 100.0, 95.0);
+                }
+                // --- delivery color space (gap batch D2): a real gamut
+                // transform + matching embedded profile, not a tag swap.
+                ui.label("色彩空间");
+                const SPACES: [&str; 3] = ["sRGB（通用）", "Display P3（广色域屏）", "Adobe RGB（印刷）"];
+                egui::ComboBox::from_id_salt("exp_space")
+                    .selected_text(SPACES[(self.exp_space as usize).min(2)])
+                    .width(170.0)
+                    .show_ui(ui, |ui| {
+                        for (i, name) in SPACES.iter().enumerate() {
+                            ui.selectable_value(&mut self.exp_space, i as u8, *name);
+                        }
+                    });
+                ui.checkbox(&mut self.save_denoise, "AI Denoise").on_hover_text(
+                    "SCUNet AI denoise before developing — high-ISO / astro (slow, GPU; needs the python sidecar)",
+                );
+                if ui.add_enabled(ready, egui::Button::new("Export → ./out")).clicked() {
+                    self.start_export();
+                }
+                if ui.add_enabled(ready, egui::Button::new("Download…")).clicked() {
+                    let ext = if self.save_jpeg { "jpg" } else { "tif" };
+                    let stem = self
+                        .src_path
+                        .as_deref()
+                        .and_then(|p| p.file_stem())
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("photo")
+                        .to_string();
+                    if let Some(p) = rfd::FileDialog::new()
+                        .add_filter(ext, &[ext])
+                        .set_file_name(format!("{stem}.developed.{ext}"))
+                        .save_file()
+                    {
+                        self.start_render_to(p);
                     }
-                    if ui.button("Save XMP").clicked() {
-                        self.save_xmp();
-                    }
-                });
+                }
+                if ui.add_enabled(ready, egui::Button::new("Save XMP")).clicked() {
+                    self.save_xmp();
+                }
             });
         });
 
@@ -4582,6 +4744,9 @@ fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 880.0])
+            // Below this the wrapped toolbar rows + two side panels leave no
+            // usable canvas; wrapping (not clipping) covers everything above.
+            .with_min_inner_size([980.0, 620.0])
             .with_title("Autoshop")
             .with_icon(std::sync::Arc::new(app_icon())),
         ..Default::default()
