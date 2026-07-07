@@ -311,6 +311,24 @@ fn drag_curve_point(pts: &mut [CurvePoint], i: usize, input: u8, output: u8) {
     pts[i].output = output;
 }
 
+/// Drag-reorder bookkeeping: element `from` moves to sit before `insert`
+/// (both indices in the PRE-move order; `insert == len` appends). Returns the
+/// element's final index plus the remap for every OTHER stored index (e.g.
+/// the selection), composed as remove-at-`from` then insert-at-`to`.
+/// `insert == from` and `insert == from + 1` are the two no-op drop slots —
+/// callers skip the move entirely for those.
+fn reorder_move(from: usize, insert: usize) -> (usize, impl Fn(usize) -> usize) {
+    let to = if insert > from { insert - 1 } else { insert };
+    (to, move |s: usize| {
+        if s == from {
+            to
+        } else {
+            let after_rm = if s > from { s - 1 } else { s };
+            if after_rm >= to { after_rm + 1 } else { after_rm }
+        }
+    })
+}
+
 // --- geometric coordinate mapping (straighten + distortion) ------------------
 // When straighten_deg ≠ 0 or lens_distortion ≠ 0 the After view shows the
 // geometrically transformed frame (original → distortion-corrected →
@@ -1385,29 +1403,49 @@ impl AutoshopApp {
             .collect();
         p.add(egui::Shape::line(pts, egui::Stroke::new(1.0, egui::Color32::from_gray(210))));
 
-        // Clipping triangles: shadows top-left (blue when the darkest bin has
-        // any channel counts), highlights top-right (red when the brightest
-        // does). Grey when clean; click = the same toggle as ▲ / J.
-        let lit_sh = hist[0][..3].iter().any(|v| *v > 0.0);
-        let lit_hi = hist[hist.len() - 1][..3].iter().any(|v| *v > 0.0);
+        // Clipping triangles, per-channel (the LR convention): the colour
+        // names WHICH channels sit in the extreme bin — one channel reads as
+        // that primary, two mix to yellow/magenta/cyan, all three to white
+        // (a neutral crush/blow-out vs. a colour cast at a glance). Shadows
+        // top-left, highlights top-right; grey when clean; click = the same
+        // toggle as ▲ / J.
+        let tri_color = |bins: &[f32; 4]| -> Option<egui::Color32> {
+            let (r, g, b) = (bins[0] > 0.0, bins[1] > 0.0, bins[2] > 0.0);
+            (r || g || b).then(|| {
+                let c = |on: bool| if on { 255u8 } else { 45 };
+                egui::Color32::from_rgb(c(r), c(g), c(b))
+            })
+        };
+        let chan_names = |bins: &[f32; 4]| -> String {
+            ["R", "G", "B"]
+                .iter()
+                .zip(bins)
+                .filter(|(_, v)| **v > 0.0)
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>()
+                .join("+")
+        };
         let mut toggle = false;
-        for (right, lit, tip) in [
-            (false, lit_sh, "阴影死黑指示 — 点击切换削波警告 (J)"),
-            (true, lit_hi, "高光溢出指示 — 点击切换削波警告 (J)"),
+        for (right, bins, what) in [
+            (false, &hist[0], "阴影死黑"),
+            (true, &hist[hist.len() - 1], "高光溢出"),
         ] {
             let s = 10.0;
             let x0 = if right { rect.max.x - s - 4.0 } else { rect.min.x + 4.0 };
             let tri = egui::Rect::from_min_size(egui::pos2(x0, rect.min.y + 4.0), egui::vec2(s, s));
+            let lit = tri_color(bins);
+            let tip = match lit {
+                Some(_) => format!("{}：{} 通道 — 点击切换削波警告 (J)", what, chan_names(bins)),
+                None => format!("{}指示（干净）— 点击切换削波警告 (J)", what),
+            };
             let resp = ui
                 .interact(tri, ui.id().with(("clip_tri", right)), egui::Sense::click())
                 .on_hover_text(tip);
-            let color = if lit {
-                if right { egui::Color32::from_rgb(255, 90, 90) } else { egui::Color32::from_rgb(110, 150, 255) }
-            } else if self.show_clipping {
+            let color = lit.unwrap_or(if self.show_clipping {
                 egui::Color32::from_gray(130)
             } else {
                 egui::Color32::from_gray(60)
-            };
+            });
             p.add(egui::Shape::convex_polygon(
                 vec![
                     egui::pos2(tri.center().x, tri.min.y),
@@ -2594,7 +2632,13 @@ impl AutoshopApp {
             // list re-sets it while the cursor is on a row — so leaving the
             // panel, collapsing this section or switching photos all fall back
             // to the selection with no stale index to chase.
+            // Rows are also DRAG SOURCES: drag one over another and release to
+            // reorder (order is render semantics — masks stack sequentially).
+            // egui clears the payload on release/Esc itself, and while a drag
+            // is in flight `hovered()` is false everywhere, so the hover
+            // preview pauses instead of churning the coverage overlay.
             let mut delete: Option<usize> = None;
+            let mut dropped: Option<(usize, usize)> = None; // (from, insert-before)
             for i in 0..n_masks {
                 ui.horizontal(|ui| {
                     let m = &self.recipe.masks[i];
@@ -2604,7 +2648,10 @@ impl AutoshopApp {
                         MaskGeometry::Bitmap { .. } => "位图",
                     };
                     let label = format!("{} · {}", if m.name.is_empty() { "mask" } else { &m.name }, kind);
-                    let row = ui.selectable_label(self.sel_mask == Some(i), label);
+                    let egui::InnerResponse { inner: row, response: drag } = ui
+                        .dnd_drag_source(ui.id().with(("mask_row", i)), i, |ui| {
+                            ui.selectable_label(self.sel_mask == Some(i), label)
+                        });
                     if row.hovered() {
                         self.hover_mask = Some(i);
                     }
@@ -2612,10 +2659,38 @@ impl AutoshopApp {
                         self.sel_mask = if self.sel_mask == Some(i) { None } else { Some(i) };
                         self.overlay_stale = true; // coverage follows the selection
                     }
+                    // A row being dragged over this one: mark the insertion
+                    // edge (above/below the midline) and take the drop.
+                    if let (Some(from), Some(p)) =
+                        (drag.dnd_hover_payload::<usize>(), ui.ctx().pointer_interact_pos())
+                    {
+                        let below = p.y > drag.rect.center().y;
+                        let y = if below { drag.rect.max.y } else { drag.rect.min.y };
+                        ui.painter().hline(
+                            drag.rect.x_range(),
+                            y,
+                            egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
+                        );
+                        let insert = if below { i + 1 } else { i };
+                        if drag.dnd_release_payload::<usize>().is_some() {
+                            dropped = Some((*from, insert));
+                        }
+                    }
                     if ui.small_button("🗑").clicked() {
                         delete = Some(i);
                     }
                 });
+            }
+            if let Some((from, insert)) = dropped
+                && insert != from
+                && insert != from + 1
+            {
+                let (to, remap) = reorder_move(from, insert);
+                let m = self.recipe.masks.remove(from);
+                self.recipe.masks.insert(to, m);
+                self.sel_mask = self.sel_mask.map(remap);
+                self.overlay_stale = true;
+                changed = true;
             }
             if let Some(i) = delete {
                 self.recipe.masks.remove(i);
@@ -3256,28 +3331,29 @@ impl AutoshopApp {
             .map(|r| if r == 0.0 { tex_size.x / tex_size.y.max(1.0) } else { r });
 
         // Handle order: 0=TL 1=TR 2=BL 3=BR, 4=move (inside).
+        const HIT: f32 = 12.0; // handle pick radius, px — shared by drag + cursor
         let corner_pos = |c: &[f32; 4], k: u8| match k {
             0 => xf.to_screen(c[0], c[1]),
             1 => xf.to_screen(c[2], c[1]),
             2 => xf.to_screen(c[0], c[3]),
             _ => xf.to_screen(c[2], c[3]),
         };
-        if resp.drag_started()
-            && let Some(p) = resp.interact_pointer_pos()
-        {
-            const HIT: f32 = 12.0;
-            let handle = (0..4)
-                .find(|&k| corner_pos(&cur, k).distance(p) <= HIT)
+        let pick_handle = |c: &[f32; 4], p: egui::Pos2| {
+            (0..4)
+                .find(|&k| corner_pos(c, k).distance(p) <= HIT)
                 .or_else(|| {
                     let r = egui::Rect::from_min_max(
-                        xf.to_screen(cur[0], cur[1]),
-                        xf.to_screen(cur[2], cur[3]),
+                        xf.to_screen(c[0], c[1]),
+                        xf.to_screen(c[2], c[3]),
                     );
                     r.contains(p).then_some(4)
-                });
-            if let Some(h) = handle {
-                self.crop_drag = Some((h, p, cur));
-            }
+                })
+        };
+        if resp.drag_started()
+            && let Some(p) = resp.interact_pointer_pos()
+            && let Some(h) = pick_handle(&cur, p)
+        {
+            self.crop_drag = Some((h, p, cur));
         }
         if resp.dragged()
             && let (Some((h, start, orig)), Some(p)) = (self.crop_drag, resp.interact_pointer_pos())
@@ -3334,12 +3410,29 @@ impl AutoshopApp {
             self.crop_drag = None;
         }
 
-        // --- overlay: darkened surround + thirds + handles --------------------
+        // Cursor affordance: name the resize direction of the handle under
+        // the pointer — or of the one being DRAGGED, since the pointer can
+        // lag off a corner mid-drag. Runs after show_image's generic
+        // crosshair set, and cursor_icon is last-write-wins, so this
+        // overrides it exactly when a handle would take the drag.
         let c = self
             .recipe
             .crop
             .map(|c| [c.left, c.top, c.right, c.bottom])
             .unwrap_or([0.0, 0.0, 1.0, 1.0]);
+        let hover_handle = self
+            .crop_drag
+            .map(|(h, ..)| h)
+            .or_else(|| resp.hover_pos().and_then(|p| pick_handle(&c, p)));
+        if let Some(h) = hover_handle {
+            ui.ctx().set_cursor_icon(match h {
+                0 | 3 => egui::CursorIcon::ResizeNwSe, // TL/BR diagonal
+                1 | 2 => egui::CursorIcon::ResizeNeSw, // TR/BL diagonal
+                _ => egui::CursorIcon::Move,           // inside: move the window
+            });
+        }
+
+        // --- overlay: darkened surround + thirds + handles --------------------
         let p = ui.painter_at(xf.rect);
         let r = egui::Rect::from_min_max(xf.to_screen(c[0], c[1]), xf.to_screen(c[2], c[3]))
             .intersect(xf.rect);
@@ -4589,6 +4682,35 @@ mod tests {
         // The channel selector reaches the right recipe field (master only here).
         for ch in 0..4 {
             assert_eq!(curve_points(&r, ch).len(), if ch == 0 { 3 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn reorder_move_remap_matches_actual_remove_insert() {
+        // The remap returned by reorder_move must agree with what physically
+        // happens to a vec under remove(from) + insert(to) — for EVERY
+        // element, every (from, insert) pair, including the append slot
+        // (insert == len). The two no-op slots are the caller's guard.
+        for len in 1..=5usize {
+            for from in 0..len {
+                for insert in 0..=len {
+                    if insert == from || insert == from + 1 {
+                        continue; // no-op drop slots, skipped by the GUI
+                    }
+                    let mut v: Vec<usize> = (0..len).collect();
+                    let (to, remap) = reorder_move(from, insert);
+                    let m = v.remove(from);
+                    v.insert(to, m);
+                    for orig in 0..len {
+                        let now = v.iter().position(|&x| x == orig).unwrap();
+                        assert_eq!(
+                            remap(orig),
+                            now,
+                            "len {len} from {from} insert {insert}: element {orig}"
+                        );
+                    }
+                }
+            }
         }
     }
 }
