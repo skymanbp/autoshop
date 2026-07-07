@@ -23,11 +23,13 @@
 - **差距批次 C 第一片 暗角补偿已完成**（见 §C ◐ 小节：线性光域径向增益 +
   GUI 镜头校正区 + XMP VignetteAmount/Midpoint，63 lib 测试）。C 第二片
   （k1/k2 畸变）牵动坐标空间约定，须整体设计。
+- **差距批次 D 第一步 导出嵌 sRGB ICC 已完成**（见 §D ◐ 小节：三格式
+  显式编码器 + CC0 profile 入库，64 lib 测试）。
 - 更早已上线：反推配方（`fit.rs` + CLI `match`）、gpt-image-2 弹性高分辨率
   （≤8.3MP + 400 回退）、风格提示词提取、GUI 生产化（直方图/toast/快捷键/
   拖拽/持久化/折叠分组/双击归零）。
-- **下一步按 §与 Photoshop 的核心差距 的顺序：C 第二片（畸变，需先做
-  坐标映射设计）或 D 色管 → G 版本（A② AI 分割可穿插）。**
+- **下一步：G 版本快照（配方多版本 ≈ LR 虚拟副本）或 C 第二片畸变
+  （需先做坐标映射设计）；A② AI 分割可穿插。**
 - 待用户真机验收：曲线拖拽/吸管/图章/拉直/范围蒙版手感；「以此母版继续
   修图」链路（修补→动滑杆→再修补→导出）；导出长边/锐化/质量 + 批量
   渲染选中；持久化"正常关闭→重启恢复"；范围蒙版 XMP 在真 Lightroom
@@ -171,10 +173,16 @@
   去紫边（需边缘邻近门控，防误伤紫色主体）；透视 Upright；lensfun 长期项。
 - AI advisor 暂不暴露镜头字段（校正是测量性操作，非审美建议；schema 未加）。
 
-### D. 色彩管理
-- 现状：全程 sRGB gamma（render.rs 管线），导出不嵌 ICC，egui 显示端无色管
-  （广色域屏会偏饱和）。
-- 路径：先导出嵌 sRGB profile，再谈 P3/AdobeRGB 输出选项；显示端受 egui 限制。
+### D. 色彩管理（◐ 第一步 导出嵌 sRGB ICC ✅ 2026-07-06）
+- **导出嵌 ICC ✅**：`render_to_file` 三种格式全部显式编码器 + `tag_srgb`
+  （render.rs）——JPEG=APP2 ICC_PROFILE 段、PNG=iCCP 块、TIFF=tag 34675；
+  profile 用 saucecontrol/Compact-ICC-Profiles 的 `sRGB-v2-magic.icc`
+  （736 B，**CC0-1.0 公有领域**，assets/ 下入库；下载时验证 acsp 签名 +
+  repo license API 实证）。单测逐格式验证 marker 字节存在。image 0.25.10
+  三个编码器的 `set_icc_profile` 实现已核对（真存储非 Unsupported）。
+- **未做**：P3/AdobeRGB 输出选项（需真正的 gamut 变换，不只换 tag）；
+  egui 显示端色管（上游限制）；retouch 母版 PNG 的 ICC（工作文件，
+  导出时会再过 render_to_file 补 tag）。
 
 ### E. 1:1 真像素检查（✅ 已完成 2026-07-06）
 - 现状（旧）：预览固定 1280px（gui.rs `PREVIEW_EDGE`），「1:1」= 预览像素。

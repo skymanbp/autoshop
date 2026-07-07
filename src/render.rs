@@ -183,12 +183,31 @@ impl Default for ExportOpts {
     }
 }
 
+/// Compact sRGB v2 ICC profile (736 bytes) embedded in every export: the whole
+/// pipeline works in sRGB, and an UNTAGGED file makes wide-gamut displays guess
+/// — typically stretching the colors to the panel gamut (oversaturation).
+/// Source: saucecontrol/Compact-ICC-Profiles `sRGB-v2-magic.icc`, licensed
+/// CC0-1.0 (public domain) — redistribution in this public repo is fine.
+const SRGB_ICC: &[u8] = include_bytes!("../assets/sRGB-v2-magic.icc");
+
+/// Tag an encoder's output as sRGB. Never fails on jpeg/png/tiff in image
+/// 0.25 (their `set_icc_profile` impls store the profile unconditionally —
+/// verified in the crate source); if a future version regresses, the pixels
+/// are still correct sRGB, just untagged — so warn instead of failing the
+/// whole export.
+fn tag_srgb<E: ImageEncoder>(enc: &mut E) {
+    if let Err(e) = enc.set_icc_profile(SRGB_ICC.to_vec()) {
+        eprintln!("⚠ could not embed the sRGB ICC profile: {e:?}");
+    }
+}
+
 /// Render and save to `out` at the highest fidelity the format allows:
 /// `.tif`/`.png` keep the full **16-bit** depth; `.jpg` downconverts to 8-bit.
-/// Extension picks the format. Dispatches RAW (demosaic engine) vs baked image
-/// (the PNG-source engine) automatically. `export` adds the delivery pipeline
-/// (resize / output sharpen / JPEG quality); `None` = full-res q95 as always.
-/// Returns the SAVED dimensions (post-resize).
+/// Every export is TAGGED sRGB (see [`SRGB_ICC`]). Extension picks the format.
+/// Dispatches RAW (demosaic engine) vs baked image (the PNG-source engine)
+/// automatically. `export` adds the delivery pipeline (resize / output sharpen
+/// / JPEG quality); `None` = full-res q95 as always. Returns the SAVED
+/// dimensions (post-resize).
 pub fn render_to_file(
     src_path: &Path,
     recipe: &EditRecipe,
@@ -235,18 +254,35 @@ pub fn render_to_file(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    let create = |p: &Path| {
+        std::fs::File::create(p)
+            .map(std::io::BufWriter::new)
+            .with_context(|| format!("create {}", p.display()))
+    };
     match ext.as_str() {
         "jpg" | "jpeg" => {
             // JPEG is 8-bit only — downconvert from 16-bit.
             let rgb8 = img.to_rgb8();
-            let file = std::fs::File::create(out)
-                .with_context(|| format!("create {}", out.display()))?;
-            let mut w = std::io::BufWriter::new(file);
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut w, opts.jpeg_quality.clamp(1, 100))
-                .write_image(rgb8.as_raw(), rgb8.width(), rgb8.height(), image::ExtendedColorType::Rgb8)
+            let mut wr = create(out)?;
+            let mut enc =
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut wr, opts.jpeg_quality.clamp(1, 100));
+            tag_srgb(&mut enc);
+            enc.write_image(rgb8.as_raw(), rgb8.width(), rgb8.height(), image::ExtendedColorType::Rgb8)
                 .with_context(|| format!("encode jpeg {}", out.display()))?;
         }
-        // .tif / .png (and anything else) keep the full 16-bit data.
+        "tif" | "tiff" => {
+            let mut enc = image::codecs::tiff::TiffEncoder::new(create(out)?);
+            tag_srgb(&mut enc);
+            img.write_with_encoder(enc)
+                .with_context(|| format!("encode tiff {}", out.display()))?;
+        }
+        "png" => {
+            let mut enc = image::codecs::png::PngEncoder::new(create(out)?);
+            tag_srgb(&mut enc);
+            img.write_with_encoder(enc)
+                .with_context(|| format!("encode png {}", out.display()))?;
+        }
+        // Unknown extensions keep the generic 16-bit save (no ICC tag).
         _ => img
             .save(out)
             .with_context(|| format!("save render {}", out.display()))?,
@@ -1481,6 +1517,31 @@ mod tests {
         assert!(spread(data[1]) < 0.05, "dark orange (same hue) must desaturate: {:?}", data[1]);
         assert_eq!(data[2], control[2], "opposite hue: the mask must skip it");
         assert_eq!(data[3], control[3], "neutral grey: the mask must skip it");
+    }
+
+    #[test]
+    fn exports_are_tagged_srgb_in_all_three_formats() {
+        // Every export format must carry the sRGB profile: JPEG in an APP2
+        // "ICC_PROFILE" segment, PNG in an iCCP chunk, TIFF as the raw profile
+        // (tag 34675) whose header signature is "acsp".
+        std::fs::create_dir_all("out").ok();
+        let src_p = std::path::Path::new("out/_icc_src.png");
+        RgbImage::from_fn(32, 16, |x, y| Rgb([(x * 8) as u8, (y * 16) as u8, 128]))
+            .save(src_p)
+            .unwrap();
+        let neutral = EditRecipe::default();
+        for (name, needle) in [
+            ("out/_icc.jpg", &b"ICC_PROFILE"[..]),
+            ("out/_icc.png", &b"iCCP"[..]),
+            ("out/_icc.tif", &b"acsp"[..]),
+        ] {
+            render_to_file(src_p, &neutral, std::path::Path::new(name), None, None).unwrap();
+            let bytes = std::fs::read(name).unwrap();
+            assert!(
+                bytes.windows(needle.len()).any(|win| win == needle),
+                "{name} must carry the sRGB ICC marker"
+            );
+        }
     }
 
     #[test]
