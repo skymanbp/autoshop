@@ -1,14 +1,26 @@
-# ROADMAP — “一定程度直接取代 Photoshop” 路线（v0.4.0 之后）
+# ROADMAP — “一定程度直接取代 Photoshop” 路线（v0.5.0 之后 · UX 阶段）
 
 > 交接文档：每项都附实现要点与 `file:line` 锚点，供新会话不重读全库即可
-> 开工。更新于 2026-07-06 深夜（**v0.4.0 已发布**，A-G 差距批次全部触底，
-> local==origin，工作区干净）。
+> 开工。更新于 2026-07-07（**v0.5.0 已发布**；差距清单三大项 + UX 三批 +
+> debug 清扫完成；**本地领先 origin 五个未推送提交**，见下）。
 
 ## 当前状态（已完成，勿重做）
 
-- **v0.4.0 已发布**（tag `v0.4.0` → `e175bf8`，GitHub Release "Autoshop
-  v0.4.0" 带双 exe，资产字节数已核对）：范围蒙版 / 双轨续接 / 导出管线 /
-  高分预览 / 暗角补偿 / sRGB ICC / 版本快照——即 A-G 差距批次整批。
+- **本地未推送提交（v0.5.0 tag 之后，等用户说 push/发布）**：
+  `763a2bc` UX批次1（蒙版覆盖叠加/削波警告/Esc）→ `eb6a098` 叠加参考缓存
+  → `51c151d` UX批次2（hover 预览/直方图三角灯/批量进度条）→ `be60c52`
+  UX批次3（蒙版⬆⬇排序/光标语言/缓存key收窄）→ `55e7e07` **debug 清扫**：
+  ①方向统一——rawler ARW 内嵌预览不带 EXIF 转正（crate 源码实证），旧管线
+  在 develop **之后**才 oriented() ⇒ 竖拍 RAW 的 crop/straighten 会错轴；
+  现两侧都在最前端转正（引擎 `orient_f32` 复用同一 `oriented`，decode 端
+  `preview_only`/`decode_raw` 同函数转正），Normal 方向逐位不变，回归
+  测试+真 ARW 61MP 全流程实测；②hover_mask 改帧作用域（折叠面板/换图
+  不再粘滞）。
+- **v0.5.0 已发布**（tag `v0.5.0` → `3ab41b6`，双 exe 资产字节核对）：
+  三大项整批——C2 手动畸变 / D2 P3+AdobeRGB 真 gamut 导出 / A② AI
+  主体天空分割（位图 mask 通路 + python sidecar，用户真机实测）。
+- **v0.4.0 已发布**（tag `v0.4.0` → `e175bf8`）：范围蒙版 / 双轨续接 /
+  导出管线 / 高分预览 / 暗角补偿 / sRGB ICC / 版本快照——A-G 整批。
 - **~~C2 手动畸变校正~~ ✅ 完成（2026-07-06 深夜，见 §C，提交 b623e5a）**
   ——坐标映射整体设计（original→corrected→view 三空间合约）+ 引擎径向
   重映射 + GUI 全调用点接入 + XMP，67 lib + 4 gui 测试。
@@ -46,19 +58,29 @@
 - 更早已上线：反推配方（`fit.rs` + CLI `match`）、gpt-image-2 弹性高分辨率
   （≤8.3MP + 400 回退）、风格提示词提取、GUI 生产化（直方图/toast/快捷键/
   拖拽/持久化/折叠分组/双击归零）。
-- 待用户真机验收（v0.3.0+v0.4.0 累计）：曲线拖拽/吸管/图章/拉直/范围蒙版
+- 待用户真机验收（v0.3.0 起累计）：曲线拖拽/吸管/图章/拉直/范围蒙版
   手感；「以此母版继续修图」链路（修补→动滑杆→再修补→导出）；导出长边/
   锐化/质量 + 批量渲染选中；预览 2560/4096 的滑杆延迟是否可接受；暗角
   补偿手感；版本快照存/载；导出 ICC 在广色域屏与真 LR 的显示；范围蒙版
   XMP 与 VignetteMidpoint 在真 Lightroom 打开的效果；持久化"正常关闭→
   重启恢复"；高分辨率生成与风格提示词的真实 API 行为（付费调用，有 400
-  回退兜底）。
+  回退兜底）。**v0.5.0+UX 阶段新增待验**：AI 选主体/选天空按钮真机手感
+  （GUI 内点击链路，sidecar 命令行已实测）；畸变滑杆与真 LR 同数值强度
+  对比；P3/AdobeRGB 文件在广色域屏与印刷流程观感；蒙版覆盖叠加透明度
+  （255,40,40 α≤140/255）与 hover 预览响应；削波三角灯灵敏度（任一像素
+  即亮）；批量进度条；蒙版⬆⬇排序手感；**竖拍 ARW 全流程**（方向统一后
+  显示/蒙版/裁剪/拉直应全部正确——修复靠单测+横拍实测，竖拍样张未过）。
 
 ## 关键架构事实（新会话必读）
 
 - 所有图上交互经 `ViewXform`（屏幕↔全幅归一化，gui.rs）；工具互斥分发在
   `after_view`（crop > placing > wb_pick > range_pick > clone > paint >
   box-select）。
+- **EXIF 方向在链条最前端**（55e7e07 起）：引擎 `orient_f32` 在 develop
+  之前转正 f32 缓冲，decode 端 `preview_only`/`decode_raw` 用同一
+  `render::oriented`（pub(crate)）转正内嵌预览——GUI 显示帧 == 引擎
+  original 帧，任何 RAW 方向下蒙版/裁剪/拉直坐标一致。rawler 的 ARW
+  内嵌预览本身**不带**转正（crate 源码实证）。
 - `develop_preview`（render.rs）跑 `apply_recipe_wb` + `apply_develop`；
   **不应用裁剪**（GUI 用 uv 窗显示、导出端真裁）。**几何链**由 GUI `redevelop`
   在 develop_preview 之后依次调引擎 `apply_lens_distortion`（C2 畸变）→
