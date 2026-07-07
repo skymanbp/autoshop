@@ -130,6 +130,8 @@ enum Msg {
     /// AI segmentation finished: (mask display name, grayscale raster path)
     /// — attached to the recipe as a `MaskGeometry::Bitmap` local mask.
     Segmented(anyhow::Result<(String, PathBuf)>),
+    /// Batch render advanced: `done` of `total` photos finished (ok or err).
+    BatchProgress { done: usize, total: usize },
     /// Reverse-fit finished: the fitted recipe + a status note (fit.rs).
     Fitted(Box<anyhow::Result<(EditRecipe, String)>>),
     /// Style-prompt extraction finished: the reusable prompt text.
@@ -484,6 +486,8 @@ struct AutoshopApp {
     show_mask_overlay: bool,               // translucent red coverage of the selected mask (O)
     mask_overlay_tex: Option<egui::TextureHandle>,
     overlay_stale: bool,                   // rebuild the coverage texture next frame
+    hover_mask: Option<usize>,             // mask row under the cursor — previews its coverage
+    batch_progress: Option<(usize, usize)>, // (done, total) while a batch render runs
     // Cached masks-cleared develop the coverage's range weights are judged
     // on — reused while the global (non-mask) recipe is unchanged, so a
     // mask-slider drag rebuilds only the coverage map, not a second develop.
@@ -659,6 +663,8 @@ impl Default for AutoshopApp {
             mask_overlay_tex: None,
             overlay_stale: false,
             overlay_ref: None,
+            hover_mask: None,
+            batch_progress: None,
             show_clipping: false,
             clip_tex: None,
         }
@@ -1265,7 +1271,12 @@ impl AutoshopApp {
         if !self.show_mask_overlay || self.base_preview.is_none() {
             return;
         }
-        let Some(i) = self.sel_mask.filter(|&i| i < self.recipe.masks.len()) else { return };
+        // A hovered mask-list row previews ITS coverage; otherwise the selection.
+        let target = self
+            .hover_mask
+            .filter(|&i| i < self.recipe.masks.len())
+            .or_else(|| self.sel_mask.filter(|&i| i < self.recipe.masks.len()));
+        let Some(i) = target else { return };
         let mut pre = self.recipe.clone();
         pre.masks.clear();
         // Reuse the cached masks-cleared develop while the global recipe is
@@ -1320,7 +1331,9 @@ impl AutoshopApp {
 
     /// Draw the live histogram (R/G/B filled, luma outline) — the tone readout a
     /// photo editor is expected to have. Sqrt-scaled so shadow detail reads.
-    fn histogram_ui(&self, ui: &mut egui::Ui) {
+    /// The corner triangles are LR's clipping indicators: lit when the extreme
+    /// bin holds pixels; clicking either toggles the on-image J overlay.
+    fn histogram_ui(&mut self, ui: &mut egui::Ui) {
         let Some(hist) = &self.histogram else { return };
         let h = 72.0;
         let (rect, _) = ui.allocate_exact_size(
@@ -1364,6 +1377,47 @@ impl AutoshopApp {
             })
             .collect();
         p.add(egui::Shape::line(pts, egui::Stroke::new(1.0, egui::Color32::from_gray(210))));
+
+        // Clipping triangles: shadows top-left (blue when the darkest bin has
+        // any channel counts), highlights top-right (red when the brightest
+        // does). Grey when clean; click = the same toggle as ▲ / J.
+        let lit_sh = hist[0][..3].iter().any(|v| *v > 0.0);
+        let lit_hi = hist[hist.len() - 1][..3].iter().any(|v| *v > 0.0);
+        let mut toggle = false;
+        for (right, lit, tip) in [
+            (false, lit_sh, "阴影死黑指示 — 点击切换削波警告 (J)"),
+            (true, lit_hi, "高光溢出指示 — 点击切换削波警告 (J)"),
+        ] {
+            let s = 10.0;
+            let x0 = if right { rect.max.x - s - 4.0 } else { rect.min.x + 4.0 };
+            let tri = egui::Rect::from_min_size(egui::pos2(x0, rect.min.y + 4.0), egui::vec2(s, s));
+            let resp = ui
+                .interact(tri, ui.id().with(("clip_tri", right)), egui::Sense::click())
+                .on_hover_text(tip);
+            let color = if lit {
+                if right { egui::Color32::from_rgb(255, 90, 90) } else { egui::Color32::from_rgb(110, 150, 255) }
+            } else if self.show_clipping {
+                egui::Color32::from_gray(130)
+            } else {
+                egui::Color32::from_gray(60)
+            };
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(tri.center().x, tri.min.y),
+                    egui::pos2(tri.max.x, tri.max.y),
+                    egui::pos2(tri.min.x, tri.max.y),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+            if resp.clicked() {
+                toggle = true;
+            }
+        }
+        if toggle {
+            self.show_clipping = !self.show_clipping;
+            self.dirty = true; // the on-image layer is rebuilt inside redevelop
+        }
     }
 
     /// The interactive tone-curve editor: a channel picker (master / R / G / B)
@@ -1697,10 +1751,12 @@ impl AutoshopApp {
         let export = self.export_opts();
         self.busy = true;
         self.status = format!("批量渲染 {} 张 → ./out …", targets.len());
+        self.batch_progress = Some((0, targets.len())); // the top-bar progress bar
         let tx = self.tx.clone();
         let ext = ext.to_string();
         std::thread::spawn(move || {
             let res = (|| {
+                let total = targets.len();
                 let (mut okn, mut errs) = (0usize, Vec::<String>::new());
                 for p in &targets {
                     let one = (|| -> anyhow::Result<()> {
@@ -1719,6 +1775,7 @@ impl AutoshopApp {
                         Ok(()) => okn += 1,
                         Err(e) => errs.push(format!("{}: {e}", autoshop::pipeline::stem(p))),
                     }
+                    let _ = tx.send(Msg::BatchProgress { done: okn + errs.len(), total });
                 }
                 if errs.is_empty() {
                     Ok(format!("./out — 批量 {okn} 张完成"))
@@ -1900,10 +1957,16 @@ impl AutoshopApp {
                     }
                 },
                 Msg::Exported(Ok(p)) => {
+                    self.batch_progress = None; // the bar belongs to ONE batch run
                     self.done(format!("exported → {p}"));
                 }
                 Msg::Exported(Err(e)) => {
+                    self.batch_progress = None;
                     self.fail("export failed", e);
+                }
+                Msg::BatchProgress { done, total } => {
+                    self.batch_progress = Some((done, total));
+                    self.status = format!("批量渲染 {done}/{total} → ./out …");
                 }
                 Msg::Segmented(res) => match res {
                     Ok((label, path)) => {
@@ -2518,8 +2581,10 @@ impl AutoshopApp {
                     self.start_segment("sky", "天空");
                 }
             });
-            // Mask list: click to select (shows overlay + sliders), 🗑 deletes.
+            // Mask list: click to select (shows overlay + sliders), 🗑 deletes;
+            // HOVERING a row previews that mask's coverage without selecting.
             let mut delete: Option<usize> = None;
+            let mut hover_now: Option<usize> = None;
             for i in 0..n_masks {
                 ui.horizontal(|ui| {
                     let m = &self.recipe.masks[i];
@@ -2529,7 +2594,11 @@ impl AutoshopApp {
                         MaskGeometry::Bitmap { .. } => "位图",
                     };
                     let label = format!("{} · {}", if m.name.is_empty() { "mask" } else { &m.name }, kind);
-                    if ui.selectable_label(self.sel_mask == Some(i), label).clicked() {
+                    let row = ui.selectable_label(self.sel_mask == Some(i), label);
+                    if row.hovered() {
+                        hover_now = Some(i);
+                    }
+                    if row.clicked() {
                         self.sel_mask = if self.sel_mask == Some(i) { None } else { Some(i) };
                         self.overlay_stale = true; // coverage follows the selection
                     }
@@ -2537,6 +2606,10 @@ impl AutoshopApp {
                         delete = Some(i);
                     }
                 });
+            }
+            if hover_now != self.hover_mask {
+                self.hover_mask = hover_now; // leave = falls back to the selection
+                self.overlay_stale = true;
             }
             if let Some(i) = delete {
                 self.recipe.masks.remove(i);
@@ -3983,6 +4056,16 @@ impl eframe::App for AutoshopApp {
             ui.horizontal(|ui| {
                 ui.heading("Autoshop");
                 ui.separator();
+                // Live batch-render progress (full-res develops take seconds
+                // each — a bare toast at the end reads as a hang).
+                if let Some((done, total)) = self.batch_progress {
+                    ui.add(
+                        egui::ProgressBar::new(done as f32 / total.max(1) as f32)
+                            .desired_width(150.0)
+                            .text(format!("批量 {done}/{total}")),
+                    );
+                    ui.separator();
+                }
                 if ui.button("Open photo…").on_hover_text("Ctrl+O · 或直接拖拽进窗口").clicked()
                     && let Some(path) = photo_file_dialog()
                 {
