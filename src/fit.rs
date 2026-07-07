@@ -16,19 +16,32 @@
 //!      the engine's own tone knots ([`render::TONE_KNOTS_X`]) and least-squares
 //!      solve the sliders against the engine's OWN basis
 //!      ([`render::tone_slider_basis`]), scanning exposure (it enters the model
-//!      nonlinearly). Whatever shape the sliders can't express goes into
-//!      `tone_curve` control points, which the engine composes exactly on top.
+//!      nonlinearly). The solve carries a REAL magnitude prior (ridge +
+//!      penalised model selection): the knot system is near-collinear, so
+//!      without it grotesque mutually-cancelling combos (Exposure +1.5 with
+//!      Contrast −97 and Shadows −100) beat tasteful ones by numerical ε —
+//!      the residual curve makes their total maps indistinguishable, but the
+//!      slider semantics are ruined (real-photo failure, 2026-07-07). Whatever
+//!      shape the penalised sliders don't express goes into `tone_curve`
+//!      control points, which the engine composes exactly on top.
 //!   2. **Saturation** — global mean-chroma ratio, secant-refined through real
 //!      [`render::develop_preview`] renders (closed loop, not open-loop math).
-//!   3. **HSL mixer** — per-band (the 8 ACR bands, same partition as the
-//!      renderer) circular-mean hue delta + sat/luma ratios of the residual.
-//!   4. **Colour cast** — per-channel CDF residuals → red/green/blue curves.
+//!   3. **Colour cast** — per-channel CDF residuals → red/green/blue curves,
+//!      last as the catch-all (cast-before-saturation measured worse on the
+//!      haze regression — see the stage comments in [`fit_recipe`]).
+//!
+//! There is deliberately NO per-band HSL stage — per-band statistics against
+//! a non-pixel-aligned generative target conflate content with style and are
+//! unidentifiable (see the note in [`fit_recipe`]; it caused the 2026-07-07
+//! purple-sky failure).
 //!
 //! Every stage fits the RESIDUAL against a fresh render of the current recipe,
 //! so stage interactions are absorbed instead of compounding; the report carries
-//! the honest before/after distribution error. Local masks and content changes
-//! are out of scope by construction (statistics cannot localise them) — the AI
-//! style-prompt path covers intent the numbers cannot.
+//! the honest before/after distribution error (tonal + channel means + per-band
+//! hue, so a hue disaster cannot hide behind matched luma quantiles). Local
+//! masks and content changes are out of scope by construction (statistics
+//! cannot localise them) — the AI style-prompt path covers intent the numbers
+//! cannot.
 
 use image::DynamicImage;
 
@@ -42,6 +55,12 @@ const HIST_BINS: usize = 1024;
 /// Quantile clip for CDF inversion — the extreme tails of a generative render
 /// are noise (a few blown/crushed pixels would otherwise own the end knots).
 const P_CLIP: f32 = 0.002;
+/// Cast-curve acceptance: the fitted per-channel curves must cut the hue-aware
+/// look error to ≤ this fraction of the without-curves error, else they are
+/// rejected as a content mismatch masquerading as a cast (see the stage-4
+/// comment in [`fit_recipe`]). A true global cast slashes the error far past
+/// this; a content difference only nibbles at it while damaging regions.
+const CAST_ACCEPT_RATIO: f32 = 0.85;
 
 /// The fit outcome: the recipe plus the distribution error (mean |Δ| over luma
 /// quantiles and channel means, 0 = identical look) before and after.
@@ -82,6 +101,13 @@ pub fn fit_recipe(src: &DynamicImage, target: &DynamicImage) -> FitReport {
     recipe.tone_curve = residual_tone_curve(&recipe, &tone_map);
 
     // --- 3) global saturation, secant-refined through the real engine --------
+    // Saturation stays BEFORE the cast curves: channel CDFs of a desaturated
+    // render differ from the target's even with zero cast (each channel's
+    // distribution is compressed toward luma), so fitting the cast first
+    // would express chroma expansion through per-channel curves — and
+    // per-channel curves rotate hue. Saturating first may amplify a latent
+    // cast, but stage 5 fits the cast residual CLOSED-LOOP on the saturated
+    // render, so it is measured and removed rather than compounded.
     let t_chroma = mean_chroma(&tp);
     for _ in 0..2 {
         let cur = pixels_of(&render::develop_preview(&s_img, &recipe));
@@ -96,23 +122,59 @@ pub fn fit_recipe(src: &DynamicImage, target: &DynamicImage) -> FitReport {
         recipe.saturation = round1((recipe.saturation + step).clamp(-60.0, 60.0));
     }
 
-    // --- 4) HSL mixer from per-band residuals ---------------------------------
+    // --- 4) per-channel colour-cast curves — the catch-all, LAST so its
+    // closed-loop residual sees every earlier stage's composed output
+    // (cast-before-saturation was tried and measured worse on the haze
+    // regression: chroma expansion leaks into the curves, which rotate hue).
+    //
+    // The curves model a GLOBAL cast (one monotone map per channel). That
+    // model is exactly right for uniform casts (haze tint, WB drift) and
+    // exactly wrong when the colour residual is CONTENT (a generative
+    // target's rocks simply ARE warmer than its sky): then the fitted map
+    // drags every region — measured on the real pair, the red lift that
+    // warmed the frame-dominant rocks turned the pale sky violet (and the
+    // neutral-only-evidence variant, also tried, cooled the warm distance
+    // haze instead). The two worlds are told apart by VALIDATION, not by
+    // evidence filtering: accept the curves only if they improve the
+    // hue-aware look error by a clear margin — a global map that truly
+    // explains the residual slashes the error (the haze regression), while
+    // a content mismatch yields a marginal "improvement" bought by regional
+    // hue damage the metric's hue term partially sees. Marginal gain does
+    // not earn regional risk: keep the recipe clean instead.
+    //
+    // Deliberately NO per-band HSL fitting. It was tried (centroid hue
+    // deltas + sat/luma ratios per ACR band, correspondence-gated) and it is
+    // what wrecked the real-photo fit (2026-07-07): against a generative,
+    // non-pixel-aligned target, a band's centroid delta conflates CONTENT
+    // difference with style, and an honest-looking 13° in-gate delta applied
+    // as a whole-band rotation turns brown rock olive and a pale sky
+    // lavender. Per-band intent is statistically unidentifiable here — like
+    // local masks, it belongs to the AI style-prompt path, not to
+    // distribution matching.
     let cur = pixels_of(&render::develop_preview(&s_img, &recipe));
-    fit_hsl_bands(&cur, &tp, &mut recipe);
-
-    // --- 5) per-channel colour-cast curves ------------------------------------
-    let cur = pixels_of(&render::develop_preview(&s_img, &recipe));
+    let err_without = look_err(&cur, &tp);
     recipe.red_curve = residual_channel_curve(&cur, &tp, 0);
     recipe.green_curve = residual_channel_curve(&cur, &tp, 1);
     recipe.blue_curve = residual_channel_curve(&cur, &tp, 2);
+    if !(recipe.red_curve.is_empty()
+        && recipe.green_curve.is_empty()
+        && recipe.blue_curve.is_empty())
+    {
+        let with_px = pixels_of(&render::develop_preview(&s_img, &recipe));
+        if look_err(&with_px, &tp) > err_without * CAST_ACCEPT_RATIO {
+            recipe.red_curve = Vec::new();
+            recipe.green_curve = Vec::new();
+            recipe.blue_curve = Vec::new();
+        }
+    }
 
     // --- report ---------------------------------------------------------------
     let final_px = pixels_of(&render::develop_preview(&s_img, &recipe));
     let err_after = look_err(&final_px, &tp);
     recipe.rationale = format!(
         "Reverse-fit from a target rendition (statistical match; the target is not \
-         pixel-aligned, so local masks are not recovered): luma-CDF → tone sliders \
-         {}, chroma → saturation, per-band HSL, per-channel cast curves. Residual \
+         pixel-aligned, so local masks and per-band HSL are not recovered): luma-CDF \
+         → tone sliders {}, chroma → saturation, per-channel cast curves. Residual \
          look error {err_before:.3} → {err_after:.3}.",
         if recipe.tone_curve.is_empty() { "(no residual curve)" } else { "+ residual tone curve" },
     );
@@ -125,10 +187,25 @@ pub fn fit_recipe(src: &DynamicImage, target: &DynamicImage) -> FitReport {
 // tone solve
 // --------------------------------------------------------------------------
 
+/// Magnitude prior for the tone solve. The 5-slider knot system is
+/// near-collinear (contrast vs shadows/highlights, whites vs the shoulder), so
+/// unpenalised least squares happily returns huge mutually-cancelling sliders
+/// whose TOTAL map ties a tasteful solution to within numerical ε — and the
+/// residual curve erases even that difference. The prior makes slider
+/// magnitude itself part of the cost, so "Exposure +1.5, Contrast −97,
+/// Shadows −100" loses to the mild solve it was shadowing. Units: basis
+/// authorities are O(0.2–0.34), knot residuals O(0.1); 0.02 prices a pegged
+/// slider (s=1) like a ~0.14 luma miss at one knot — strong enough to kill
+/// cancellation combos, weak enough that genuinely-needed big moves survive
+/// (the roundtrip test pins recovery of a real ±25-point recipe).
+const TONE_PRIOR: f64 = 0.02;
+
 /// Scan exposure (nonlinear in the model) and, for each candidate, solve the 5
 /// linear sliders (contrast/highlights/shadows/whites/blacks, in the basis
-/// order of [`render::tone_slider_basis`]) by ridge least squares over the 8
-/// knots; keep the (ev, sliders) with the smallest clamped-solution SSE.
+/// order of [`render::tone_slider_basis`]) by RIDGE least squares over the 8
+/// knots; keep the (ev, sliders) minimising the PENALISED clamped-solution
+/// score `SSE + TONE_PRIOR·Σs²` — the same prior in the solve and in the
+/// model selection, so the exposure scan cannot smuggle the degeneracy back.
 fn fit_tone_sliders(tone_map: &impl Fn(f32) -> f32) -> (f32, [f32; 5]) {
     let targets: Vec<f32> = render::TONE_KNOTS_X.iter().map(|&x| tone_map(x)).collect();
     let basis: Vec<[f32; 5]> =
@@ -154,20 +231,22 @@ fn fit_tone_sliders(tone_map: &impl Fn(f32) -> f32) -> (f32, [f32; 5]) {
             }
         }
         for (i, row) in ata.iter_mut().enumerate() {
-            row[i] += 1e-4; // ridge: keeps the near-collinear shoulder terms stable
+            row[i] += TONE_PRIOR; // ridge = the magnitude prior (see const doc)
         }
         let sol = solve5(ata, atb);
         let s: [f32; 5] = std::array::from_fn(|i| (sol[i] as f32).clamp(-1.0, 1.0));
-        let sse: f64 = basis
+        let penalty: f64 = s.iter().map(|&v| TONE_PRIOR * v as f64 * v as f64).sum();
+        let score: f64 = basis
             .iter()
             .zip(&resid)
             .map(|(b, r)| {
                 let fit: f64 = (0..5).map(|i| b[i] as f64 * s[i] as f64).sum();
                 (r - fit) * (r - fit)
             })
-            .sum();
-        if (sse as f32) < best.2 {
-            best = (ev, s, sse as f32);
+            .sum::<f64>()
+            + penalty;
+        if (score as f32) < best.2 {
+            best = (ev, s, score as f32);
         }
         ev += 0.05;
     }
@@ -280,39 +359,6 @@ fn band_stats(px: &[[f32; 3]]) -> ([BandStat; 8], f64) {
     (bands, total)
 }
 
-/// Per-band residual between the current render and the target → the `hsl`
-/// mixer. Bands too thin in either image (< 1.5 % of chromatic pixels) stay
-/// neutral — their statistics are noise, and a generative target can genuinely
-/// add/remove content in a band.
-fn fit_hsl_bands(cur: &[[f32; 3]], tgt: &[[f32; 3]], recipe: &mut EditRecipe) {
-    let (cb, ct) = band_stats(cur);
-    let (tb, tt) = band_stats(tgt);
-    if ct < 1.0 || tt < 1.0 {
-        return;
-    }
-    for i in 0..8 {
-        let (c, t) = (&cb[i], &tb[i]);
-        if c.w / ct < 0.015 || t.w / tt < 0.015 || c.s < 1e-4 || c.l < 1e-4 {
-            continue;
-        }
-        let c_deg = c.sin.atan2(c.cos).to_degrees();
-        let t_deg = t.sin.atan2(t.cos).to_degrees();
-        let mut d = t_deg - c_deg;
-        while d > 180.0 {
-            d -= 360.0;
-        }
-        while d < -180.0 {
-            d += 360.0;
-        }
-        // Engine scale: hue slider ±100 → ±30° rotation; luminance ±100 → ±50 %.
-        recipe.hsl.hue[i] = round1(((d / 30.0) * 100.0).clamp(-45.0, 45.0) as f32);
-        let sat_ratio = (t.s / t.w) / (c.s / c.w);
-        recipe.hsl.saturation[i] = round1((((sat_ratio - 1.0) * 100.0) as f32).clamp(-40.0, 40.0));
-        let lum_ratio = (t.l / t.w) / (c.l / c.w);
-        recipe.hsl.luminance[i] = round1((((lum_ratio - 1.0) * 200.0) as f32).clamp(-40.0, 40.0));
-    }
-}
-
 /// Residual per-channel CDF map (current render → target) as a channel curve —
 /// the colour-cast catch-all (white balance shift, split toning the wheels/HSL
 /// didn't express). Skipped when the channel already matches within tolerance.
@@ -377,23 +423,23 @@ fn luma_cdf(px: &[[f32; 3]]) -> Vec<f32> {
     cdf_from_values(px.iter().map(luma601), px.len())
 }
 
+/// Near-neutral gate shared by the tone and cast evidence. Gated on HSV
+/// saturation ((max−min)/max), which is INVARIANT under pure luminance
+/// scaling — so the same pixels qualify in the source and in its tone-mapped
+/// target (an absolute-chroma gate is not: dark colours slip under it in the
+/// source and leave it once brightened, skewing the two CDFs against each
+/// other). Near-black counts as neutral.
+fn is_neutralish(p: &[f32; 3]) -> bool {
+    let mx = p[0].max(p[1]).max(p[2]);
+    let mn = p[0].min(p[1]).min(p[2]);
+    mx < 0.04 || (mx - mn) / mx < 0.15
+}
+
 /// Luma CDF over near-neutral pixels only — the clean tone evidence (see the
-/// call site). "Neutral" is gated on HSV saturation ((max−min)/max), which is
-/// INVARIANT under pure luminance scaling — so the same pixels qualify in the
-/// source and in its tone-mapped target (an absolute-chroma gate is not: dark
-/// colours slip under it in the source and leave it once brightened, skewing
-/// the two CDFs against each other). Falls back to every pixel when the frame
-/// is too colourful to leave a reliable neutral sample (< 5 %, or < 512 px).
+/// call site). Falls back to every pixel when the frame is too colourful to
+/// leave a reliable neutral sample (< 5 %, or < 512 px).
 fn tone_cdf(px: &[[f32; 3]]) -> Vec<f32> {
-    let neutral: Vec<f32> = px
-        .iter()
-        .filter(|p| {
-            let mx = p[0].max(p[1]).max(p[2]);
-            let mn = p[0].min(p[1]).min(p[2]);
-            mx < 0.04 || (mx - mn) / mx < 0.15 // near-black counts as neutral
-        })
-        .map(luma601)
-        .collect();
+    let neutral: Vec<f32> = px.iter().filter(|p| is_neutralish(p)).map(luma601).collect();
     if neutral.len() >= (px.len() / 20).max(512) {
         let n = neutral.len();
         cdf_from_values(neutral.into_iter(), n)
@@ -449,7 +495,12 @@ fn mean_chroma(px: &[[f32; 3]]) -> f32 {
 }
 
 /// One scalar "how different do these look" — mean |Δ| over 21 luma quantiles
-/// (75 %) + the 3 channel means (25 %). 0 = identical distributions.
+/// (60 %), the 3 channel means (20 %), and the weight-averaged per-band
+/// centroid hue disagreement (20 %). 0 = identical distributions. The hue
+/// term exists because matched luma quantiles + channel MEANS can hide a
+/// full-blown hue disaster (a purple sky and a blue one can share all four
+/// global numbers — exactly how the 2026-07-07 real-photo failure reported
+/// err 0.034 / confidence 0.80 for an unusable render).
 fn look_err(a: &[[f32; 3]], b: &[[f32; 3]]) -> f32 {
     let (ca, cb) = (luma_cdf(a), luma_cdf(b));
     let mut tonal = 0.0f32;
@@ -467,7 +518,32 @@ fn look_err(a: &[[f32; 3]], b: &[[f32; 3]]) -> f32 {
         px.iter().map(|p| p[ch]).sum::<f32>() / px.len() as f32
     };
     let colour = (0..3).map(|ch| (mean(a, ch) - mean(b, ch)).abs()).sum::<f32>() / 3.0;
-    0.75 * tonal + 0.25 * colour
+    // Per-band centroid hue disagreement — the WORST qualifying band, not a
+    // weighted mean: one region with wrecked hue ruins a photo no matter how
+    // small its area share (a lavender sky over perfect rocks), and an
+    // area-weighted mean lets exactly that hide (measured: the violet-sky
+    // curves slipped through the cast-acceptance gate on the mean variant).
+    // |Δ| saturates at 60° so a fully-wrecked band reads 1.
+    let (sa, ta) = band_stats(a);
+    let (sb, tb) = band_stats(b);
+    let mut hue = 0.0f32;
+    if ta >= 1.0 && tb >= 1.0 {
+        for i in 0..8 {
+            let (x, y) = (&sa[i], &sb[i]);
+            if x.w / ta < 0.015 || y.w / tb < 0.015 {
+                continue;
+            }
+            let mut d = y.sin.atan2(y.cos).to_degrees() - x.sin.atan2(x.cos).to_degrees();
+            while d > 180.0 {
+                d -= 360.0;
+            }
+            while d < -180.0 {
+                d += 360.0;
+            }
+            hue = hue.max((d.abs().min(60.0) / 60.0) as f32);
+        }
+    }
+    0.6 * tonal + 0.2 * colour + 0.2 * hue
 }
 
 fn round1(v: f32) -> f32 {
@@ -552,6 +628,82 @@ mod tests {
             rep.err_after,
             rep.err_before
         );
+    }
+
+    #[test]
+    fn hazy_to_clean_fit_stays_sane() {
+        // Regression for the 2026-07-07 real-photo failure: fitting a
+        // low-contrast, low-chroma, blue-cast base toward a clean punchy
+        // target produced mutually-cancelling pegged tone sliders
+        // (Exposure +1.5 / Contrast −97 / Shadows −100), pegged per-band hue
+        // rotations (+45) and a purple sky — while the old metric reported
+        // "improved". The prior, the stage order and the correspondence gate
+        // must keep every fitted control in its sane regime.
+        let clean = synth();
+        let mut haze = EditRecipe {
+            exposure_ev: -0.3,
+            contrast: -45.0,
+            blacks: 40.0,
+            saturation: -40.0,
+            // a shadow-weighted blue cast at realistic haze strength (the
+            // midpoint pin keeps it out of the highlights, like real haze)
+            blue_curve: vec![
+                CurvePoint { input: 0, output: 25 },
+                CurvePoint { input: 128, output: 132 },
+                CurvePoint { input: 255, output: 255 },
+            ],
+            ..Default::default()
+        };
+        haze.clamp();
+        let base = render::develop_preview(&clean, &haze);
+        let rep = fit_recipe(&base, &clean);
+        let r = &rep.recipe;
+        assert!(
+            r.contrast > -20.0 && r.contrast.abs() < 90.0,
+            "degenerate contrast {}",
+            r.contrast
+        );
+        assert!(
+            r.shadows.abs() < 90.0 && r.whites.abs() < 90.0 && r.blacks.abs() < 90.0,
+            "pegged tone sliders: sh {} wh {} bl {}",
+            r.shadows,
+            r.whites,
+            r.blacks
+        );
+        assert!(r.exposure_ev.abs() <= 1.0, "runaway exposure {}", r.exposure_ev);
+        // NOTE deliberately no "slider not pegged" assertion for hue: the
+        // correspondence gate already rejects mismatched populations, and a
+        // genuine in-gate rotation larger than the engine's ±13.5° range
+        // legitimately clamps. What must hold is the RESULT (below): no band
+        // of the fitted render lands tens of degrees off the target.
+        assert!(
+            rep.err_after < rep.err_before,
+            "fit made the look worse: {} -> {}",
+            rep.err_before,
+            rep.err_after
+        );
+        // The decisive invariant: render the fitted recipe and check every
+        // populated band's centroid hue against the target — the purple-sky
+        // failure class means some band lands tens of degrees off.
+        let fitted = pixels_of(&render::develop_preview(&base, &rep.recipe));
+        let (fb, ftot) = band_stats(&fitted);
+        let (tb, ttot) = band_stats(&pixels_of(&clean));
+        let mut worst = 0.0f64;
+        for i in 0..8 {
+            let (x, y) = (&fb[i], &tb[i]);
+            if x.w / ftot < 0.015 || y.w / ttot < 0.015 {
+                continue;
+            }
+            let mut d = y.sin.atan2(y.cos).to_degrees() - x.sin.atan2(x.cos).to_degrees();
+            while d > 180.0 {
+                d -= 360.0;
+            }
+            while d < -180.0 {
+                d += 360.0;
+            }
+            worst = worst.max(d.abs());
+        }
+        assert!(worst < 15.0, "a band's hue is still {worst:.1}° off after the fit");
     }
 
     #[test]
