@@ -9,15 +9,15 @@
 - **v0.4.0 已发布**（tag `v0.4.0` → `e175bf8`，GitHub Release "Autoshop
   v0.4.0" 带双 exe，资产字节数已核对）：范围蒙版 / 双轨续接 / 导出管线 /
   高分预览 / 暗角补偿 / sRGB ICC / 版本快照——即 A-G 差距批次整批。
-- **~~C2 手动畸变校正~~ ✅ 完成（2026-07-06 深夜，见 §C）**——坐标映射
-  整体设计（original→corrected→view 三空间合约）+ 引擎径向重映射 + GUI
-  全调用点接入 + XMP，67 lib + 4 gui 测试。
-- **下一批 = 剩余两个大项（任选或按序）**：
-  1. **A② AI 主体/天空分割**——前置是引擎位图 mask 通路（recipe 里的
-     MaskGeometry 加 Bitmap 变体或旁路），python sidecar 循 SCUNet 模式
-     或云 API，见 §A。
-  2. **D2 P3/AdobeRGB 输出**——需真 gamut 变换（矩阵 + TRC），不是换
-     标签；profile 仍可循 CC0 紧凑系列，见 §D。
+- **~~C2 手动畸变校正~~ ✅ 完成（2026-07-06 深夜，见 §C，提交 b623e5a）**
+  ——坐标映射整体设计（original→corrected→view 三空间合约）+ 引擎径向
+  重映射 + GUI 全调用点接入 + XMP，67 lib + 4 gui 测试。
+- **~~D2 P3/AdobeRGB 输出~~ ✅ 完成（2026-07-06 深夜，见 §D）**——真
+  gamut 变换（色度推矩阵 + 双 TRC）+ CC0 profile 双件 + GUI 色彩空间
+  下拉 + Prefs，69 lib + 4 gui 测试。
+- **下一批 = 最后一个大项**：**A② AI 主体/天空分割**——前置是引擎位图
+  mask 通路（recipe 里的 MaskGeometry 加 Bitmap 变体或旁路），python
+  sidecar 循 SCUNet 模式或云 API，见 §A。
 - v0.3.0 → `fa9add8`，v0.2.0 → `1bc57ff`。
 - **有序批次 ①-⑤ 全部完成**（详见各节 ✅ 小节，含实现锚点与已知近似）：
   ①曲线编辑器 ②批量复制/粘贴 ③WB 吸管（含 WB 预览前置重构）
@@ -204,16 +204,29 @@
   紫色主体）；透视 Upright。
 - AI advisor 暂不暴露镜头字段（校正是测量性操作，非审美建议；schema 未加）。
 
-### D. 色彩管理（◐ 第一步 导出嵌 sRGB ICC ✅ 2026-07-06）
-- **导出嵌 ICC ✅**：`render_to_file` 三种格式全部显式编码器 + `tag_srgb`
-  （render.rs）——JPEG=APP2 ICC_PROFILE 段、PNG=iCCP 块、TIFF=tag 34675；
-  profile 用 saucecontrol/Compact-ICC-Profiles 的 `sRGB-v2-magic.icc`
-  （736 B，**CC0-1.0 公有领域**，assets/ 下入库；下载时验证 acsp 签名 +
+### D. 色彩管理（✅ sRGB ICC + D2 广色域输出均完成 2026-07-06）
+- **导出嵌 ICC ✅**：`render_to_file` 三种格式全部显式编码器 + `tag_icc`
+  （render.rs，原 tag_srgb 泛化）——JPEG=APP2 ICC_PROFILE 段、PNG=iCCP 块、
+  TIFF=tag 34675；profile 用 saucecontrol/Compact-ICC-Profiles
+  （**CC0-1.0 公有领域**，assets/ 下入库；下载时验证 acsp 签名 +
   repo license API 实证）。单测逐格式验证 marker 字节存在。image 0.25.10
   三个编码器的 `set_icc_profile` 实现已核对（真存储非 Unsupported）。
-- **未做**：P3/AdobeRGB 输出选项（需真正的 gamut 变换，不只换 tag）；
-  egui 显示端色管（上游限制）；retouch 母版 PNG 的 ICC（工作文件，
-  导出时会再过 render_to_file 补 tag）。
+- **D2 P3/AdobeRGB 输出 ✅（2026-07-06 深夜）**：`ExportColorSpace`
+  {Srgb, DisplayP3, AdobeRgb} 入 `ExportOpts`（默认 Srgb，旧调用零变化）；
+  **真 gamut 变换**（render.rs `convert_export_color_space`）——解 sRGB
+  TRC → 线性光 3×3 原色变换 → 目标 TRC（P3 同 sRGB 曲线；AdobeRGB 纯
+  563/256 gamma）；矩阵**运行时从原色色度推导**（`rgb_to_xyz`/`inv3`，
+  不手抄七位小数表），三空间共 D65 白点、无色适应项；白点保持单测端到端
+  锁定推导。profile：`DisplayP3-v2-magic.icc`（736 B）+
+  `AdobeCompat-v2.icc`（374 B），下载时同样验 acsp+尺寸。GUI 导出面板
+  「色彩空间」下拉（sRGB/Display P3/Adobe RGB），入 Prefs（越界回落
+  sRGB）。未知扩展名（无法带 tag 的格式）刻意留 sRGB——P3/AdobeRGB 数值
+  不带 profile 到处都显示错。单测：白/灰/中性保持、逆矩阵 roundtrip、
+  sRGB 红在 P3 内（正 g/b）/在 AdobeRGB 是重缩放纯红（共享红原色）、
+  JPEG/TIFF 文件字节含完整目标 profile。
+- **未做**：egui 显示端色管（上游限制）；retouch 母版 PNG 的 ICC（工作
+  文件，导出时会再过 render_to_file 补 tag）；工作空间本身仍是 sRGB
+  （引擎在更宽空间显影是另一级大工程，超出导出选项范畴）。
 
 ### E. 1:1 真像素检查（✅ 已完成 2026-07-06）
 - 现状（旧）：预览固定 1280px（gui.rs `PREVIEW_EDGE`），「1:1」= 预览像素。
@@ -263,8 +276,8 @@
 ### 建议批次顺序（v0.3.x 起 · 2026-07-06 收官状态）
 ~~A①（范围蒙版）~~ ✅ → ~~B（双轨打通）~~ ✅ → ~~F（导出管线）~~ ✅ →
 ~~E（高分预览）~~ ✅ → ~~C（暗角 + C2 手动畸变）~~ ✅ →
-D（◐ sRGB ICC ✅，P3/AdobeRGB 待 gamut 变换）→ ~~G（版本）~~ ✅；
-A②（AI 分割）待引擎位图 mask 通路。
+~~D（sRGB ICC + D2 广色域输出）~~ ✅ → ~~G（版本）~~ ✅；
+剩 A②（AI 分割）——待引擎位图 mask 通路，是差距清单最后一个大项。
 
 ## 完成每项后的例行动作
 

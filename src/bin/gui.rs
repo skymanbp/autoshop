@@ -69,6 +69,7 @@ struct Prefs {
     exp_long_edge: u32,
     exp_sharpen: f32,
     exp_quality: f32,
+    exp_space: u8,
     preview_edge: u32,
 }
 
@@ -85,6 +86,7 @@ impl Default for Prefs {
             exp_long_edge: 0,
             exp_sharpen: 0.0,
             exp_quality: 95.0,
+            exp_space: 0,
             preview_edge: PREVIEW_EDGE,
         }
     }
@@ -487,10 +489,11 @@ struct AutoshopApp {
     // --- pixel-master ↔ recipe chaining (gap batch B) ---
     master: Option<PathBuf>,               // last ./out retouch master (fill/heal/clone/reimagine)
     keep_recipe: bool,                     // one-shot: next Opened keeps the recipe (continue-from-master)
-    // --- export pipeline (gap batch F) ---
+    // --- export pipeline (gap batch F + D2) ---
     exp_long_edge: u32,                    // resize long edge in px; 0 = full resolution
     exp_sharpen: f32,                      // output sharpening 0..100, post-resize
     exp_quality: f32,                      // JPEG quality 1..100 (f32 for the shared slider)
+    exp_space: u8,                         // delivery color space: 0 sRGB / 1 Display P3 / 2 Adobe RGB
     // --- preview resolution (gap batch E) ---
     preview_edge: u32,                     // working-preview long edge: 1280 fluid / 2560 / 4096 detail
     // --- recipe versions (gap batch G): ./out/<stem>.v<N>.recipe.json ---
@@ -619,6 +622,7 @@ impl Default for AutoshopApp {
             exp_long_edge: 0,
             exp_sharpen: 0.0,
             exp_quality: 95.0,
+            exp_space: 0,
             preview_edge: PREVIEW_EDGE,
             versions: Vec::new(),
         }
@@ -641,6 +645,10 @@ impl AutoshopApp {
             app.exp_long_edge = prefs.exp_long_edge;
             app.exp_sharpen = prefs.exp_sharpen.clamp(0.0, 100.0);
             app.exp_quality = prefs.exp_quality.clamp(1.0, 100.0);
+            // Only known color spaces — an out-of-range pref falls back to sRGB.
+            if prefs.exp_space <= 2 {
+                app.exp_space = prefs.exp_space;
+            }
             // Only the known steps — a corrupt pref must not produce a 1-px
             // or 100-MP working preview.
             if [1280, 2560, 4096].contains(&prefs.preview_edge) {
@@ -1510,6 +1518,11 @@ impl AutoshopApp {
             long_edge: (self.exp_long_edge > 0).then_some(self.exp_long_edge),
             sharpen: self.exp_sharpen.clamp(0.0, 100.0),
             jpeg_quality: self.exp_quality.round().clamp(1.0, 100.0) as u8,
+            color_space: match self.exp_space {
+                1 => autoshop::render::ExportColorSpace::DisplayP3,
+                2 => autoshop::render::ExportColorSpace::AdobeRgb,
+                _ => autoshop::render::ExportColorSpace::Srgb,
+            },
         }
     }
 
@@ -3795,6 +3808,20 @@ impl eframe::App for AutoshopApp {
                     if self.save_jpeg {
                         Self::slider(ui, "JPEG 质量", &mut self.exp_quality, 60.0, 100.0, 95.0);
                     }
+                    // --- delivery color space (gap batch D2): a real gamut
+                    // transform + matching embedded profile, not a tag swap.
+                    ui.horizontal(|ui| {
+                        ui.label("色彩空间");
+                        const SPACES: [&str; 3] = ["sRGB（通用）", "Display P3（广色域屏）", "Adobe RGB（印刷）"];
+                        egui::ComboBox::from_id_salt("exp_space")
+                            .selected_text(SPACES[(self.exp_space as usize).min(2)])
+                            .width(170.0)
+                            .show_ui(ui, |ui| {
+                                for (i, name) in SPACES.iter().enumerate() {
+                                    ui.selectable_value(&mut self.exp_space, i as u8, *name);
+                                }
+                            });
+                    });
                     ui.checkbox(&mut self.save_denoise, "AI Denoise").on_hover_text(
                         "SCUNet AI denoise before developing — high-ISO / astro (slow, GPU; needs the python sidecar)",
                     );
@@ -4014,6 +4041,7 @@ impl eframe::App for AutoshopApp {
                 exp_long_edge: self.exp_long_edge,
                 exp_sharpen: self.exp_sharpen,
                 exp_quality: self.exp_quality,
+                exp_space: self.exp_space,
                 preview_edge: self.preview_edge,
             },
         );

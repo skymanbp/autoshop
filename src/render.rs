@@ -172,11 +172,11 @@ pub fn render_baked_to_image(
     Ok(dynimg)
 }
 
-/// The output pipeline — Lightroom's export page distilled to the three
-/// controls that matter for delivery: resize to a long edge, output sharpening
-/// applied AFTER the resize (detail lost to downscaling can only be compensated
-/// post-resize), and JPEG quality. `None` / `Default` reproduce the classic
-/// full-resolution q95 behaviour exactly.
+/// The output pipeline — Lightroom's export page distilled to the controls
+/// that matter for delivery: resize to a long edge, output sharpening applied
+/// AFTER the resize (detail lost to downscaling can only be compensated
+/// post-resize), JPEG quality, and the delivery color space. `None` /
+/// `Default` reproduce the classic full-resolution q95 sRGB behaviour exactly.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ExportOpts {
     /// Resize so the LONG edge equals this many pixels (aspect kept, Lanczos3).
@@ -187,39 +187,171 @@ pub struct ExportOpts {
     pub sharpen: f32,
     /// JPEG quality 1..=100 (ignored by TIFF/PNG, which stay 16-bit lossless).
     pub jpeg_quality: u8,
+    /// Delivery color space — a REAL gamut transform + matching embedded
+    /// profile, not a tag swap (gap batch D2).
+    pub color_space: ExportColorSpace,
 }
 
 impl Default for ExportOpts {
     fn default() -> Self {
-        Self { long_edge: None, sharpen: 0.0, jpeg_quality: 95 }
+        Self { long_edge: None, sharpen: 0.0, jpeg_quality: 95, color_space: ExportColorSpace::Srgb }
     }
 }
 
-/// Compact sRGB v2 ICC profile (736 bytes) embedded in every export: the whole
-/// pipeline works in sRGB, and an UNTAGGED file makes wide-gamut displays guess
-/// — typically stretching the colors to the panel gamut (oversaturation).
-/// Source: saucecontrol/Compact-ICC-Profiles `sRGB-v2-magic.icc`, licensed
-/// CC0-1.0 (public domain) — redistribution in this public repo is fine.
-const SRGB_ICC: &[u8] = include_bytes!("../assets/sRGB-v2-magic.icc");
+// --- Delivery color spaces: a real gamut transform (gap batch D2) ------------
+//
+// The whole pipeline works in sRGB. Choosing a wider export space converts the
+// pixel NUMBERS (linearise → 3×3 primaries change → target TRC) and embeds the
+// matching profile, so a color-managed viewer shows the *same* colors — that
+// is the point of color management. What you gain is a valid Display P3 /
+// Adobe RGB deliverable (wide-gamut web, print workflows). sRGB is a subset of
+// both targets, so the conversion never clips.
+//
+// The matrices are DERIVED from primary chromaticities at runtime instead of
+// hand-typing 7-digit constants from a table: build each space's RGB→XYZ from
+// its primaries + white point (all three spaces share the D65 white, so no
+// chromatic adaptation is involved), then sRGB→target = inv(M_target)·M_srgb.
+// The white-preservation unit test pins the derivation end to end.
 
-/// Tag an encoder's output as sRGB. Never fails on jpeg/png/tiff in image
-/// 0.25 (their `set_icc_profile` impls store the profile unconditionally —
-/// verified in the crate source); if a future version regresses, the pixels
-/// are still correct sRGB, just untagged — so warn instead of failing the
-/// whole export.
-fn tag_srgb<E: ImageEncoder>(enc: &mut E) {
-    if let Err(e) = enc.set_icc_profile(SRGB_ICC.to_vec()) {
-        eprintln!("⚠ could not embed the sRGB ICC profile: {e:?}");
+/// Output color space for exports. `Srgb` is the pipeline's native space
+/// (identity). Display P3 uses the sRGB transfer curve on P3-D65 primaries;
+/// Adobe RGB (1998) uses its pure 563/256 gamma on its own primaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExportColorSpace {
+    #[default]
+    Srgb,
+    DisplayP3,
+    AdobeRgb,
+}
+
+/// CIE xy chromaticities (D65 white shared by all three spaces).
+const D65_XY: [f32; 2] = [0.3127, 0.3290];
+const SRGB_PRIM: [[f32; 2]; 3] = [[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]];
+const P3_PRIM: [[f32; 2]; 3] = [[0.680, 0.320], [0.265, 0.690], [0.150, 0.060]];
+const ADOBE_PRIM: [[f32; 2]; 3] = [[0.64, 0.33], [0.21, 0.71], [0.15, 0.06]];
+/// Adobe RGB (1998) transfer gamma, exact per the spec (= 2.19921875, a
+/// dyadic rational that f32 represents exactly).
+const ADOBE_GAMMA: f32 = 563.0 / 256.0;
+
+fn mat_vec3(m: &[[f32; 3]; 3], v: &[f32; 3]) -> [f32; 3] {
+    [
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+    ]
+}
+
+fn mat_mul3(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let mut out = [[0.0f32; 3]; 3];
+    for (i, row) in out.iter_mut().enumerate() {
+        for (j, cell) in row.iter_mut().enumerate() {
+            *cell = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+        }
+    }
+    out
+}
+
+/// 3×3 inverse by adjugate / determinant. The primaries matrices are far from
+/// singular (their determinants are the gamut volumes), so plain f32 is fine.
+fn inv3(m: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let c00 = m[1][1] * m[2][2] - m[1][2] * m[2][1];
+    let c01 = m[1][2] * m[2][0] - m[1][0] * m[2][2];
+    let c02 = m[1][0] * m[2][1] - m[1][1] * m[2][0];
+    let det = m[0][0] * c00 + m[0][1] * c01 + m[0][2] * c02;
+    let d = 1.0 / det;
+    [
+        [c00 * d, (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * d, (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * d],
+        [c01 * d, (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * d, (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * d],
+        [c02 * d, (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * d, (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * d],
+    ]
+}
+
+/// RGB→XYZ from primary + white chromaticities (textbook derivation: primary
+/// XYZ columns at Y=1, scaled so R=G=B=1 lands exactly on the white point).
+fn rgb_to_xyz(prim: [[f32; 2]; 3], white: [f32; 2]) -> [[f32; 3]; 3] {
+    let col = |p: [f32; 2]| [p[0] / p[1], 1.0, (1.0 - p[0] - p[1]) / p[1]];
+    let (r, g, b) = (col(prim[0]), col(prim[1]), col(prim[2]));
+    let m = [[r[0], g[0], b[0]], [r[1], g[1], b[1]], [r[2], g[2], b[2]]];
+    let s = mat_vec3(&inv3(&m), &col(white));
+    [
+        [m[0][0] * s[0], m[0][1] * s[1], m[0][2] * s[2]],
+        [m[1][0] * s[0], m[1][1] * s[1], m[1][2] * s[2]],
+        [m[2][0] * s[0], m[2][1] * s[1], m[2][2] * s[2]],
+    ]
+}
+
+/// Linear-light sRGB → linear-light target primaries. `None` for sRGB itself.
+fn srgb_to_space_matrix(space: ExportColorSpace) -> Option<[[f32; 3]; 3]> {
+    let m_srgb = rgb_to_xyz(SRGB_PRIM, D65_XY);
+    match space {
+        ExportColorSpace::Srgb => None,
+        ExportColorSpace::DisplayP3 => Some(mat_mul3(&inv3(&rgb_to_xyz(P3_PRIM, D65_XY)), &m_srgb)),
+        ExportColorSpace::AdobeRgb => Some(mat_mul3(&inv3(&rgb_to_xyz(ADOBE_PRIM, D65_XY)), &m_srgb)),
+    }
+}
+
+/// Convert a rendered (sRGB-encoded) image into the requested delivery space:
+/// decode the sRGB TRC → change primaries in linear light → encode the
+/// target's TRC (P3 shares sRGB's curve; Adobe RGB is a pure 563/256 gamma).
+/// 16-bit throughout. Identity (clone) for sRGB.
+pub fn convert_export_color_space(img: &DynamicImage, space: ExportColorSpace) -> DynamicImage {
+    let Some(m) = srgb_to_space_matrix(space) else {
+        return img.clone();
+    };
+    let mut rgb = img.to_rgb16();
+    for px in rgb.pixels_mut() {
+        let lin = [
+            srgb_to_linear(px[0] as f32 / 65535.0),
+            srgb_to_linear(px[1] as f32 / 65535.0),
+            srgb_to_linear(px[2] as f32 / 65535.0),
+        ];
+        let t = mat_vec3(&m, &lin);
+        let enc = |c: f32| -> u16 {
+            let c = c.clamp(0.0, 1.0);
+            let e = match space {
+                ExportColorSpace::AdobeRgb => c.powf(1.0 / ADOBE_GAMMA),
+                _ => linear_to_srgb(c),
+            };
+            (e.clamp(0.0, 1.0) * 65535.0).round() as u16
+        };
+        *px = Rgb([enc(t[0]), enc(t[1]), enc(t[2])]);
+    }
+    DynamicImage::ImageRgb16(rgb)
+}
+
+/// Compact v2 ICC profiles embedded in exports — an UNTAGGED file makes
+/// wide-gamut displays guess (typically stretching colors to the panel gamut).
+/// All three from saucecontrol/Compact-ICC-Profiles, licensed CC0-1.0 (public
+/// domain, repo license verified) — redistribution in this public repo is fine.
+/// `acsp` signature + header size field validated at download time.
+const SRGB_ICC: &[u8] = include_bytes!("../assets/sRGB-v2-magic.icc");
+const DISPLAY_P3_ICC: &[u8] = include_bytes!("../assets/DisplayP3-v2-magic.icc");
+const ADOBE_RGB_ICC: &[u8] = include_bytes!("../assets/AdobeCompat-v2.icc");
+
+/// Tag an encoder's output with the export space's profile. Never fails on
+/// jpeg/png/tiff in image 0.25 (their `set_icc_profile` impls store the
+/// profile unconditionally — verified in the crate source); if a future
+/// version regresses, the pixels are still correctly encoded, just untagged —
+/// so warn instead of failing the whole export.
+fn tag_icc<E: ImageEncoder>(enc: &mut E, space: ExportColorSpace) {
+    let profile = match space {
+        ExportColorSpace::Srgb => SRGB_ICC,
+        ExportColorSpace::DisplayP3 => DISPLAY_P3_ICC,
+        ExportColorSpace::AdobeRgb => ADOBE_RGB_ICC,
+    };
+    if let Err(e) = enc.set_icc_profile(profile.to_vec()) {
+        eprintln!("⚠ could not embed the {space:?} ICC profile: {e:?}");
     }
 }
 
 /// Render and save to `out` at the highest fidelity the format allows:
 /// `.tif`/`.png` keep the full **16-bit** depth; `.jpg` downconverts to 8-bit.
-/// Every export is TAGGED sRGB (see [`SRGB_ICC`]). Extension picks the format.
-/// Dispatches RAW (demosaic engine) vs baked image (the PNG-source engine)
-/// automatically. `export` adds the delivery pipeline (resize / output sharpen
-/// / JPEG quality); `None` = full-res q95 as always. Returns the SAVED
-/// dimensions (post-resize).
+/// Every export is transformed into and TAGGED with the selected delivery
+/// color space (sRGB by default — see [`ExportColorSpace`] / [`tag_icc`]).
+/// Extension picks the format. Dispatches RAW (demosaic engine) vs baked
+/// image (the PNG-source engine) automatically. `export` adds the delivery
+/// pipeline (resize / output sharpen / JPEG quality / color space); `None` =
+/// full-res q95 sRGB as always. Returns the SAVED dimensions (post-resize).
 pub fn render_to_file(
     src_path: &Path,
     recipe: &EditRecipe,
@@ -266,6 +398,14 @@ pub fn render_to_file(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    // The gamut transform only runs for formats that can carry the matching
+    // profile: pixels re-encoded for P3/AdobeRGB but saved UNTAGGED would
+    // display wrong everywhere — sRGB is the only space safe to leave untagged.
+    let taggable = matches!(ext.as_str(), "jpg" | "jpeg" | "tif" | "tiff" | "png");
+    let space = if taggable { opts.color_space } else { ExportColorSpace::Srgb };
+    if space != ExportColorSpace::Srgb {
+        img = convert_export_color_space(&img, space);
+    }
     let create = |p: &Path| {
         std::fs::File::create(p)
             .map(std::io::BufWriter::new)
@@ -278,23 +418,24 @@ pub fn render_to_file(
             let mut wr = create(out)?;
             let mut enc =
                 image::codecs::jpeg::JpegEncoder::new_with_quality(&mut wr, opts.jpeg_quality.clamp(1, 100));
-            tag_srgb(&mut enc);
+            tag_icc(&mut enc, space);
             enc.write_image(rgb8.as_raw(), rgb8.width(), rgb8.height(), image::ExtendedColorType::Rgb8)
                 .with_context(|| format!("encode jpeg {}", out.display()))?;
         }
         "tif" | "tiff" => {
             let mut enc = image::codecs::tiff::TiffEncoder::new(create(out)?);
-            tag_srgb(&mut enc);
+            tag_icc(&mut enc, space);
             img.write_with_encoder(enc)
                 .with_context(|| format!("encode tiff {}", out.display()))?;
         }
         "png" => {
             let mut enc = image::codecs::png::PngEncoder::new(create(out)?);
-            tag_srgb(&mut enc);
+            tag_icc(&mut enc, space);
             img.write_with_encoder(enc)
                 .with_context(|| format!("encode png {}", out.display()))?;
         }
-        // Unknown extensions keep the generic 16-bit save (no ICC tag).
+        // Unknown extensions keep the generic 16-bit save (no ICC tag, so the
+        // pixels above were deliberately left in sRGB).
         _ => img
             .save(out)
             .with_context(|| format!("save render {}", out.display()))?,
@@ -1691,6 +1832,95 @@ mod tests {
                 bytes.windows(needle.len()).any(|win| win == needle),
                 "{name} must carry the sRGB ICC marker"
             );
+        }
+    }
+
+    #[test]
+    fn gamut_transform_is_colorimetric_not_a_tag_swap() {
+        // (a) White preservation pins the whole matrix derivation: every row of
+        // sRGB→target must sum to 1 (R=G=B=1 stays exactly white — all three
+        // spaces share the D65 white point, so no adaptation term may appear).
+        for space in [ExportColorSpace::DisplayP3, ExportColorSpace::AdobeRgb] {
+            let m = srgb_to_space_matrix(space).unwrap();
+            for (i, row) in m.iter().enumerate() {
+                let s: f32 = row.iter().sum();
+                assert!((s - 1.0).abs() < 1e-3, "{space:?} row {i} sums to {s}");
+            }
+            // (b) Invertibility: a color grid survives forward → inverse.
+            let inv = inv3(&m);
+            for c in [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.7, 0.2, 0.55]] {
+                let back = mat_vec3(&inv, &mat_vec3(&m, &c));
+                for k in 0..3 {
+                    assert!((back[k] - c[k]).abs() < 1e-3, "{space:?} roundtrip {c:?} → {back:?}");
+                }
+            }
+        }
+
+        // (c) Full pixel path on a mid-grey: P3 shares sRGB's TRC, so a neutral
+        // pixel is numerically UNCHANGED; Adobe RGB's pure gamma encodes the
+        // same grey darker — while staying exactly neutral. That difference is
+        // the transform actually running (a tag swap would leave both equal).
+        let grey = DynamicImage::ImageRgb16(ImageBuffer::from_pixel(2, 2, Rgb([32896u16, 32896, 32896])));
+        let p3 = convert_export_color_space(&grey, ExportColorSpace::DisplayP3).to_rgb16();
+        let (pr, pg, pb) = (p3.get_pixel(0, 0)[0], p3.get_pixel(0, 0)[1], p3.get_pixel(0, 0)[2]);
+        assert!(pr == pg && pg == pb, "P3 grey must stay neutral: {pr},{pg},{pb}");
+        assert!((pr as i32 - 32896).abs() <= 4, "P3 grey must keep its value: {pr}");
+        let ad = convert_export_color_space(&grey, ExportColorSpace::AdobeRgb).to_rgb16();
+        let (ar, ag, ab) = (ad.get_pixel(0, 0)[0], ad.get_pixel(0, 0)[1], ad.get_pixel(0, 0)[2]);
+        assert!(ar == ag && ag == ab, "AdobeRGB grey must stay neutral: {ar},{ag},{ab}");
+        assert!((ar as i32) < pr as i32 - 64, "AdobeRGB gamma must encode grey darker: {ar} vs {pr}");
+
+        // (d) Saturated sRGB red. P3's red primary sits further out, so sRGB
+        // red lands strictly INSIDE (dominant red, positive green/blue).
+        // Adobe RGB shares sRGB's red CHROMATICITY, so sRGB red stays a pure
+        // red there — just rescaled (Adobe's red carries a larger luminance
+        // share): g = b = 0 with red below full scale. Both derive from the
+        // primaries table, so both directions pin the matrix.
+        let red = DynamicImage::ImageRgb16(ImageBuffer::from_pixel(1, 1, Rgb([65535u16, 0, 0])));
+        let p3r = convert_export_color_space(&red, ExportColorSpace::DisplayP3).to_rgb16();
+        let p = p3r.get_pixel(0, 0);
+        assert!(
+            p[0] > 55000 && p[1] > 0 && p[2] > 0 && p[1] < p[0] && p[2] < p[0],
+            "DisplayP3: sRGB red must land inside the gamut, got {p:?}"
+        );
+        let adr = convert_export_color_space(&red, ExportColorSpace::AdobeRgb).to_rgb16();
+        let q = adr.get_pixel(0, 0);
+        assert!(
+            q[0] > 50000 && q[0] < 62000 && q[1] <= 300 && q[2] <= 300,
+            "AdobeRGB: sRGB red must stay a rescaled pure red, got {q:?}"
+        );
+
+        // (e) sRGB is the identity (exact clone).
+        let same = convert_export_color_space(&grey, ExportColorSpace::Srgb).to_rgb16();
+        assert_eq!(same.get_pixel(1, 1)[0], 32896);
+    }
+
+    #[test]
+    fn exports_embed_the_selected_wide_gamut_profile() {
+        // JPEG (APP2, one segment at 736 B) and TIFF (tag 34675) store the raw
+        // profile — the ENTIRE profile bytes must appear in the file. PNG
+        // deflate-compresses inside iCCP, so it is covered by the chunk check
+        // in exports_are_tagged_srgb_in_all_three_formats.
+        std::fs::create_dir_all("out").ok();
+        let src_p = std::path::Path::new("out/_gamut_src.png");
+        RgbImage::from_fn(24, 12, |x, y| Rgb([(x * 10) as u8, (y * 20) as u8, 90]))
+            .save(src_p)
+            .unwrap();
+        let neutral = EditRecipe::default();
+        for (space, profile) in [
+            (ExportColorSpace::DisplayP3, DISPLAY_P3_ICC),
+            (ExportColorSpace::AdobeRgb, ADOBE_RGB_ICC),
+        ] {
+            let opts = ExportOpts { color_space: space, ..Default::default() };
+            for name in ["out/_gamut.jpg", "out/_gamut.tif"] {
+                render_to_file(src_p, &neutral, std::path::Path::new(name), None, Some(&opts)).unwrap();
+                let bytes = std::fs::read(name).unwrap();
+                assert!(
+                    bytes.windows(profile.len()).any(|win| win == profile),
+                    "{name} must embed the full {space:?} profile ({} B)",
+                    profile.len()
+                );
+            }
         }
     }
 
