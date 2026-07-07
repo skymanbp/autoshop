@@ -111,7 +111,10 @@ const PILL: egui::Color32 = egui::Color32::from_rgb(0xc9, 0xa1, 0x4a);
 /// reimagine): (preview of the saved ./out master, status message, the saved
 /// path when it is a REIMAGINE output — a whole-frame rendition that can be
 /// reverse-fitted into a recipe — and the master path itself, which
-///「以此母版继续修图」reopens as the working source with the recipe kept).
+///「以此母版继续修图」reopens as the working source; the recipe is kept only
+/// for fill/heal/clone masters — a reimagine master already carries the look
+/// in its pixels, so chaining restarts from a neutral recipe, see
+/// `continue_from_master`).
 type RetouchDone = anyhow::Result<(image::DynamicImage, String, Option<PathBuf>, PathBuf)>;
 
 /// Messages from worker threads back to the UI. The large payloads are boxed so
@@ -570,7 +573,9 @@ struct AutoshopApp {
     clone_fullres: bool,                   // clone on the full-res develop (RAW only)
     // --- pixel-master ↔ recipe chaining (gap batch B) ---
     master: Option<PathBuf>,               // last ./out retouch master (fill/heal/clone/reimagine)
+    master_restyled: bool,                 // master is a whole-frame restyle (reimagine): its look lives in the pixels
     keep_recipe: bool,                     // one-shot: next Opened keeps the recipe (continue-from-master)
+    open_note: Option<String>,             // one-shot: status note for the next Opened (e.g. why the sliders reset)
     // --- export pipeline (gap batch F + D2) ---
     exp_long_edge: u32,                    // resize long edge in px; 0 = full resolution
     exp_sharpen: f32,                      // output sharpening 0..100, post-resize
@@ -701,7 +706,9 @@ impl Default for AutoshopApp {
             clone_src: None,
             clone_fullres: false,
             master: None,
+            master_restyled: false,
             keep_recipe: false,
+            open_note: None,
             exp_long_edge: 0,
             exp_sharpen: 0.0,
             exp_quality: 95.0,
@@ -890,10 +897,19 @@ impl AutoshopApp {
     }
 
     /// 「以此母版继续修图」— reopen the last ./out retouch master as the working
-    /// source with the current recipe KEPT (gap batch B: the pixel master and
-    /// the parametric recipe chain instead of detaching). Valid because every
-    /// master is a NEUTRAL develop + retouched pixels of the same full frame,
-    /// so tone/colour/masks/crop/straighten all still mean the same thing.
+    /// source (gap batch B: the pixel master and the parametric recipe chain
+    /// instead of detaching). Whether the recipe survives depends on WHAT the
+    /// master is:
+    ///
+    /// - fill/heal/clone: a NEUTRAL develop + local pixel patches of the same
+    ///   full frame — tone/colour/masks/crop/straighten still mean the same
+    ///   thing, so the working recipe is KEPT.
+    /// - reimagine: a whole-frame generative RESTYLE — the look is already
+    ///   baked into the pixels. Keeping the recipe re-applies it on top (and
+    ///   right after a reverse-fit the recipe IS that look), double-cooking
+    ///   the image (2026-07-07 field report: saturation +60 over the already
+    ///   saturated rendition → neon orange/blue). The recipe restarts neutral.
+    ///
     /// Subsequent fill/heal/clone read the master (src_path re-targets); XMP
     /// stays tied to RAW sources only, as before.
     fn continue_from_master(&mut self) {
@@ -903,7 +919,14 @@ impl AutoshopApp {
             self.master = None;
             return;
         }
-        self.keep_recipe = true; // consumed by the next Msg::Opened
+        if self.master_restyled {
+            // Recipe deliberately NOT kept — explain in the status line, or the
+            // sliders snapping to neutral reads as "my edit got lost".
+            self.open_note =
+                Some("已从生成母版继续 — 观感已烘焙在像素里，滑杆从中性开始（避免风格二次叠加）".into());
+        } else {
+            self.keep_recipe = true; // consumed by the next Msg::Opened
+        }
         self.open_path(p);
     }
 
@@ -1956,10 +1979,11 @@ impl AutoshopApp {
             let Some(msg) = self.rx.as_ref().and_then(|rx| rx.try_recv().ok()) else { break };
             match msg {
                 Msg::Opened(boxed) => {
-                    // One-shot continue-from-master flag: consumed whether the
-                    // open succeeded or failed, so a failure can't leak it into
+                    // One-shot continue-from-master flags: consumed whether the
+                    // open succeeded or failed, so a failure can't leak them into
                     // an unrelated later open.
                     let keep = std::mem::take(&mut self.keep_recipe);
+                    let note = std::mem::take(&mut self.open_note);
                     match *boxed {
                     Ok(base) => {
                         self.before_tex = Some(ctx.load_texture(
@@ -2009,7 +2033,9 @@ impl AutoshopApp {
                         self.refresh_versions(); // version snapshots are per-photo
                         self.dirty = true; // render the (neutral) after
                         self.busy = false;
-                        self.status = if keep {
+                        self.status = if let Some(n) = note {
+                            n // e.g. restyled-master continue: says WHY the sliders reset
+                        } else if keep {
                             "已从母版继续 — 配方保留，可继续调滑杆/再修图".into()
                         } else {
                             "ready — adjust sliders or run AI Analyze".into()
@@ -2109,11 +2135,16 @@ impl AutoshopApp {
                         // A whole-frame reimagine output becomes the reverse-fit
                         // target; fill/heal artifacts don't (they're mostly the
                         // original pixels, so a fit would just be neutral).
+                        // The same predicate marks the master as RESTYLED: an
+                        // output that is a whole-frame rendition carries its look
+                        // in the pixels, so continue_from_master must not keep
+                        // the recipe on top of it (double-cook).
+                        self.master_restyled = generated.is_some();
                         if let Some(p) = generated {
                             self.last_generated = Some(p);
                         }
                         // Remember the master so「以此母版继续修图」can chain it
-                        // back in as the working source (recipe kept).
+                        // back in as the working source.
                         self.master = Some(master);
                         self.clear_mask();
                         self.done(msg);
@@ -4052,14 +4083,17 @@ impl AutoshopApp {
             ui.horizontal(|ui| {
                 let name = m.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 ui.label(egui::RichText::new(format!("母版 {name}")).weak().small());
-                if ui
-                    .button("⤴ 以此母版继续修图")
-                    .on_hover_text(
-                        "把这张 ./out 像素母版设为当前工作图（保留全部滑杆/蒙版/裁剪），\
-后续修图与导出都基于它 — 修补不再因动滑杆而丢失",
-                    )
-                    .clicked()
-                {
+                // The promise differs by master kind: a retouch master chains
+                // with the recipe kept; a reimagine master carries its look in
+                // the pixels, so the sliders restart neutral (no double-cook).
+                let tip = if self.master_restyled {
+                    "把这张 AI 生成图设为当前工作图。观感已烘焙在像素里，\
+滑杆会从中性开始（配方不叠加，避免风格二次烹饪）；后续修补与导出都基于它"
+                } else {
+                    "把这张 ./out 像素母版设为当前工作图（保留全部滑杆/蒙版/裁剪），\
+后续修图与导出都基于它 — 修补不再因动滑杆而丢失"
+                };
+                if ui.button("⤴ 以此母版继续修图").on_hover_text(tip).clicked() {
                     self.continue_from_master();
                 }
             });
