@@ -107,15 +107,24 @@ const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x4c, 0x8b, 0xf5);
 const SEL_BG: egui::Color32 = egui::Color32::from_rgb(0x26, 0x41, 0x7a);
 const PILL: egui::Color32 = egui::Color32::from_rgb(0xc9, 0xa1, 0x4a);
 
-/// A finished retouch, from any of the four pixel paths (fill/heal/clone/
-/// reimagine): (preview of the saved ./out master, status message, the saved
-/// path when it is a REIMAGINE output — a whole-frame rendition that can be
-/// reverse-fitted into a recipe — and the master path itself, which
-///「以此母版继续修图」reopens as the working source; the recipe is kept only
-/// for fill/heal/clone masters — a reimagine master already carries the look
-/// in its pixels, so chaining restarts from a neutral recipe, see
-/// `continue_from_master`).
-type RetouchDone = anyhow::Result<(image::DynamicImage, String, Option<PathBuf>, PathBuf)>;
+/// How a finished retouch enters the variant strip.
+#[derive(Clone, Copy, PartialEq)]
+enum RetouchKind {
+    /// A whole-frame REIMAGINE rendition → a NEW「AI 生成」variant (its look
+    /// lives in the pixels).
+    NewGenerated,
+    /// A fill/heal/clone touch-up of the CURRENT rendition → bake into the
+    /// active variant's base AND repoint its `origin` at the saved artifact, so
+    /// export / reverse-fit / a further retouch all follow the retouched pixels
+    /// (WYSIWYG) instead of the pre-retouch source.
+    InPlace,
+}
+
+/// A finished retouch from any of the four pixel paths (fill/heal/clone/
+/// reimagine): `(preview of the ./out result, status message, the saved
+/// full-resolution ./out artifact, kind)`. The saved path becomes the affected
+/// variant's `origin` — its export / reverse-fit / next-retouch source.
+type RetouchDone = anyhow::Result<(image::DynamicImage, String, PathBuf, RetouchKind)>;
 
 /// Messages from worker threads back to the UI. The large payloads are boxed so
 /// the channel message stays small (clippy::large_enum_variant).
@@ -478,7 +487,16 @@ fn model_picker(ui: &mut egui::Ui, salt: &str, value: &mut String, options: &[St
 
 struct AutoshopApp {
     src_path: Option<PathBuf>,
-    base_preview: Option<image::DynamicImage>, // decoded source preview (re-developed on edit)
+    // The ACTIVE variant's base pixels — what the sliders develop over. Equals
+    // `source_preview` for source-based variants (Original / Fitted), or a
+    // baked raster for a Generated / retouched variant. Every existing reader
+    // ("develop from here", "fit from here", mask sizing) uses this unchanged.
+    base_preview: Option<image::DynamicImage>,
+    // The pristine source neutral (RAW develop / loaded image), decoded once
+    // per open. It is the `None`-base for Original and Fitted variants and the
+    // base a reverse-fit maps FROM — kept separate so switching a source-based
+    // variant back never re-decodes and a reimagine can't overwrite it.
+    source_preview: Option<image::DynamicImage>,
     before_tex: Option<egui::TextureHandle>,
     after_tex: Option<egui::TextureHandle>,
     recipe: EditRecipe,
@@ -525,8 +543,6 @@ struct AutoshopApp {
     fill_quality: usize,                   // 0=high 1=medium 2=low
     fill_fullres: bool,                    // composite onto the full-res develop
     heal_fullres: bool,                    // heal the full-res develop
-    // --- reverse-fit ("match") ---
-    last_generated: Option<PathBuf>,       // this photo's last reimagine output (fit target)
     // --- production niceties ---
     view_mode: ViewMode,                   // side-by-side vs after-only (hold B = compare)
     toasts: Vec<Toast>,                    // transient corner notifications
@@ -571,11 +587,14 @@ struct AutoshopApp {
     clone_mode: bool,                      // brush paints the clone target; Alt+click = source
     clone_src: Option<(f32, f32)>,         // picked source point, original-frame normalized
     clone_fullres: bool,                   // clone on the full-res develop (RAW only)
-    // --- pixel-master ↔ recipe chaining (gap batch B) ---
-    master: Option<PathBuf>,               // last ./out retouch master (fill/heal/clone/reimagine)
-    master_restyled: bool,                 // master is a whole-frame restyle (reimagine): its look lives in the pixels
-    keep_recipe: bool,                     // one-shot: next Opened keeps the recipe (continue-from-master)
-    open_note: Option<String>,             // one-shot: status note for the next Opened (e.g. why the sliders reset)
+    // --- variants (版本/变体): parallel renditions of the open photo ---
+    // Original + any AI-generated / reverse-fitted versions. The active one
+    // drives the sliders, histogram and canvas; switching is lossless (each
+    // remembers its own base + recipe), so an AI develop no longer "reverts"
+    // when you touch a slider — you're editing that variant's own base.
+    variants: Vec<Variant>,
+    active: usize,                         // index into `variants` (always valid once a photo is open)
+    keep_recipe: bool,                     // one-shot: next Opened keeps recipe/variants (preview-res re-decode)
     // --- export pipeline (gap batch F + D2) ---
     exp_long_edge: u32,                    // resize long edge in px; 0 = full resolution
     exp_sharpen: f32,                      // output sharpening 0..100, post-resize
@@ -585,6 +604,49 @@ struct AutoshopApp {
     preview_edge: u32,                     // working-preview long edge: 1280 fluid / 2560 / 4096 detail
     // --- recipe versions (gap batch G): ./out/<stem>.v<N>.recipe.json ---
     versions: Vec<u32>,                    // snapshot numbers found for the open photo (sorted)
+}
+
+/// One rendition in the variant strip — a Lightroom-style virtual copy /
+/// Capture One variant, NOT a compositing layer (variants never blend; you
+/// switch between them losslessly). A variant is fully defined by its base
+/// pixels + its develop recipe.
+struct Variant {
+    kind: VariantKind,
+    /// This variant's develop. The ACTIVE variant's recipe is mirrored in
+    /// `AutoshopApp::recipe` (the live working copy the sliders edit); it is
+    /// saved back here when you switch away.
+    recipe: EditRecipe,
+    /// Base pixels this variant develops from. `None` ⇒ the shared source
+    /// neutral (`AutoshopApp::source_preview`): used by Original and by a
+    /// reverse-fit (Fitted re-develops the SAME negative — only the recipe
+    /// carries the look). `Some` ⇒ a raster the look is baked into (a
+    /// reimagine result, or a fill/heal/clone touch-up), developed on top.
+    base: Option<image::DynamicImage>,
+    /// The ./out artifact behind a raster variant (the reimagine PNG) — the
+    /// reverse-fit target and the full-res export source. `None` for
+    /// source-based variants.
+    origin: Option<PathBuf>,
+    /// Small developed thumbnail for the strip (rebuilt for the active variant
+    /// on every develop; built once for the others when created / left).
+    thumb: Option<egui::TextureHandle>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum VariantKind {
+    Original,  // 原片 — the loaded RAW / image, your develop
+    Generated, // AI 生成 — a whole-frame gpt-image restyle (look in the pixels)
+    Fitted,    // 反推 — the generated look solved back into an editable recipe
+}
+
+impl VariantKind {
+    /// Strip label (icon + name).
+    fn label(self) -> &'static str {
+        match self {
+            VariantKind::Original => "▣ 原片",
+            VariantKind::Generated => "✨ AI 生成",
+            VariantKind::Fitted => "◭ 反推",
+        }
+    }
 }
 
 /// The two mask geometries a user can place by dragging.
@@ -640,6 +702,7 @@ impl Default for AutoshopApp {
         Self {
             src_path: None,
             base_preview: None,
+            source_preview: None,
             before_tex: None,
             after_tex: None,
             recipe: EditRecipe::default(),
@@ -681,7 +744,6 @@ impl Default for AutoshopApp {
             fill_quality: 0,
             fill_fullres: false,
             heal_fullres: false,
-            last_generated: None,
             view_mode: ViewMode::SideBySide,
             toasts: Vec::new(),
             histogram: None,
@@ -705,10 +767,9 @@ impl Default for AutoshopApp {
             clone_mode: false,
             clone_src: None,
             clone_fullres: false,
-            master: None,
-            master_restyled: false,
+            variants: Vec::new(),
+            active: 0,
             keep_recipe: false,
-            open_note: None,
             exp_long_edge: 0,
             exp_sharpen: 0.0,
             exp_quality: 95.0,
@@ -896,38 +957,140 @@ impl AutoshopApp {
         });
     }
 
-    /// 「以此母版继续修图」— reopen the last ./out retouch master as the working
-    /// source (gap batch B: the pixel master and the parametric recipe chain
-    /// instead of detaching). Whether the recipe survives depends on WHAT the
-    /// master is:
-    ///
-    /// - fill/heal/clone: a NEUTRAL develop + local pixel patches of the same
-    ///   full frame — tone/colour/masks/crop/straighten still mean the same
-    ///   thing, so the working recipe is KEPT.
-    /// - reimagine: a whole-frame generative RESTYLE — the look is already
-    ///   baked into the pixels. Keeping the recipe re-applies it on top (and
-    ///   right after a reverse-fit the recipe IS that look), double-cooking
-    ///   the image (2026-07-07 field report: saturation +60 over the already
-    ///   saturated rendition → neon orange/blue). The recipe restarts neutral.
-    ///
-    /// Subsequent fill/heal/clone read the master (src_path re-targets); XMP
-    /// stays tied to RAW sources only, as before.
-    fn continue_from_master(&mut self) {
-        let Some(p) = self.master.clone() else { return };
-        if !p.exists() {
-            self.status = format!("母版不存在：{}（已被移动/删除？）", p.display());
-            self.master = None;
+    /// The active variant, if a photo is open.
+    fn active_variant(&self) -> Option<&Variant> {
+        self.variants.get(self.active)
+    }
+
+    /// The reverse-fit / style-prompt target: the ./out PNG behind the active
+    /// variant when it is an AI-generated rendition (nothing to fit otherwise).
+    /// Reverse-fit maps the SOURCE neutral onto this rendition, so it only
+    /// makes sense when the look lives in a generated raster.
+    fn fit_target(&self) -> Option<PathBuf> {
+        let v = self.active_variant()?;
+        (v.kind == VariantKind::Generated).then(|| v.origin.clone()).flatten()
+    }
+
+    /// The on-disk PIXEL SOURCE the active variant renders / retouches /
+    /// exports FROM. Any variant whose pixels are baked into a ./out raster — a
+    /// reimagine (Generated), OR an in-place fill/heal/clone on ANY variant —
+    /// carries that full-resolution artifact in `origin` and renders from it;
+    /// a pristine source-based variant (原片 / 反推 with no pixel retouch) has
+    /// `origin = None` and renders from `src_path` (the RAW / loaded image)
+    /// developed by the recipe. Retouch and export key off THIS — not raw
+    /// `src_path` — so what exports matches what's on screen (WYSIWYG), never
+    /// the untouched negative underneath a generated / retouched rendition.
+    fn active_source_path(&self) -> Option<PathBuf> {
+        match self.active_variant() {
+            Some(v) => v.origin.clone().or_else(|| self.src_path.clone()),
+            None => self.src_path.clone(),
+        }
+    }
+
+    /// Is the active variant an AI-generated raster (look baked into pixels,
+    /// not the recipe)? Such a variant has no parametric XMP representation —
+    /// exporting a sidecar for it would be a lie; steer the user to 反推 first.
+    fn active_is_generated(&self) -> bool {
+        self.active_variant().is_some_and(|v| v.kind == VariantKind::Generated)
+    }
+
+    /// Make `self.active`'s recipe + base pixels the live working state and
+    /// rebuild the before texture. Per-variant transient state (undo history,
+    /// local selection, view) restarts — like a soft re-open; what persists is
+    /// each variant's recipe + pixels. Shared by switch / push / delete.
+    fn load_active(&mut self, ctx: &egui::Context) {
+        let Some(v) = self.variants.get(self.active) else { return };
+        self.recipe = v.recipe.clone();
+        self.rationale = self.recipe.rationale.clone();
+        // Base pixels: the variant's own baked raster, else the shared source
+        // neutral (Original / Fitted re-develop the same negative).
+        let base = v.base.clone().or_else(|| self.source_preview.clone());
+        if let Some(base) = base {
+            let (mw, mh) = base.dimensions();
+            self.before_tex = Some(ctx.load_texture(
+                "before",
+                to_color_image(&base),
+                egui::TextureOptions::LINEAR,
+            ));
+            self.base_preview = Some(base);
+            // A fresh transparent paint mask sized to THIS base (a generated
+            // raster and the source neutral can differ in dimensions).
+            self.mask_paint = Some(image::RgbaImage::new(mw, mh));
+            self.mask_tex = None;
+            self.mask_dirty = false;
+            self.paint_last = None;
+        }
+        self.reset_history(); // you can't undo across variants
+        self.region = None;
+        self.region_drag = None;
+        self.sel_mask = None;
+        self.overlay_ref = None;
+        self.overlay_stale = true;
+        self.placing_mask = None;
+        self.place_start = None;
+        self.paint_mode = false;
+        self.clone_mode = false;
+        self.clone_src = None;
+        self.wb_picking = false;
+        self.range_picking = None;
+        self.crop_mode = false;
+        self.crop_drag = None;
+        self.zoom = 1.0;
+        self.pan = egui::vec2(0.5, 0.5);
+        self.verdict = None;
+        self.dirty = true; // re-develop the newly active variant
+    }
+
+    /// Switch the active variant losslessly (strip click): in-flight slider
+    /// edits are saved back into the variant you leave, then the target's
+    /// recipe + pixels become current.
+    fn switch_variant(&mut self, idx: usize, ctx: &egui::Context) {
+        if idx == self.active || idx >= self.variants.len() || self.busy {
             return;
         }
-        if self.master_restyled {
-            // Recipe deliberately NOT kept — explain in the status line, or the
-            // sliders snapping to neutral reads as "my edit got lost".
-            self.open_note =
-                Some("已从生成母版继续 — 观感已烘焙在像素里，滑杆从中性开始（避免风格二次叠加）".into());
-        } else {
-            self.keep_recipe = true; // consumed by the next Msg::Opened
+        if let Some(cur) = self.variants.get_mut(self.active) {
+            cur.recipe = self.recipe.clone(); // don't lose the edits in progress
         }
-        self.open_path(p);
+        self.active = idx;
+        self.load_active(ctx);
+        self.status = format!(
+            "已切到「{}」变体 — 各版本独立，切换无损",
+            self.variants[self.active].kind.label()
+        );
+    }
+
+    /// Append a variant and switch to it (its recipe/pixels become live).
+    /// Saves the outgoing variant's edits first so nothing is lost.
+    fn push_variant(&mut self, v: Variant, ctx: &egui::Context) {
+        if let Some(cur) = self.variants.get_mut(self.active) {
+            cur.recipe = self.recipe.clone();
+        }
+        self.variants.push(v);
+        self.active = self.variants.len() - 1;
+        self.load_active(ctx);
+    }
+
+    /// Remove variant `idx` (never the last one — the strip stays non-empty).
+    /// Only reloads the working state when the ACTIVE variant's identity moves,
+    /// so deleting a background variant can't clobber live edits. Refuses while
+    /// busy: an in-flight retouch worker resolves its target by `self.active` at
+    /// COMPLETION time, so re-anchoring `active` mid-flight would bake its result
+    /// onto the wrong variant.
+    fn delete_variant(&mut self, idx: usize, ctx: &egui::Context) {
+        if self.busy || self.variants.len() <= 1 || idx >= self.variants.len() {
+            return;
+        }
+        let active_removed = idx == self.active;
+        self.variants.remove(idx);
+        if self.active > idx {
+            self.active -= 1; // same variant, shifted left
+        }
+        if self.active >= self.variants.len() {
+            self.active = self.variants.len() - 1; // removed the tail
+        }
+        if active_removed {
+            self.load_active(ctx); // the active variant changed identity
+        }
     }
 
     /// Recipe snapshot path for version `n` — `./out/<stem>.v<n>.recipe.json`
@@ -1325,6 +1488,16 @@ impl AutoshopApp {
                 ctx.load_texture("clip", clipping_overlay(&after), egui::TextureOptions::NEAREST)
             });
             self.after_tex = Some(ctx.load_texture("after", to_color_image(&after), egui::TextureOptions::LINEAR));
+            // Keep the active variant's strip thumbnail in step with its
+            // develop (the other variants' thumbs were built when last active).
+            let thumb = ctx.load_texture(
+                "vthumb",
+                to_color_image(&after.thumbnail(96, 96)),
+                egui::TextureOptions::LINEAR,
+            );
+            if let Some(v) = self.variants.get_mut(self.active) {
+                v.thumb = Some(thumb);
+            }
         }
         // Any recipe change can move the selected mask's coverage (geometry,
         // range, amount, straighten, distortion) — refresh the overlay too.
@@ -1730,10 +1903,12 @@ impl AutoshopApp {
         });
     }
 
-    /// `./out/<stem>.developed.{tif|jpg}` — the default export target.
+    /// `./out/<stem>.developed.{tif|jpg}` — the default export target. The stem
+    /// follows the ACTIVE variant's pixel source, so a Generated variant exports
+    /// under its reimagine stem (and its AI pixels), not the original's.
     fn default_out(&self) -> PathBuf {
-        let stem = self
-            .src_path
+        let src = self.active_source_path();
+        let stem = src
             .as_deref()
             .and_then(|p| p.file_stem())
             .and_then(|s| s.to_str())
@@ -1744,9 +1919,11 @@ impl AutoshopApp {
     }
 
     /// Render the full-resolution develop to `out` on a worker thread (16-bit
-    /// TIFF, or 8-bit JPEG when the path ends in .jpg).
+    /// TIFF, or 8-bit JPEG when the path ends in .jpg). Renders the ACTIVE
+    /// variant's pixel source (a Generated variant → its full-res reimagine PNG,
+    /// developed by the recipe), so what exports matches what's on screen.
     fn start_render_to(&mut self, out: PathBuf) {
-        let Some(path) = self.src_path.clone() else { return };
+        let Some(path) = self.active_source_path() else { return };
         if self.busy {
             return;
         }
@@ -1892,7 +2069,15 @@ impl AutoshopApp {
     }
 
     /// Write the Lightroom / Camera-Raw XMP sidecar to ./out (RAW sources only).
+    /// An XMP reproduces a look via develop PARAMETERS; a Generated variant's
+    /// look lives in its pixels, not the recipe, so there's nothing faithful to
+    /// write — steer the user to 反推 (which produces a Fitted variant whose XMP
+    /// IS the look). Always keyed to the original RAW `src_path`.
     fn save_xmp(&mut self) {
+        if self.active_is_generated() {
+            self.status = "生成变体的观感在像素里，没有参数配方可导；先「反推配方」得到可导出的 XMP".into();
+            return;
+        }
         let Some(path) = self.src_path.clone() else { return };
         if !autoshop::decode::is_raw(&path) {
             self.status = "XMP applies to RAW files only".into();
@@ -1979,70 +2164,111 @@ impl AutoshopApp {
             let Some(msg) = self.rx.as_ref().and_then(|rx| rx.try_recv().ok()) else { break };
             match msg {
                 Msg::Opened(boxed) => {
-                    // One-shot continue-from-master flags: consumed whether the
-                    // open succeeded or failed, so a failure can't leak them into
-                    // an unrelated later open.
+                    // `keep` distinguishes a fresh open from a preview-resolution
+                    // re-decode (the px combo): consumed whether the open
+                    // succeeds or fails so a failure can't leak it into a later
+                    // open.
                     let keep = std::mem::take(&mut self.keep_recipe);
-                    let note = std::mem::take(&mut self.open_note);
                     match *boxed {
                     Ok(base) => {
-                        self.before_tex = Some(ctx.load_texture(
-                            "before",
-                            to_color_image(&base),
-                            egui::TextureOptions::LINEAR,
-                        ));
-                        let (mw, mh) = base.dimensions();
-                        self.base_preview = Some(base);
-                        // A fresh, fully-transparent paint mask sized to the preview.
-                        self.mask_paint = Some(image::RgbaImage::new(mw, mh));
-                        self.mask_tex = None;
-                        self.mask_dirty = false;
-                        self.paint_last = None;
-                        self.paint_mode = false;
-                        if keep {
-                            // Continue-from-master: the ./out master is a NEUTRAL
-                            // develop + retouched pixels, so the working recipe
-                            // applies to it 1:1 — the pixel and parametric tracks
-                            // chain instead of detaching. History restarts on the
-                            // new base (the master is the new "original").
-                        } else {
-                            self.recipe = EditRecipe::default();
-                            self.master = None; // a master belongs to ONE source photo
-                        }
-                        self.reset_history(); // a new photo starts a fresh undo history
-                        self.region = None; // and a fresh local-edit selection
-                        self.region_drag = None;
-                        self.last_generated = None; // a fit target belongs to ONE photo
-                        // View + tool state is per-photo.
-                        self.zoom = 1.0;
-                        self.pan = egui::vec2(0.5, 0.5);
-                        self.crop_mode = false;
-                        self.crop_drag = None;
-                        self.sel_mask = None;
-                        self.overlay_ref = None; // the reference develop belongs to ONE base
-                        self.overlay_stale = true;
-                        self.placing_mask = None;
-                        self.place_start = None;
-                        self.curve_drag = None; // curve_channel is a UI pref, keep it
-                        self.wb_picking = false;
-                        self.range_picking = None;
-                        self.clone_mode = false;
-                        self.clone_src = None;
-                        self.verdict = None;
-                        self.rationale.clear();
-                        self.refresh_versions(); // version snapshots are per-photo
-                        self.dirty = true; // render the (neutral) after
                         self.busy = false;
-                        self.status = if let Some(n) = note {
-                            n // e.g. restyled-master continue: says WHY the sliders reset
-                        } else if keep {
-                            "已从母版继续 — 配方保留，可继续调滑杆/再修图".into()
+                        if keep {
+                            // Preview-resolution re-decode: the SOURCE pixels just
+                            // changed resolution — keep the whole variant set,
+                            // recipe, undo history and view (zoom included: you
+                            // switched to 4096px to inspect 1:1, losing the zoom
+                            // would defeat the point). Refresh the base a
+                            // source-based active variant develops from; a
+                            // baked-raster variant keeps its own pixels.
+                            let (mw, mh) = base.dimensions();
+                            self.source_preview = Some(base.clone());
+                            let active_source =
+                                self.active_variant().is_none_or(|v| v.base.is_none());
+                            if active_source {
+                                self.before_tex = Some(ctx.load_texture(
+                                    "before",
+                                    to_color_image(&base),
+                                    egui::TextureOptions::LINEAR,
+                                ));
+                                self.mask_paint = Some(image::RgbaImage::new(mw, mh));
+                                self.mask_tex = None;
+                                self.mask_dirty = false;
+                                self.paint_last = None;
+                                self.base_preview = Some(base);
+                            }
+                            self.dirty = true;
+                            self.status = format!("预览分辨率 {}px — 已重解码", self.preview_edge);
                         } else {
-                            "ready — adjust sliders or run AI Analyze".into()
-                        };
+                            // Fresh open: a single Original variant, neutral
+                            // recipe, all per-photo state reset.
+                            let (mw, mh) = base.dimensions();
+                            self.before_tex = Some(ctx.load_texture(
+                                "before",
+                                to_color_image(&base),
+                                egui::TextureOptions::LINEAR,
+                            ));
+                            self.source_preview = Some(base.clone());
+                            self.base_preview = Some(base);
+                            self.recipe = EditRecipe::default();
+                            self.variants = vec![Variant {
+                                kind: VariantKind::Original,
+                                recipe: EditRecipe::default(),
+                                base: None,
+                                origin: None,
+                                thumb: None,
+                            }];
+                            self.active = 0;
+                            // A fresh, fully-transparent paint mask sized to the preview.
+                            self.mask_paint = Some(image::RgbaImage::new(mw, mh));
+                            self.mask_tex = None;
+                            self.mask_dirty = false;
+                            self.paint_last = None;
+                            self.paint_mode = false;
+                            self.reset_history(); // a new photo starts a fresh undo history
+                            self.region = None; // and a fresh local-edit selection
+                            self.region_drag = None;
+                            // View + tool state is per-photo.
+                            self.zoom = 1.0;
+                            self.pan = egui::vec2(0.5, 0.5);
+                            self.crop_mode = false;
+                            self.crop_drag = None;
+                            self.sel_mask = None;
+                            self.overlay_ref = None; // the reference develop belongs to ONE base
+                            self.overlay_stale = true;
+                            self.placing_mask = None;
+                            self.place_start = None;
+                            self.curve_drag = None; // curve_channel is a UI pref, keep it
+                            self.wb_picking = false;
+                            self.range_picking = None;
+                            self.clone_mode = false;
+                            self.clone_src = None;
+                            self.verdict = None;
+                            self.rationale.clear();
+                            self.refresh_versions(); // version snapshots are per-photo
+                            self.dirty = true; // render the (neutral) after
+                            self.status = "ready — adjust sliders or run AI Analyze".into();
+                        }
                     }
                     Err(e) => {
                         self.fail("could not open", e);
+                        if !keep {
+                            // A FRESH open failed: open_path already re-pointed
+                            // src_path to the file that wouldn't decode, but the
+                            // previous photo's variants / pixels are still live —
+                            // a mismatch that would misdirect a later fit / heal /
+                            // XMP (they key off src_path). Drop to a clean
+                            // no-photo state so src_path and the variants can never
+                            // disagree. (A preview-res re-decode failure — keep —
+                            // leaves the still-open photo untouched.)
+                            self.src_path = None;
+                            self.variants.clear();
+                            self.active = 0;
+                            self.base_preview = None;
+                            self.source_preview = None;
+                            self.before_tex = None;
+                            self.after_tex = None;
+                            self.selected = None;
+                        }
                     }
                 }},
                 Msg::Analyzed(boxed) => match *boxed {
@@ -2123,30 +2349,54 @@ impl AutoshopApp {
                     }
                 }
                 Msg::Retouched(boxed) => match *boxed {
-                    Ok((img, msg, generated, master)) => {
-                        // Show the saved master in the After pane (it's a separate
-                        // ./out artifact, not the develop recipe — a slider edit
-                        // re-develops over it, exactly like the web UI).
-                        self.after_tex = Some(ctx.load_texture(
-                            "after",
-                            to_color_image(&img),
-                            egui::TextureOptions::LINEAR,
-                        ));
-                        // A whole-frame reimagine output becomes the reverse-fit
-                        // target; fill/heal artifacts don't (they're mostly the
-                        // original pixels, so a fit would just be neutral).
-                        // The same predicate marks the master as RESTYLED: an
-                        // output that is a whole-frame rendition carries its look
-                        // in the pixels, so continue_from_master must not keep
-                        // the recipe on top of it (double-cook).
-                        self.master_restyled = generated.is_some();
-                        if let Some(p) = generated {
-                            self.last_generated = Some(p);
-                        }
-                        // Remember the master so「以此母版继续修图」can chain it
-                        // back in as the working source.
-                        self.master = Some(master);
+                    Ok((img, msg, saved, kind)) => {
                         self.clear_mask();
+                        match kind {
+                            RetouchKind::NewGenerated => {
+                                // Whole-frame reimagine → a NEW「AI 生成」variant
+                                // whose base IS this raster. Auto-switch to it, so
+                                // editing works on the generated pixels — a slider
+                                // no longer reverts to the source develop. Its path
+                                // is the reverse-fit / full-res export source.
+                                self.push_variant(
+                                    Variant {
+                                        kind: VariantKind::Generated,
+                                        recipe: EditRecipe::default(),
+                                        base: Some(img),
+                                        origin: Some(saved),
+                                        thumb: None,
+                                    },
+                                    ctx,
+                                );
+                            }
+                            RetouchKind::InPlace => {
+                                // fill/heal/clone: a pixel touch-up of the CURRENT
+                                // rendition — bake it into the active variant's base
+                                // (so later slider edits develop OVER the retouched
+                                // pixels) AND repoint its origin at the saved
+                                // full-res artifact, so export / reverse-fit / a
+                                // further retouch all follow the retouched pixels
+                                // rather than the pre-retouch source (WYSIWYG).
+                                let (mw, mh) = img.dimensions();
+                                if let Some(v) = self.variants.get_mut(self.active) {
+                                    v.base = Some(img.clone());
+                                    v.origin = Some(saved);
+                                }
+                                self.before_tex = Some(ctx.load_texture(
+                                    "before",
+                                    to_color_image(&img),
+                                    egui::TextureOptions::LINEAR,
+                                ));
+                                self.base_preview = Some(img);
+                                // Keep the paint canvas sized to the new base (the
+                                // retouch result can differ in dimensions — e.g. a
+                                // non-square reimagine origin).
+                                self.mask_paint = Some(image::RgbaImage::new(mw, mh));
+                                self.mask_tex = None;
+                                self.mask_dirty = false;
+                                self.dirty = true;
+                            }
+                        }
                         self.done(msg);
                     }
                     Err(e) => {
@@ -2155,14 +2405,21 @@ impl AutoshopApp {
                 },
                 Msg::Fitted(boxed) => match *boxed {
                     Ok((recipe, note)) => {
-                        // The fitted recipe replaces the working recipe like an AI
-                        // Analyze result — the undo history picks it up as one step
-                        // via the committed-snapshot diff, and the preview
-                        // re-develops through the normal dirty path.
-                        self.recipe = recipe;
-                        self.rationale = self.recipe.rationale.clone();
-                        self.verdict = None;
-                        self.dirty = true;
+                        // The generated look, solved back into an editable recipe,
+                        // becomes a NEW「反推」variant: base = the source neutral
+                        // (same negative as Original), look carried by the recipe —
+                        // so it is fully editable, exports XMP and renders at full
+                        // resolution. Auto-switch to it.
+                        self.push_variant(
+                            Variant {
+                                kind: VariantKind::Fitted,
+                                recipe,
+                                base: None,
+                                origin: None,
+                                thumb: None,
+                            },
+                            ctx,
+                        );
                         self.done(note);
                     }
                     Err(e) => {
@@ -3832,7 +4089,10 @@ impl AutoshopApp {
     /// Generative fill: regenerate the painted area (gpt-image), composite onto
     /// the source, save to ./out. Runs on a worker thread.
     fn start_fill(&mut self) {
-        let Some(path) = self.src_path.clone() else { return };
+        // Retouch the ACTIVE variant's pixels (a Generated variant → its origin
+        // PNG), not the raw negative — otherwise a fill on the AI image would
+        // splice in original pixels.
+        let Some(path) = self.active_source_path() else { return };
         if self.busy {
             return;
         }
@@ -3854,6 +4114,7 @@ impl AutoshopApp {
         let tx = self.tx.clone();
         let quality = ["high", "medium", "low"][self.fill_quality.min(2)].to_string();
         let full_res = self.fill_fullres;
+        let edge = self.preview_edge.clamp(640, 8192); // bake at the working res, not a fixed 1280
         std::thread::spawn(move || {
             let res = (|| -> RetouchDone {
                 let cfg = autoshop::config::Config::load();
@@ -3864,10 +4125,11 @@ impl AutoshopApp {
                 let r = autoshop::generative::retouch(&cfg, &path, &mask_tmp, &prompt, &quality, full_res, &out);
                 let _ = std::fs::remove_file(&mask_tmp);
                 r?;
-                let img = autoshop::decode::load_image(&out)?.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE);
-                // Not a fit target: a fill keeps most source pixels, so a reverse
-                // fit against it would just recover a neutral recipe.
-                Ok((img, format!("filled → {} (saved to ./out)", out.display()), None, out))
+                let img = autoshop::decode::load_image(&out)?.thumbnail(edge, edge);
+                // InPlace: refine the current rendition — bake into the active
+                // variant's base AND repoint its origin at this saved artifact
+                // so export / reverse-fit / next retouch follow the fill.
+                Ok((img, format!("filled → {} (更新当前变体)", out.display()), out, RetouchKind::InPlace))
             })();
             let _ = tx.send(Msg::Retouched(Box::new(res)));
         });
@@ -3876,7 +4138,8 @@ impl AutoshopApp {
     /// Heal: AI auto-detect (use_mask=false) or the painted mask (use_mask=true).
     /// Pixel retouch from surrounding real pixels; saves to ./out.
     fn start_heal(&mut self, use_mask: bool) {
-        let Some(path) = self.src_path.clone() else { return };
+        // Heal the ACTIVE variant's pixels (Generated → its origin PNG).
+        let Some(path) = self.active_source_path() else { return };
         if self.busy {
             return;
         }
@@ -3899,6 +4162,7 @@ impl AutoshopApp {
         };
         let tx = self.tx.clone();
         let full_res = self.heal_fullres;
+        let edge = self.preview_edge.clamp(640, 8192); // bake at the working res, not a fixed 1280
         std::thread::spawn(move || {
             let res = (|| -> RetouchDone {
                 let cfg = autoshop::config::Config::load();
@@ -3917,9 +4181,9 @@ impl AutoshopApp {
                     let _ = std::fs::remove_file(t);
                 }
                 let rep = rep?;
-                let img = autoshop::decode::load_image(&out)?.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE);
-                // Not a fit target (pixel heal, not a whole-frame rendition).
-                Ok((img, format!("healed {} spot(s) → {}", rep.spots, out.display()), None, out))
+                let img = autoshop::decode::load_image(&out)?.thumbnail(edge, edge);
+                // InPlace: bake into the active variant's base + repoint origin.
+                Ok((img, format!("healed {} spot(s) → {}", rep.spots, out.display()), out, RetouchKind::InPlace))
             })();
             let _ = tx.send(Msg::Retouched(Box::new(res)));
         });
@@ -3929,7 +4193,8 @@ impl AutoshopApp {
     /// source point → `retouch::clone_stamp` (deterministic, no AI) → ./out
     /// pixel master shown in the After pane, exactly like heal.
     fn start_clone(&mut self) {
-        let Some(path) = self.src_path.clone() else { return };
+        // Clone within the ACTIVE variant's pixels (Generated → its origin PNG).
+        let Some(path) = self.active_source_path() else { return };
         if self.busy {
             return;
         }
@@ -3945,6 +4210,7 @@ impl AutoshopApp {
         self.status = "克隆中…（本地像素运算）".into();
         let tx = self.tx.clone();
         let full_res = self.clone_fullres;
+        let edge = self.preview_edge.clamp(640, 8192); // bake at the working res, not a fixed 1280
         std::thread::spawn(move || {
             let res = (|| -> RetouchDone {
                 let out = autoshop::pipeline::default_out(&path, "clone", "png");
@@ -3954,9 +4220,10 @@ impl AutoshopApp {
                 let rep = autoshop::retouch::clone_stamp(&path, &mask_tmp, src_pt, full_res, &out);
                 let _ = std::fs::remove_file(&mask_tmp);
                 let rep = rep?;
-                let img = autoshop::decode::load_image(&out)?.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE);
-                // Not a fit target (pixel transplant, not a whole-frame look).
-                Ok((img, format!("克隆 {} 处 → {}", rep.spots, out.display()), None, out))
+                let img = autoshop::decode::load_image(&out)?.thumbnail(edge, edge);
+                // InPlace: a pixel transplant of the current rendition — bake it
+                // into the active variant's base + repoint origin at the artifact.
+                Ok((img, format!("克隆 {} 处 → {}", rep.spots, out.display()), out, RetouchKind::InPlace))
             })();
             let _ = tx.send(Msg::Retouched(Box::new(res)));
         });
@@ -3965,15 +4232,34 @@ impl AutoshopApp {
     /// Full-frame generative re-render via gpt-image — the OPTIONAL "let GPT
     /// directly make the picture" path. Uses the Direction text as the look
     /// prompt. Unlike Analyze (a faithful parametric recipe), this REGENERATES
-    /// pixels — a creative restyle, not a master (up to ~8 MP on flexible-size
-    /// models, ~1.5K on older ones). The saved path is remembered as the
-    /// reverse-fit ("反推配方") target, which turns the look back into sliders +
-    /// XMP at full resolution. Hits the gpt-image (image) endpoint.
+    /// pixels — a creative restyle (up to ~8 MP on flexible-size models, ~1.5K
+    /// on older ones). The result enters the strip as a new「AI 生成」variant
+    /// (`origin = Some(out)`); its saved path is the reverse-fit ("反推配方")
+    /// target that turns the look back into sliders + XMP at full resolution.
     fn start_reimagine(&mut self) {
+        // Always reimagine the ORIGINAL negative (src_path), never a generated
+        // variant's pixels — regenerating a rendition is the double-cook path
+        // the variant model exists to avoid. Each call gets a UNIQUE ./out PNG
+        // so two Generated variants never alias the same origin (which would
+        // cross-wire their export / reverse-fit).
         let Some(path) = self.src_path.clone() else { return };
         if self.busy {
             return;
         }
+        // First FREE ./out name — probing the filesystem (not a live-variant
+        // count) so delete-then-reimagine can't reuse a number whose PNG a
+        // surviving variant still points at. Bounded by a hard cap.
+        let out = {
+            let mut n = 0u32;
+            loop {
+                let tag = if n == 0 { "reimagine".to_string() } else { format!("reimagine-{}", n + 1) };
+                let cand = autoshop::pipeline::default_out(&path, &tag, "png");
+                if !cand.exists() || n >= 999 {
+                    break cand;
+                }
+                n += 1;
+            }
+        };
         let prompt = {
             let g = self.guidance.trim();
             if g.is_empty() {
@@ -3987,26 +4273,31 @@ impl AutoshopApp {
         self.busy = true;
         self.status = "AI 生成出片中… (gpt-image, ~15–60s; 高分辨率输入需先全幅显影)".into();
         let tx = self.tx.clone();
+        let edge = self.preview_edge.clamp(640, 8192);
         std::thread::spawn(move || {
             let res = (|| -> RetouchDone {
                 let cfg = autoshop::config::Config::load();
-                let out = autoshop::pipeline::default_out(&path, "reimagine", "png");
                 // fidelity "high" keeps it recognisably the same photo.
                 autoshop::generative::reimagine(&cfg, &path, &prompt, "high", &cfg.openai_image_quality, &out)?;
-                let img = autoshop::decode::load_image(&out)?.thumbnail(PREVIEW_EDGE, PREVIEW_EDGE);
-                let msg = format!("generated → {} (可再点「反推配方」得滑杆/XMP)", out.display());
-                Ok((img, msg, Some(out.clone()), out))
+                let img = autoshop::decode::load_image(&out)?.thumbnail(edge, edge);
+                let msg = format!("已生成「AI 生成」变体 → {} · 可继续微调或「反推配方」", out.display());
+                // NewGenerated: a whole-frame rendition → a new Generated variant.
+                Ok((img, msg, out, RetouchKind::NewGenerated))
             })();
             let _ = tx.send(Msg::Retouched(Box::new(res)));
         });
     }
 
     /// Reverse-fit ("match"): statistically solve the develop parameters that map
-    /// the source preview onto the last reimagine output — the sliders update in
-    /// place (undo-able), and for a RAW the XMP sidecar is written immediately.
-    /// Deterministic, in-process, no API call (fit.rs).
+    /// the SOURCE neutral onto the active「AI 生成」variant — the result lands as
+    /// a new「反推」variant (base = source neutral, look in the recipe), and for a
+    /// RAW the XMP sidecar is written immediately. Deterministic, no API call.
+    ///
+    /// The base is `source_preview`, NOT `base_preview`: after a reimagine the
+    /// active variant's base IS the generated raster, and fitting a rendition
+    /// onto itself would recover ~neutral. Fit must map the negative → the look.
     fn start_fit(&mut self) {
-        let (Some(base), Some(tgt)) = (self.base_preview.clone(), self.last_generated.clone())
+        let (Some(base), Some(tgt)) = (self.source_preview.clone(), self.fit_target())
         else {
             return;
         };
@@ -4022,7 +4313,7 @@ impl AutoshopApp {
                 let target = autoshop::decode::load_image(&tgt)?;
                 let rep = autoshop::fit::fit_recipe(&base, &target);
                 let mut note = format!(
-                    "反推完成：look 残差 {:.3}→{:.3}（滑杆已更新，可 undo）",
+                    "反推完成：look 残差 {:.3}→{:.3} · 已建「反推」变体（可编辑/导 XMP/出全分辨率）",
                     rep.err_before, rep.err_after
                 );
                 if let Some(p) = src_path.filter(|p| autoshop::decode::is_raw(p)) {
@@ -4039,7 +4330,7 @@ impl AutoshopApp {
     /// model. The result lands in the Direction box (ready to reimagine OTHER
     /// photos with the same look) and is saved to ./out/<stem>.style.txt.
     fn start_style_prompt(&mut self) {
-        let (Some(base), Some(tgt)) = (self.base_preview.clone(), self.last_generated.clone())
+        let (Some(base), Some(tgt)) = (self.source_preview.clone(), self.fit_target())
         else {
             return;
         };
@@ -4072,37 +4363,93 @@ impl AutoshopApp {
         });
     }
 
+    /// The variant strip (版本条): one card per rendition — 原片 / AI 生成 /
+    /// 反推 — with a live developed thumbnail. Click a card to switch (lossless;
+    /// each variant keeps its own base + recipe), × to drop one. This is the
+    /// selector that makes an AI develop a first-class, non-reverting version.
+    fn variant_strip(&mut self, ui: &mut egui::Ui) {
+        let mut switch_to: Option<usize> = None;
+        let mut delete: Option<usize> = None;
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("版本").strong());
+            ui.separator();
+            egui::ScrollArea::horizontal().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for i in 0..self.variants.len() {
+                        let active = i == self.active;
+                        let kind = self.variants[i].kind;
+                        ui.vertical(|ui| {
+                            // Developed thumbnail (or a placeholder until the
+                            // variant has been developed once).
+                            let resp = if let Some(t) = &self.variants[i].thumb {
+                                let s = t.size_vec2();
+                                let h = 52.0;
+                                let w = (s.x / s.y.max(1.0) * h).clamp(30.0, 104.0);
+                                let (rect, resp) =
+                                    ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+                                let uv = egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                );
+                                if active {
+                                    ui.painter().rect_filled(
+                                        rect.expand(3.0),
+                                        5.0,
+                                        egui::Color32::from_rgba_unmultiplied(0xc9, 0xa1, 0x4a, 46),
+                                    );
+                                }
+                                ui.painter().image(t.id(), rect, uv, egui::Color32::WHITE);
+                                if active {
+                                    ui.painter().rect_stroke(
+                                        rect,
+                                        4.0,
+                                        egui::Stroke::new(2.0, PILL),
+                                    );
+                                }
+                                resp
+                            } else {
+                                ui.add_sized([64.0, 52.0], egui::Button::new("…"))
+                            };
+                            if resp.on_hover_text("点击切到此版本（无损）").clicked() {
+                                switch_to = Some(i);
+                            }
+                            ui.horizontal(|ui| {
+                                let label = egui::RichText::new(kind.label()).small();
+                                ui.label(if active { label.strong().color(PILL) } else { label });
+                                // Any variant except the sole Original can be dropped.
+                                if self.variants.len() > 1
+                                    && kind != VariantKind::Original
+                                    && ui.small_button("×").on_hover_text("删除此版本").clicked()
+                                {
+                                    delete = Some(i);
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                    }
+                });
+            });
+        });
+        if let Some(i) = switch_to {
+            self.switch_variant(i, ui.ctx());
+        } else if let Some(i) = delete {
+            self.delete_variant(i, ui.ctx());
+        }
+    }
+
     fn retouch_panel(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.heading("Retouch");
 
-        // --- pixel-master ↔ recipe chaining (gap batch B): after any retouch,
-        // one click makes the saved ./out master the new working source with
-        // the recipe kept, so retouch + develop keep compounding.
-        if let Some(m) = self.master.clone() {
-            ui.horizontal(|ui| {
-                let name = m.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                ui.label(egui::RichText::new(format!("母版 {name}")).weak().small());
-                // The promise differs by master kind: a retouch master chains
-                // with the recipe kept; a reimagine master carries its look in
-                // the pixels, so the sliders restart neutral (no double-cook).
-                let tip = if self.master_restyled {
-                    "把这张 AI 生成图设为当前工作图。观感已烘焙在像素里，\
-滑杆会从中性开始（配方不叠加，避免风格二次烹饪）；后续修补与导出都基于它"
-                } else {
-                    "把这张 ./out 像素母版设为当前工作图（保留全部滑杆/蒙版/裁剪），\
-后续修图与导出都基于它 — 修补不再因动滑杆而丢失"
-                };
-                if ui.button("⤴ 以此母版继续修图").on_hover_text(tip).clicked() {
-                    self.continue_from_master();
-                }
-            });
-        }
-
         // Whole-image generative re-render: let gpt-image DIRECTLY produce the
         // picture (the optional "GPT makes the image" path). Distinct from
-        // AI Analyze, which emits a faithful parametric recipe — but the
-        // reverse-fit button closes the loop: generated look → recipe.
+        // AI Analyze, which emits a faithful parametric recipe. The result
+        // becomes a new「AI 生成」variant in the strip below; the reverse-fit
+        // button then closes the loop, adding a「反推」variant whose look lives
+        // in an editable recipe (full-res + XMP). No more "continue from
+        // master" button — each result is its own selectable variant, so a
+        // slider edit can never revert or double-cook it.
         egui::CollapsingHeader::new("整图 AI 生成 · Reimagine")
             .id_salt("sec_reimagine")
             .default_open(true)
@@ -4112,6 +4459,7 @@ impl AutoshopApp {
                         .button("✨ AI 生成出片")
                         .on_hover_text(
                             "用 gpt-image 直接重绘整张图（拿上方 Direction 文本当风格描述）。重绘像素=非保真；\
+                             生成后自动加入底部「AI 生成」变体并切过去，可继续微调不会变回去。\
                              支持任意尺寸的模型（gpt-image-2）可达 ~8MP，其余 ~1.5K。需 OPENAI_API_KEY",
                         )
                         .clicked()
@@ -4119,9 +4467,17 @@ impl AutoshopApp {
                         self.start_reimagine();
                     }
                 });
-                // Reverse-fit the generated look back into an editable recipe —
-                // how the low-res experiment becomes a full-res, XMP-able edit.
-                let can_fit = self.last_generated.is_some() && self.base_preview.is_some();
+                // Reverse-fit the active generated variant's look back into an
+                // editable recipe — how the low-res experiment becomes a
+                // full-res, XMP-able「反推」variant.
+                let can_fit = self.fit_target().is_some() && self.source_preview.is_some();
+                if !can_fit {
+                    ui.label(
+                        egui::RichText::new("先「AI 生成出片」并停在该变体上，才能反推它的配方。")
+                            .weak()
+                            .small(),
+                    );
+                }
                 ui.add_enabled_ui(!self.busy && can_fit, |ui| {
                     ui.horizontal(|ui| {
                         if ui
@@ -4508,8 +4864,11 @@ impl eframe::App for AutoshopApp {
                 }
                 if ui.add_enabled(ready, egui::Button::new("Download…")).clicked() {
                     let ext = if self.save_jpeg { "jpg" } else { "tif" };
-                    let stem = self
-                        .src_path
+                    // Suggest a name from the ACTIVE variant's pixel source (a
+                    // Generated variant → its reimagine stem), matching what
+                    // Export → ./out writes; the rendered pixels already follow it.
+                    let src = self.active_source_path();
+                    let stem = src
                         .as_deref()
                         .and_then(|p| p.file_stem())
                         .and_then(|s| s.to_str())
@@ -4537,6 +4896,17 @@ impl eframe::App for AutoshopApp {
                 ui.label(&self.status);
             });
         });
+
+        // Variant strip — sits directly above the status bar (registered after
+        // it so it stacks on top), only when a photo is open. The selector for
+        // 原片 / AI 生成 / 反推 renditions.
+        if self.src_path.is_some() {
+            egui::TopBottomPanel::bottom("variants")
+                .exact_height(96.0)
+                .show(ctx, |ui| {
+                    self.variant_strip(ui);
+                });
+        }
 
         // Left-most: the library gallery (folder browse + thumbnails).
         egui::SidePanel::left("gallery").default_width(240.0).show(ctx, |ui| {
@@ -4765,6 +5135,38 @@ fn install_cjk_font(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// A unified visual theme: warm-gold accent (shared with the variant-strip
+/// highlight), rounder widgets, a little more breathing room, and headings a
+/// step down from egui's chunky default so section titles group instead of
+/// shouting. One tasteful pass over egui's dark base — not a full reskin.
+fn install_theme(ctx: &egui::Context) {
+    use egui::{FontFamily, FontId, Rounding, Stroke, TextStyle};
+    let mut style = (*ctx.style()).clone();
+    style.visuals.selection.bg_fill =
+        egui::Color32::from_rgba_unmultiplied(0xc9, 0xa1, 0x4a, 90);
+    style.visuals.selection.stroke = Stroke::new(1.0, PILL);
+    style.visuals.hyperlink_color = PILL;
+    let rounding = Rounding::same(5.0);
+    for w in [
+        &mut style.visuals.widgets.noninteractive,
+        &mut style.visuals.widgets.inactive,
+        &mut style.visuals.widgets.hovered,
+        &mut style.visuals.widgets.active,
+        &mut style.visuals.widgets.open,
+    ] {
+        w.rounding = rounding;
+    }
+    style.visuals.window_rounding = Rounding::same(8.0);
+    style.visuals.menu_rounding = Rounding::same(6.0);
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    style.spacing.interact_size.y = 24.0;
+    style
+        .text_styles
+        .insert(TextStyle::Heading, FontId::new(17.0, FontFamily::Proportional));
+    ctx.set_style(style);
+}
+
 /// Decode the embedded Autoshop icon for the window title bar / taskbar.
 fn app_icon() -> egui::IconData {
     let img = image::load_from_memory(include_bytes!("../../assets/icon_256.png"))
@@ -4790,6 +5192,7 @@ fn main() -> eframe::Result<()> {
         opts,
         Box::new(|cc| {
             install_cjk_font(&cc.egui_ctx); // CJK glyphs so Chinese labels aren't tofu
+            install_theme(&cc.egui_ctx); // unified accent / spacing / rounding pass
             Ok(Box::new(AutoshopApp::new(cc))) // restores prefs + last library
         }),
     )
