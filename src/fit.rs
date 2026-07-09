@@ -28,7 +28,11 @@
 //!      [`render::develop_preview`] renders (closed loop, not open-loop math).
 //!   3. **Colour cast** — per-channel CDF residuals → red/green/blue curves,
 //!      last as the catch-all (cast-before-saturation measured worse on the
-//!      haze regression — see the stage comments in [`fit_recipe`]).
+//!      haze regression — see the stage comments in [`fit_recipe`]). Accepted
+//!      only through TWO gates: the aggregate look-error ratio AND the
+//!      foreign-hue veto (the curves must not paint a region of the frame in
+//!      hues the target holds nowhere — the 2026-07-09 violet-sky failure was
+//!      cross-band invisible to the aggregate; see the veto const block).
 //!
 //! There is deliberately NO per-band HSL stage — per-band statistics against
 //! a non-pixel-aligned generative target conflate content with style and are
@@ -61,6 +65,63 @@ const P_CLIP: f32 = 0.002;
 /// comment in [`fit_recipe`]). A true global cast slashes the error far past
 /// this; a content difference only nibbles at it while damaging regions.
 const CAST_ACCEPT_RATIO: f32 = 0.85;
+
+// --- cast foreign-hue veto (the second, pixel-aligned gate) -----------------
+// The aggregate ratio above is structurally blind to a CROSS-BAND hue wreck:
+// rotate a small pale sky from blue into violet and its band mass lands in
+// Purple/Magenta (empty in the target → the hue term's two-sided weight gate
+// skips it) while draining out of Blue (below the gate in the fitted render →
+// also skipped) — the hue term sees nothing, and the tonal+colour win on the
+// frame-dominant region sails the curves through (real-machine canyon
+// failure, 2026-07-09; reproduced by
+// `warm_rock_cast_must_not_violet_the_pale_sky`).
+//
+// The veto exploits what the aggregate cannot: the renders WITHOUT and WITH
+// the curves come from the SAME source, so "what did the curves do" is
+// exact, not statistical. The verdict is by HUE DISTANCE: a pixel the curves
+// leave visibly tinted at a hue ≥ [`VETO_FAR_BINS`]·15° away from EVERY hue
+// the target populates is FOREIGN — reject the curves when they grow the
+// frame's foreign share by ≥ [`VETO_CREATED_SHARE`].
+//
+// Distance is the discriminator the failure data demanded (both probed on
+// the live pairs): the canyon violet lands 60-100° from everything the
+// target contains, while the haze correction's imperfect residuals scatter
+// pixels only 5-40° off the target's own orange/green/blue mass — so
+// family-membership rules at ANY granularity mis-classify one side or the
+// other (a ±15° window scored the haze fix 15% "damage"; whole-band shares
+// flagged its 35-45° orange-yellow skirt as a phantom yellow family), but a
+// 45° = 1.5-ACR-band radius separates them with a 20°+ margin either way.
+// Measuring the DELTA against the without-render keeps pre-existing content
+// mismatch (already-foreign pixels the curves didn't create) out of the
+// verdict.
+//
+// Known non-goal: a cast that rotates a region into a hue the target DOES
+// contain elsewhere (sky turned rock-red) passes this veto; that failure is
+// near-band and the band-centroid hue term in `look_err` is the signal that
+// sees it. The observed failure class is the foreign hue.
+
+/// Target pixels feeding the hue-support bins must clear this chroma —
+/// deliberately BELOW the 0.06 band-stats gate so a pale sky still testifies.
+const VETO_SUPPORT_CHROMA: f32 = 0.03;
+/// Below this many chromatic target pixels there is no reliable hue evidence
+/// (e.g. a monochrome target) — the veto stands down.
+const VETO_MIN_TARGET_CHROMATIC: usize = 500;
+/// A pixel is "visibly tinted" at/above this chroma and enters the foreign
+/// census. Below the renderer's HSL fade-in (0.05), but a contiguous 0.04
+/// tint over a sky-sized region is visible.
+const VETO_TINT_CHROMA: f32 = 0.04;
+/// A 15° hue bin is "populated" when it holds ≥ this share of the target's
+/// chromatic mass. Chroma noise spread over 24 bins stays well under this;
+/// any hue region the target actually contains clears it severalfold.
+const VETO_SUPPORT_BIN_MIN: f32 = 0.015;
+/// Foreign radius in 15° bins: ±3 bins = ±45° = 1.5 ACR bands. The canyon
+/// violet sits 60°+ from all target hues; the haze residuals sit ≤ 40° from
+/// the target's own families — 45° splits them with margin on both sides.
+const VETO_FAR_BINS: usize = 3;
+/// Foreign frame-share the curves must CREATE (with − without) to be
+/// rejected: 5% of the frame is a REGION (the canyon sky measures ~12-15%),
+/// not boundary speckle (the haze pair measures ≈ 0.04%).
+const VETO_CREATED_SHARE: f32 = 0.05;
 
 /// The fit outcome: the recipe plus the distribution error (mean |Δ| over luma
 /// quantiles and channel means, 0 = identical look) before and after.
@@ -161,7 +222,12 @@ pub fn fit_recipe(src: &DynamicImage, target: &DynamicImage) -> FitReport {
         && recipe.blue_curve.is_empty())
     {
         let with_px = pixels_of(&render::develop_preview(&s_img, &recipe));
-        if look_err(&with_px, &tp) > err_without * CAST_ACCEPT_RATIO {
+        // Two gates, both must pass: the aggregate ratio (a marginal win does
+        // not earn regional risk) and the phantom-family veto (a large
+        // aggregate win does not earn a wrecked region the aggregate is
+        // cross-band-blind to — the veto only ever rejects, never rescues).
+        let ratio_fail = look_err(&with_px, &tp) > err_without * CAST_ACCEPT_RATIO;
+        if ratio_fail || cast_paints_foreign_hues(&cur, &with_px, &tp) {
             recipe.red_curve = Vec::new();
             recipe.green_curve = Vec::new();
             recipe.blue_curve = Vec::new();
@@ -385,6 +451,69 @@ fn residual_channel_curve(cur: &[[f32; 3]], tgt: &[[f32; 3]], ch: usize) -> Vec<
     } else {
         pts
     }
+}
+
+/// The set of 15°-hue bins FOREIGN to the target: farther than
+/// [`VETO_FAR_BINS`] bins (circularly) from every bin holding ≥
+/// [`VETO_SUPPORT_BIN_MIN`] of the target's chromatic mass. `None` when the
+/// target has fewer than [`VETO_MIN_TARGET_CHROMATIC`] chromatic pixels — no
+/// reliable hue testimony, the veto stands down.
+fn foreign_hue_bins(tp: &[[f32; 3]]) -> Option<[bool; 24]> {
+    let mut mass = [0.0f32; 24];
+    let mut n = 0usize;
+    for p in tp {
+        let chroma = p[0].max(p[1]).max(p[2]) - p[0].min(p[1]).min(p[2]);
+        if chroma < VETO_SUPPORT_CHROMA {
+            continue;
+        }
+        let (h, _s, _l) = render::rgb_to_hsl(p[0], p[1], p[2]);
+        mass[((h * 24.0) as usize).min(23)] += 1.0;
+        n += 1;
+    }
+    if n < VETO_MIN_TARGET_CHROMATIC {
+        return None;
+    }
+    let populated: Vec<usize> =
+        (0..24).filter(|&k| mass[k] / n as f32 >= VETO_SUPPORT_BIN_MIN).collect();
+    let mut foreign = [true; 24];
+    for (k, f) in foreign.iter_mut().enumerate() {
+        for &p in &populated {
+            let fwd = (k as isize - p as isize).rem_euclid(24) as usize;
+            if fwd.min(24 - fwd) <= VETO_FAR_BINS {
+                *f = false;
+                break;
+            }
+        }
+    }
+    Some(foreign)
+}
+
+/// Fraction of the frame visibly tinted at a hue foreign to the target
+/// (chroma ≥ [`VETO_TINT_CHROMA`], hue in a foreign bin).
+fn foreign_share(px: &[[f32; 3]], foreign: &[bool; 24]) -> f32 {
+    let mut cnt = 0usize;
+    for p in px {
+        let chroma = p[0].max(p[1]).max(p[2]) - p[0].min(p[1]).min(p[2]);
+        if chroma < VETO_TINT_CHROMA {
+            continue;
+        }
+        let (h, _s, _l) = render::rgb_to_hsl(p[0], p[1], p[2]);
+        if foreign[((h * 24.0) as usize).min(23)] {
+            cnt += 1;
+        }
+    }
+    cnt as f32 / px.len().max(1) as f32
+}
+
+/// Did the cast curves paint a REGION of the frame in hues the target holds
+/// nowhere (≥ [`VETO_FAR_BINS`]·15° from all its populated hue mass)?
+/// `cur`/`with_px` render the SAME source, so the share DELTA is exactly the
+/// curves' own work — pre-existing content mismatch cancels out.
+fn cast_paints_foreign_hues(cur: &[[f32; 3]], with_px: &[[f32; 3]], tp: &[[f32; 3]]) -> bool {
+    let Some(foreign) = foreign_hue_bins(tp) else {
+        return false;
+    };
+    foreign_share(with_px, &foreign) - foreign_share(cur, &foreign) >= VETO_CREATED_SHARE
 }
 
 // --------------------------------------------------------------------------
@@ -704,6 +833,161 @@ mod tests {
             worst = worst.max(d.abs());
         }
         assert!(worst < 15.0, "a band's hue is still {worst:.1}° off after the fit");
+    }
+
+    /// 192×128 canyon: 15.6% neutral ramp (tone evidence — without it the
+    /// pale sky is the only `is_neutralish` population and the tone solve
+    /// degenerates), 68.8% warm-rock ramp, 15.6% pale-blue sky. `warm` = the
+    /// region-graded target: rocks red-lifted (`l^0.7`), ramp + sky IDENTICAL
+    /// to the source — the grade a global cast cannot express without
+    /// collateral damage.
+    fn canyon(warm: bool) -> DynamicImage {
+        let (w, h) = (192u32, 128u32);
+        let mut img = RgbImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let l = 0.15 + 0.80 * x as f32 / (w - 1) as f32;
+                let p = if y < 16 {
+                    [l, l, l] // neutral ramp
+                } else if y < 112 {
+                    // Rocks: the warm grade is a pure RED OFFSET — a hue move
+                    // toward orange that symmetric chroma expansion (the
+                    // saturation stage) cannot express, so the residual lands
+                    // squarely on the red channel curve, as in the real photo.
+                    let r = if warm { (0.85 * l + 0.18).min(1.0) } else { 0.85 * l };
+                    [r, 0.52 * l, 0.30 * l]
+                } else {
+                    [0.64, 0.68, 0.73] // pale blue sky, hue ≈ 213°, chroma 0.09
+                };
+                img.put_pixel(
+                    x,
+                    y,
+                    image::Rgb(p.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)),
+                );
+            }
+        }
+        DynamicImage::ImageRgb8(img)
+    }
+
+    /// The veto's discriminator, pinned on both live cases: it must NOT fire
+    /// on the haze pair (whose accepted correction rotates pixels only INTO
+    /// the target's own hue families — measured foreign-share delta ≈ 0.000)
+    /// and MUST fire on the canyon cast (which paints ~12% of the frame in
+    /// hues ≥ 45° from everything the target contains). The end-to-end
+    /// verdicts live in `hazy_to_clean_fit_stays_sane` and
+    /// `warm_rock_cast_must_not_violet_the_pale_sky`; this pins the primitive
+    /// so a threshold tweak that flips one side fails HERE with numbers.
+    #[test]
+    fn foreign_hue_veto_separates_haze_from_canyon() {
+        // Canyon: rebuild stage 4's exact inputs (fit minus its cast curves →
+        // `cur`; curves re-derived and rendered → `with`).
+        let src = canyon(false);
+        let tgt = canyon(true);
+        let s2 = src.thumbnail(ANALYZE_EDGE, ANALYZE_EDGE);
+        let tp2 = pixels_of(&tgt.thumbnail(ANALYZE_EDGE, ANALYZE_EDGE));
+        let mut pre = fit_recipe(&src, &tgt).recipe;
+        pre.red_curve = Vec::new();
+        pre.green_curve = Vec::new();
+        pre.blue_curve = Vec::new();
+        let cur2 = pixels_of(&render::develop_preview(&s2, &pre));
+        let mut with = pre.clone();
+        with.red_curve = residual_channel_curve(&cur2, &tp2, 0);
+        with.green_curve = residual_channel_curve(&cur2, &tp2, 1);
+        with.blue_curve = residual_channel_curve(&cur2, &tp2, 2);
+        assert!(
+            !with.red_curve.is_empty(),
+            "premise broken: the canyon pair no longer provokes a red cast curve"
+        );
+        let with2 = pixels_of(&render::develop_preview(&s2, &with));
+        let cf = foreign_hue_bins(&tp2).expect("canyon target has chromatic mass");
+        let created = foreign_share(&with2, &cf) - foreign_share(&cur2, &cf);
+        assert!(
+            cast_paints_foreign_hues(&cur2, &with2, &tp2),
+            "veto must fire on the canyon cast (foreign share created {created:.4})"
+        );
+        assert!(created > 2.0 * VETO_CREATED_SHARE, "margin eroded: created {created:.4}");
+
+        // Haze: same reconstruction on the accepted correction.
+        let clean = synth();
+        let mut haze = EditRecipe {
+            exposure_ev: -0.3,
+            contrast: -45.0,
+            blacks: 40.0,
+            saturation: -40.0,
+            blue_curve: vec![
+                CurvePoint { input: 0, output: 25 },
+                CurvePoint { input: 128, output: 132 },
+                CurvePoint { input: 255, output: 255 },
+            ],
+            ..Default::default()
+        };
+        haze.clamp();
+        let base = render::develop_preview(&clean, &haze);
+        let s_img = base.thumbnail(ANALYZE_EDGE, ANALYZE_EDGE);
+        let tp = pixels_of(&clean.thumbnail(ANALYZE_EDGE, ANALYZE_EDGE));
+        let rec = fit_recipe(&base, &clean).recipe; // veto active: curves survive
+        assert!(
+            !(rec.red_curve.is_empty() && rec.green_curve.is_empty() && rec.blue_curve.is_empty()),
+            "the haze correction's cast curves must survive the veto"
+        );
+        let mut pre_h = rec.clone();
+        pre_h.red_curve = Vec::new();
+        pre_h.green_curve = Vec::new();
+        pre_h.blue_curve = Vec::new();
+        let cur_h = pixels_of(&render::develop_preview(&s_img, &pre_h));
+        let with_h = pixels_of(&render::develop_preview(&s_img, &rec));
+        assert!(
+            !cast_paints_foreign_hues(&cur_h, &with_h, &tp),
+            "veto must NOT fire on the haze correction"
+        );
+    }
+
+    #[test]
+    fn warm_rock_cast_must_not_violet_the_pale_sky() {
+        // Regression for the 2026-07-09 real-machine canyon failure: the target
+        // warms the frame-dominant rocks and keeps the small pale sky blue. The
+        // channel-CDF cast stage answers the rocks' demand with a global red
+        // lift whose 5-knot interpolation drags the sky's red up too → violet
+        // sky. The aggregate acceptance gate passed it because the rotated sky
+        // is CROSS-BAND invisible to the hue term (mass lands in Purple/Magenta
+        // — empty in the target — and drains out of Blue: the two-sided band
+        // gate skips both). The pixel-aligned hue-damage veto must reject the
+        // curves; saturation alone (hue-preserving) then matches the chroma.
+        let src = canyon(false);
+        let tgt = canyon(true);
+        let rep = fit_recipe(&src, &tgt);
+        // Render the fitted recipe and audit the sky region (rows y ≥ 108).
+        let out = render::develop_preview(&src, &rep.recipe).to_rgb8();
+        let (mut sin, mut cos, mut n) = (0.0f64, 0.0f64, 0.0f64);
+        for y in 108..128 {
+            for x in 0..192 {
+                let p = out.get_pixel(x, y);
+                let (r, g, b) =
+                    (p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0);
+                if r.max(g).max(b) - r.min(g).min(b) < 0.03 {
+                    continue; // desaturated sky pixels carry no hue verdict
+                }
+                let hue = render::rgb_to_hsl(r, g, b).0 as f64 * std::f64::consts::TAU;
+                sin += hue.sin();
+                cos += hue.cos();
+                n += 1.0;
+            }
+        }
+        if n > 0.0 {
+            let mean = sin.atan2(cos).to_degrees().rem_euclid(360.0);
+            let d = (mean - 213.0 + 540.0).rem_euclid(360.0) - 180.0;
+            assert!(
+                d.abs() < 30.0,
+                "sky hue drifted to {mean:.0}° (Δ{d:.0}°) — a violet/purple cast leaked through"
+            );
+        }
+        // And rejecting the cast must not have made the overall fit worse.
+        assert!(
+            rep.err_after <= rep.err_before + 0.01,
+            "fit made the look worse: {} -> {}",
+            rep.err_before,
+            rep.err_after
+        );
     }
 
     #[test]
