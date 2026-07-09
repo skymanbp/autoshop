@@ -8,11 +8,12 @@
 //! they collapse into a single per-channel lookup table; saturation/vibrance run
 //! per pixel; then orientation + crop.
 //!
-//! HONEST SCOPE (v1): these ops are tasteful **approximations**, not bit-exact
-//! Lightroom. NOT yet applied here: white-balance *temperature/tint* re-balance
-//! (the develop step keeps as-shot WB), clarity, dehaze, sharpening, noise
-//! reduction — those local/convolution ops are deferred; the XMP→Lightroom path
-//! renders them faithfully in the meantime.
+//! HONEST SCOPE: these ops are tasteful **approximations**, not bit-exact
+//! Lightroom — clarity/sharpening are luma unsharp masks, noise reduction is a
+//! bilateral-lite, dehaze is a pointwise scattering inversion (see
+//! [`apply_dehaze`]). NOT applied here: LOCAL-mask clarity/dehaze/texture/
+//! temperature/tint (deferred — the XMP→Lightroom path renders those, see
+//! [`apply_masks`]).
 
 use std::path::Path;
 
@@ -488,6 +489,16 @@ fn apply_develop(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
     if r.lens_vignette != 0.0 {
         apply_vignette(data, w, h, r.lens_vignette, r.lens_vignette_mid);
     }
+    // 0b) dehaze — pointwise atmospheric-veil removal in LINEAR light, before
+    //    any tonal work: the airlight estimate then depends only on the capture
+    //    (plus WB, which ran before apply_develop), never on the user's tone
+    //    sliders — dragging Exposure cannot re-estimate the haze. The
+    //    pinned-white tone LUT afterwards cannot blow what dehaze protected,
+    //    and saturation/vibrance stay downstream so the user can trim dehaze's
+    //    chroma restoration.
+    if r.dehaze != 0.0 {
+        apply_dehaze(data, r.dehaze);
+    }
     // 1) tonal ops via the LUT (exposure/contrast/whites/blacks/highlights/
     //    shadows/tone-curve). Tone the pixel's LUMINANCE and scale RGB by the
     //    ratio (scale_chroma) so hue + saturation are preserved — NOT per-channel.
@@ -564,6 +575,82 @@ fn apply_vignette(data: &mut [[f32; 3]], w: usize, h: usize, amount: f32, midpoi
             for c in px.iter_mut() {
                 *c = linear_to_srgb((srgb_to_linear(*c) * gain).clamp(0.0, 1.0));
             }
+        }
+    }
+}
+
+/// Dehaze: pointwise atmospheric-scattering inversion, `amount` -100..=100.
+///
+/// Model: `I = J·t + A·(1−t)` (observed = true radiance through transmission
+/// `t`, veiled by airlight `A`). Solved per pixel with the pixel's OWN
+/// min-channel as the haze-density proxy — deliberately NOT the spatial
+/// dark-channel min-filter: a pointwise op is O(N) per slider tick and its
+/// statistics stay CDF-identifiable (the constraint the reverse-fit design
+/// documents in fit.rs). Airlight `A` = P99 of the min channel in linear
+/// light (the brightest neutral-ish region — the hazy sky), via a histogram
+/// over strided samples so full-res export and 384px analysis agree.
+///
+/// Positive `amount` removes haze: `ω = min(R,G,B)/A` (haze density),
+/// `t = max(1 − K·s·ω, T_MIN)`, `out = (in − A(1−t))/t`. All three channels
+/// of a pixel share one affine map, so channel ORDER is preserved (no
+/// magenta/cyan inversions), `v = A` is a fixed point (an airlight-bright sky
+/// does not move or blow out), and the map is monotone in luma. Scaling the
+/// channel DIFFERENCES by 1/t ≥ 1 is the point — haze removal must deepen
+/// tone AND restore chroma together, which is why this deliberately does not
+/// use the luma-preserving `scale_chroma` convention of the tone stages.
+///
+/// Negative `amount` adds a uniform veil toward the airlight (`ω ≡ 1`, the
+/// exact inverse family): a convex blend, mathematically clip-free.
+fn apply_dehaze(data: &mut [[f32; 3]], amount: f32) {
+    let s = amount.clamp(-100.0, 100.0) / 100.0;
+    if s.abs() < 1e-4 {
+        return;
+    }
+    /// Full-slider strength: at +100 a pure-airlight pixel reaches t = T_MIN.
+    const K: f32 = 0.75;
+    /// Transmission floor — caps amplification at 1/T_MIN ≈ 3.3× so deep
+    /// shadows darken decisively but cannot explode to noise.
+    const T_MIN: f32 = 0.30;
+
+    // Airlight: histogram of the linear min-channel over ≤ ~262k strided
+    // samples (resolution-stable), P99, clamped away from black so a frame
+    // with no bright region cannot produce a degenerate divisor.
+    let mut hist = [0u32; 1024];
+    let mut n = 0u32;
+    let stride = (data.len() / 262_144).max(1);
+    for px in data.iter().step_by(stride) {
+        let m = srgb_to_linear(px[0]).min(srgb_to_linear(px[1])).min(srgb_to_linear(px[2]));
+        hist[(m.clamp(0.0, 1.0) * 1023.0) as usize] += 1;
+        n += 1;
+    }
+    let mut acc = 0u32;
+    let mut a_bin = 1023usize;
+    for (i, c) in hist.iter().enumerate() {
+        acc += c;
+        if acc as f32 >= 0.99 * n as f32 {
+            a_bin = i;
+            break;
+        }
+    }
+    let a = (a_bin as f32 / 1023.0).clamp(0.10, 1.0);
+
+    for px in data.iter_mut() {
+        let lin = [srgb_to_linear(px[0]), srgb_to_linear(px[1]), srgb_to_linear(px[2])];
+        let out = if s > 0.0 {
+            let w = (lin[0].min(lin[1]).min(lin[2]) / a).clamp(0.0, 1.0);
+            let t = (1.0 - K * s * w).max(T_MIN);
+            let b = a * (1.0 - t);
+            [(lin[0] - b) / t, (lin[1] - b) / t, (lin[2] - b) / t]
+        } else {
+            let v = K * (-s);
+            [
+                lin[0] * (1.0 - v) + a * v,
+                lin[1] * (1.0 - v) + a * v,
+                lin[2] * (1.0 - v) + a * v,
+            ]
+        };
+        for (c, o) in px.iter_mut().zip(out) {
+            *c = linear_to_srgb(o.clamp(0.0, 1.0));
         }
     }
 }
@@ -2535,6 +2622,138 @@ mod tests {
         apply_develop(&mut data, w, h, &r);
         let after = data[4][0] - data[3][0];
         assert!(after > before, "edge step {after} should exceed {before}");
+    }
+
+    // ---- dehaze -----------------------------------------------------------
+
+    /// A colourful test frame under a synthetic atmospheric veil built with
+    /// the actual scattering physics — `I = J·t + A·(1−t)` in LINEAR light
+    /// (haze is additive in radiance, not in gamma): t=0.55, airlight 0.9.
+    /// Lifted black, compressed contrast, desaturated.
+    fn hazy_frame() -> (Vec<[f32; 3]>, usize, usize) {
+        let (w, h) = (64usize, 32usize);
+        let (t0, a0) = (0.55f32, 0.90f32);
+        let mut data = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                let l = x as f32 / (w - 1) as f32;
+                let p = match y * 4 / h {
+                    0 => [l, l, l],
+                    1 => [l, l * 0.6, l * 0.2],
+                    2 => [l * 0.2, l * 0.7, l],
+                    _ => [l * 0.3, l, l * 0.4],
+                };
+                data.push(p.map(|c| {
+                    linear_to_srgb(srgb_to_linear(c) * t0 + a0 * (1.0 - t0))
+                }));
+            }
+        }
+        (data, w, h)
+    }
+
+    fn mean_chroma(px: &[[f32; 3]]) -> f32 {
+        px.iter().map(|p| p[0].max(p[1]).max(p[2]) - p[0].min(p[1]).min(p[2])).sum::<f32>()
+            / px.len() as f32
+    }
+
+    fn luma_quantile_spread(px: &[[f32; 3]]) -> f32 {
+        let mut lum: Vec<f32> = px.iter().map(luma601).collect();
+        lum.sort_by(f32::total_cmp);
+        lum[(lum.len() * 9) / 10] - lum[lum.len() / 10]
+    }
+
+    #[test]
+    fn dehaze_zero_is_exact_identity() {
+        // Like neutral_recipe_is_near_identity but bit-exact: the stage is
+        // gated on != 0.0 and must not run at all.
+        let (data, _, _) = hazy_frame();
+        let mut out = data.clone();
+        apply_dehaze(&mut out, 0.0);
+        assert_eq!(data, out, "dehaze 0 must be a bit-exact no-op");
+    }
+
+    #[test]
+    fn dehaze_positive_recovers_a_hazy_ramp() {
+        // Haze removal must jointly deepen tone AND restore chroma — the
+        // signature no combination of tone sliders (luma-preserving chroma)
+        // reproduces.
+        let (mut data, _, _) = hazy_frame();
+        let spread0 = luma_quantile_spread(&data);
+        let chroma0 = mean_chroma(&data);
+        apply_dehaze(&mut data, 50.0);
+        let spread1 = luma_quantile_spread(&data);
+        let chroma1 = mean_chroma(&data);
+        assert!(
+            spread1 > spread0 * 1.15,
+            "q90-q10 luma spread must grow ≥15%: {spread0:.3} → {spread1:.3}"
+        );
+        assert!(chroma1 > chroma0 * 1.10, "mean chroma must grow: {chroma0:.3} → {chroma1:.3}");
+    }
+
+    #[test]
+    fn dehaze_protects_bright_sky_channel_order() {
+        // A bright pale-blue sky pixel near the airlight sits at the model's
+        // fixed point: strong dehaze must not blow it out, flip its channel
+        // order (no magenta/cyan inversions), or move it far.
+        let (mut data, w, _) = hazy_frame();
+        let sky = [0.80f32, 0.85, 0.92];
+        data[w / 2] = sky;
+        apply_dehaze(&mut data, 75.0);
+        let p = data[w / 2];
+        assert!(p[2] > p[1] && p[1] > p[0], "channel order flipped: {p:?}");
+        assert!(p[2] < 0.999, "sky blew out: {p:?}");
+        let moved = (0..3).map(|c| (p[c] - sky[c]).abs()).fold(0.0f32, f32::max);
+        assert!(moved < 0.15, "near-airlight pixel moved {moved:.3}: {p:?}");
+    }
+
+    #[test]
+    fn dehaze_negative_adds_a_veil_without_clipping() {
+        // Adding haze is a convex blend toward the airlight: black lifts,
+        // chroma drops, a neutral ramp stays strictly monotone, nothing clips.
+        let (w, h) = (64usize, 1usize);
+        let mut data: Vec<[f32; 3]> = (0..w)
+            .map(|x| {
+                let v = x as f32 / (w - 1) as f32;
+                [v, v, v]
+            })
+            .collect();
+        let (mut colour, _, _) = hazy_frame();
+        let chroma0 = mean_chroma(&colour);
+        apply_dehaze(&mut colour, -50.0);
+        assert!(mean_chroma(&colour) < chroma0, "a veil must desaturate");
+        apply_dehaze(&mut data, -50.0);
+        assert!(data[0][0] > 0.05, "black point must lift under a veil: {}", data[0][0]);
+        for i in 1..w {
+            assert!(
+                data[i][0] > data[i - 1][0],
+                "veiled ramp must stay strictly increasing at {i}"
+            );
+        }
+        for p in &data {
+            assert!(p[0] < 1.0 && p[0] > 0.0, "veil must not clip: {p:?}");
+        }
+        let _ = h;
+    }
+
+    #[test]
+    fn dehaze_is_gentle_on_a_clean_image() {
+        // On an already-clean frame (deep blacks present → low airlight-relative
+        // haze density on colourful pixels) positive dehaze must be a light
+        // touch, not a re-grade: a saturated midtone probe barely moves.
+        let (w, h) = (64usize, 4usize);
+        let mut data = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                let l = x as f32 / (w - 1) as f32;
+                data.push(if y == 0 { [l, l, l] } else { [l, l * 0.5, l * 0.15] });
+            }
+        }
+        let probe_idx = w + w / 2; // saturated orange, mid ramp
+        let before = data[probe_idx];
+        apply_dehaze(&mut data, 50.0);
+        let after = data[probe_idx];
+        let moved = (0..3).map(|c| (after[c] - before[c]).abs()).fold(0.0f32, f32::max);
+        assert!(moved < 0.05, "clean saturated midtone moved {moved:.3}: {before:?} → {after:?}");
     }
 
     #[test]
