@@ -32,6 +32,11 @@ pub struct LocalSettings {
     pub image_model: Option<String>,
     pub image_base_url: Option<String>,
     pub image_gen_model: Option<String>,
+    /// `"oauth"` (ChatGPT-subscription via a local Codex bridge, e.g. CLIProxyAPI)
+    /// or `"api"` (a real OpenAI-compatible key). Purely a UI/preset selector —
+    /// both resolve to the same OpenAI-compatible HTTP path, differing only in
+    /// `image_base_url`/`image_api_key`. Absent ⇒ `"api"` (prior behaviour).
+    pub image_provider: Option<String>,
 }
 
 /// Path to the local settings file (cwd-relative, gitignored).
@@ -73,6 +78,11 @@ pub struct Config {
     /// without flexible sizing 400 the request and we fall back to the fixed
     /// 1024/1536 enum automatically.
     pub openai_image_max_px: u32,
+    /// UI/preset selector for the image role: `"oauth"` (ChatGPT-subscription via
+    /// a local Codex bridge) or `"api"` (a real OpenAI-compatible key). The engine
+    /// path is identical for both — this only distinguishes how the endpoint above
+    /// was populated, so the Settings UI can restore the right mode.
+    pub image_provider: String,
 
     // --- analysis role: the verifier (oauth = claude CLI, or api = OpenAI) -----
     /// `"oauth"` (default; the `claude` CLI) or `"api"` (OpenAI-compatible chat).
@@ -135,6 +145,11 @@ impl Config {
             openai_image_max_px: nonempty("AUTOSHOP_IMAGE_MAX_PX")
                 .and_then(|s| s.parse::<u32>().ok())
                 .unwrap_or(8_294_400),
+            image_provider: pick(
+                &local.image_provider,
+                nonempty("AUTOSHOP_IMAGE_PROVIDER"),
+                "api",
+            ),
 
             analysis_provider: pick(
                 &local.analysis_provider,
@@ -173,5 +188,11 @@ impl Config {
     /// True if the analysis role is configured to use the OpenAI-compatible API.
     pub fn analysis_is_api(&self) -> bool {
         self.analysis_provider.eq_ignore_ascii_case("api")
+    }
+
+    /// True when the image role points at a ChatGPT-subscription Codex bridge
+    /// (OAuth preset) rather than a real OpenAI-compatible key (API preset).
+    pub fn image_is_oauth(&self) -> bool {
+        self.image_provider.eq_ignore_ascii_case("oauth")
     }
 }

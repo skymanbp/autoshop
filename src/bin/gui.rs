@@ -154,12 +154,23 @@ enum Msg {
     Pasted(anyhow::Result<String>),
 }
 
+/// Default endpoint for the image-role OAuth preset: a local Codex bridge
+/// (e.g. CLIProxyAPI) that replays a ChatGPT-subscription OAuth token as an
+/// OpenAI-compatible API on loopback. Only a default — the field stays editable
+/// so a custom host/port works too.
+const CODEX_BRIDGE_URL: &str = "http://127.0.0.1:8317/v1";
+
+/// The stock OpenAI endpoint. Used to recognise a stale default when flipping the
+/// image role into OAuth mode, so we can swap in the bridge URL automatically.
+const OPENAI_DEFAULT_URL: &str = "https://api.openai.com/v1";
+
 /// Editable buffers for the in-app Settings window. Key fields stay blank on
 /// load and only overwrite the stored key when non-empty (the form never shows
 /// an existing secret) — mirroring the web `/api/settings` contract.
 #[derive(Default)]
 struct SettingsForm {
     analysis_provider_api: bool, // false = OAuth (claude CLI), true = OpenAI-compatible API
+    image_provider_oauth: bool,  // true = Codex bridge (ChatGPT sub), false = OpenAI-compatible API
     analysis_model: String,
     analysis_base_url: String,
     analysis_api_key: String,
@@ -1229,6 +1240,7 @@ impl AutoshopApp {
         let image_gen_choices = std::mem::take(&mut self.settings.image_gen_choices);
         self.settings = SettingsForm {
             analysis_provider_api: cfg.analysis_is_api(),
+            image_provider_oauth: cfg.image_is_oauth(),
             analysis_model: cfg.analysis_model.clone(),
             analysis_base_url: cfg.analysis_base_url.clone(),
             analysis_api_key: String::new(),
@@ -1251,6 +1263,8 @@ impl AutoshopApp {
         let mut cur = autoshop::config::load_local_settings();
         cur.analysis_provider =
             Some(if self.settings.analysis_provider_api { "api" } else { "oauth" }.to_string());
+        cur.image_provider =
+            Some(if self.settings.image_provider_oauth { "oauth" } else { "api" }.to_string());
         cur.analysis_model = Some(self.settings.analysis_model.trim().to_string());
         cur.analysis_base_url = Some(self.settings.analysis_base_url.trim().to_string());
         cur.image_model = Some(self.settings.image_model.trim().to_string());
@@ -1370,14 +1384,30 @@ impl AutoshopApp {
                 });
             }
             ui.separator();
-            ui.heading("Image — the vision proposer + generative edits (API only)");
+            ui.heading("Image — the vision proposer + generative edits");
+            ui.horizontal(|ui| {
+                ui.label("Provider");
+                ui.radio_value(&mut f.image_provider_oauth, false, "API (OpenAI-compatible)");
+                ui.radio_value(&mut f.image_provider_oauth, true, "OAuth (Codex 桥 / ChatGPT 订阅)");
+            });
+            // Flipping into OAuth while the endpoint is still empty or the stock
+            // OpenAI host means the field is wrong for a subscription bridge —
+            // swap in the loopback bridge default so it works without retyping.
+            // Idempotent: stops once the user sets any other (custom) value.
+            if f.image_provider_oauth {
+                let b = f.image_base_url.trim();
+                if b.is_empty() || b.trim_end_matches('/') == OPENAI_DEFAULT_URL {
+                    f.image_base_url = CODEX_BRIDGE_URL.to_string();
+                }
+            }
             ui.horizontal(|ui| {
                 let label = if f.fetching_models { "拉取中… / fetching…" } else { "🔄 拉取可用模型 / Fetch models" };
                 let clicked = ui
                     .add_enabled(!f.fetching_models, egui::Button::new(label))
                     .on_hover_text(
-                        "List the models this API key can use (GET /models) so you can pick instead of guess. \
-                         Uses the key typed above, or the saved one if blank.",
+                        "List the models this endpoint serves (GET /models) so you can pick instead of \
+                         guess — and a live reachability check for the bridge/API. Uses the key/token \
+                         typed below, or the saved one if blank.",
                     )
                     .clicked();
                 if clicked {
@@ -1396,36 +1426,47 @@ impl AutoshopApp {
                 }
             });
             ui.horizontal(|ui| {
+                ui.label(if f.image_provider_oauth { "Bridge URL" } else { "Base URL" });
+                ui.text_edit_singleline(&mut f.image_base_url);
+            });
+            ui.horizontal(|ui| {
                 ui.label("Vision model");
                 let opts = model_opts(&f.chat_choices, &["gpt-5.5", "gpt-4o"], &f.image_model);
                 model_picker(ui, "set_vision_model", &mut f.image_model, &opts);
             });
             ui.horizontal(|ui| {
-                ui.label("Base URL");
-                ui.text_edit_singleline(&mut f.image_base_url);
-            });
-            ui.horizontal(|ui| {
                 ui.label("Image-gen model");
-                let opts = model_opts(
-                    &f.image_gen_choices,
-                    &["gpt-image-1.5", "gpt-image-2", "gpt-image-1", "gpt-image-1-mini", "chatgpt-image-latest"],
-                    &f.image_gen_model,
-                );
+                // OAuth (subscription) exposes gpt-image-2 first; API keys often
+                // still prefer gpt-image-1.5 for its input_fidelity lock.
+                let fallbacks: &[&str] = if f.image_provider_oauth {
+                    &["gpt-image-2", "gpt-image-1.5"]
+                } else {
+                    &["gpt-image-1.5", "gpt-image-2", "gpt-image-1", "gpt-image-1-mini", "chatgpt-image-latest"]
+                };
+                let opts = model_opts(&f.image_gen_choices, fallbacks, &f.image_gen_model);
                 model_picker(ui, "set_imagegen_model", &mut f.image_gen_model, &opts);
             });
-            ui.label(
-                egui::RichText::new(
-                    "Tip: gpt-image-1.5 keeps the photo most faithful (input_fidelity); newer models \
-                     like gpt-image-2 ignore that lock and edit more freely.",
-                )
-                .weak()
-                .small(),
-            );
             ui.horizontal(|ui| {
-                ui.label("API Key");
-                let hint = if f.image_key_present { "key set — blank keeps it" } else { "no key set" };
+                ui.label(if f.image_provider_oauth { "Gate token" } else { "API Key" });
+                let hint = if f.image_key_present {
+                    "set — blank keeps it"
+                } else if f.image_provider_oauth {
+                    "the bridge's own api-keys token (loopback, not a cloud key)"
+                } else {
+                    "no key set"
+                };
                 ui.add(egui::TextEdit::singleline(&mut f.image_api_key).password(true).hint_text(hint));
             });
+            let note = if f.image_provider_oauth {
+                "OAuth rides your ChatGPT subscription via the local Codex bridge — no OpenAI key. \
+                 Start the bridge first (else edits fail to connect). Generative output is capped at \
+                 ~1.5 MP by the subscription image tier; for full-resolution edits switch to API mode \
+                 with a real key."
+            } else {
+                "Tip: gpt-image-1.5 keeps the photo most faithful (input_fidelity); newer models \
+                 like gpt-image-2 ignore that lock and edit more freely."
+            };
+            ui.label(egui::RichText::new(note).weak().small());
             ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("Save settings").clicked() {
