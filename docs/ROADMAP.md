@@ -1,12 +1,27 @@
 # ROADMAP — “一定程度直接取代 Photoshop” 路线（v0.5.0 之后 · UX 阶段）
 
 > 交接文档：每项都附实现要点与 `file:line` 锚点，供新会话不重读全库即可
-> 开工。更新于 2026-07-08（**v0.5.2 已发布**；此后本地有未推送提交——反推
-> 母版补丁 `2fc9092`/`33075cb` 与其后**变体条重构**，见「当前状态」首条；
-> 进入真机反馈驱动阶段——用户试用 → 报障/提需 → 修复/打磨 → 发布）。
+> 开工。更新于 2026-07-09（**v0.6.0 已发布**——把 v0.5.2 之后的功能批次
+> [变体条重构 `bb80040` + codex 桥 OAuth `c389df6` + 双煮修复 `2fc9092`]
+> 打包发布；进入真机反馈驱动阶段——用户试用 → 报障/提需 → 修复/打磨 → 发布）。
 
 ## 当前状态（已完成，勿重做）
 
+- **图像角色 OAuth 模式 / codex 桥（2026-07-09，`c389df6`，v0.6.0 发布）**：
+  图像角色（vision 提配方 + 生成式 fill/heal/reimagine）新增 `image_provider`
+  开关——**OAuth（本地 Codex 桥）** | **API（真 OpenAI key）**，与分析角色的
+  OAuth|API **对称**。OAuth 模式经 CLIProxyAPI（`127.0.0.1:8317`，持有用户的
+  ChatGPT 订阅令牌，上游 `chatgpt.com/backend-api`）走订阅出图，**无需 OpenAI
+  key**；选 OAuth 自动填桥地址 `http://127.0.0.1:8317/v1`、API-Key 标签改
+  「Gate token」、拉取模型按钮变可达性测试、image-gen 回退模型顺序按模式切换。
+  纯 UI + 一个 config 字段（`config.rs` `image_provider`，缺省 `"api"` 保持旧
+  行为；`image_is_oauth()` 判定；`gui.rs` `SettingsForm.image_provider_oauth`
+  + 幂等自动填地址），**引擎零改动**——两种模式都落到同一 OpenAI 兼容 HTTP 路径。
+  已知硬上限：订阅出图路径经 codex 内建 `image_gen` 工具，输出面积锁 ~1.57 MP
+  （honors 宽高比、免费路不可提；全分辨率需真 OpenAI key 的 `images.request`
+  scope）；遮罩编辑语义非像素保真但 `composite_region` 天然免疫。ToS 灰区、
+  测试烧订阅额度——详见持久记忆 `autoshop-codex-bridge`。真机点击链未走（无弹
+  窗纪律，靠编译 + 75 lib/5 gui 测试 + 源码走查验证）。
 - **变体/版本条重构（2026-07-08，用户报障"AI 生图后再调整又变回去"+
   "图片版本没有可选的"，本地未发布）**：把"单一工作图 (src_path,
   base_preview, recipe)"模型换成**变体条**（Lightroom 虚拟副本 / Capture
