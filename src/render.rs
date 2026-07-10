@@ -855,7 +855,7 @@ fn load_mask_bitmap(g: &MaskGeometry) -> Option<std::sync::Arc<image::GrayImage>
 }
 
 /// Bilinear weight lookup in an 8-bit greyscale mask at normalised (nx, ny).
-fn sample_gray_norm(b: &image::GrayImage, nx: f32, ny: f32) -> f32 {
+pub(crate) fn sample_gray_norm(b: &image::GrayImage, nx: f32, ny: f32) -> f32 {
     let (w, h) = (b.width() as f32, b.height() as f32);
     let sx = (nx.clamp(0.0, 1.0) * (w - 1.0)).max(0.0);
     let sy = (ny.clamp(0.0, 1.0) * (h - 1.0)).max(0.0);

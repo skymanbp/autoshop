@@ -67,7 +67,7 @@ use crate::render;
 /// this; keeping it small keeps the closed-loop renders interactive-fast
 /// (5 in the common path; up to ~20 if the do-no-harm loop shrinks
 /// saturation, each a 384-px develop).
-const ANALYZE_EDGE: u32 = 384;
+pub(crate) const ANALYZE_EDGE: u32 = 384;
 const HIST_BINS: usize = 1024;
 /// Quantile clip for CDF inversion — the extreme tails of a generative render
 /// are noise (a few blown/crushed pixels would otherwise own the end knots).
@@ -681,7 +681,7 @@ fn cast_rotates_a_region(cur: &[[f32; 3]], with_px: &[[f32; 3]]) -> bool {
 // statistics primitives
 // --------------------------------------------------------------------------
 
-fn pixels_of(img: &DynamicImage) -> Vec<[f32; 3]> {
+pub(crate) fn pixels_of(img: &DynamicImage) -> Vec<[f32; 3]> {
     img.to_rgb8()
         .pixels()
         .map(|p| [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0])
@@ -808,7 +808,7 @@ fn mean_chroma(px: &[[f32; 3]]) -> f32 {
 /// disaster (a purple sky and a blue one can share all four global numbers —
 /// exactly how the 2026-07-07 real-photo failure reported err 0.034 /
 /// confidence 0.80 for an unusable render).
-fn look_err(a: &[[f32; 3]], b: &[[f32; 3]]) -> f32 {
+pub(crate) fn look_err(a: &[[f32; 3]], b: &[[f32; 3]]) -> f32 {
     let (ca, cb) = (luma_cdf(a), luma_cdf(b));
     let mut tonal = 0.0f32;
     let mut n = 0.0f32;

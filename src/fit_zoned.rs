@@ -27,7 +27,15 @@
 //! Saturation stays closed-loop through real renders ([`zone_sat_step`]),
 //! matching the global fit's philosophy.
 
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use image::{DynamicImage, GrayImage};
+
+use crate::fit::{self, FitReport};
+use crate::recipe::{LocalAdjustment, MaskGeometry};
 use crate::render;
+use crate::segment::{segment_file, SegmentOpts};
 
 /// A zone must cover at least this weighted share of ITS frame on BOTH sides
 /// to carry trustworthy moments (a real sky measures 10–40%; segmentation
@@ -121,10 +129,10 @@ pub(crate) fn fit_zone_dials(src: &ZoneMoments, tgt: &ZoneMoments) -> ZoneDials 
         .clamp(-ZONE_EV_LIMIT, ZONE_EV_LIMIT);
     let bright = 2.0f32.powf(exposure_ev);
     let mut color_gains = [1.0f32; 3];
-    for c in 0..3 {
+    for (c, gain) in color_gains.iter_mut().enumerate() {
         let want = tgt.mean_lin[c].max(1e-5) / src.mean_lin[c].max(1e-5);
         // Same legal range recipe::clamp enforces (0 would kill a channel).
-        color_gains[c] = (want / bright).clamp(0.05, 8.0);
+        *gain = (want / bright).clamp(0.05, 8.0);
     }
     ZoneDials { exposure_ev, color_gains }
 }
@@ -150,6 +158,177 @@ pub(crate) fn zone_sat_step(cur_chroma: f32, tgt_chroma: f32) -> Option<f32> {
 /// Clamp an accumulated local saturation to the zone model cap.
 pub(crate) fn clamp_zone_sat(v: f32) -> f32 {
     v.clamp(-ZONE_SAT_LIMIT, ZONE_SAT_LIMIT)
+}
+
+// --------------------------------------------------------------------------
+// orchestration
+// --------------------------------------------------------------------------
+
+/// The zoned reverse-fit: the global [`fit::fit_recipe`] first, then a
+/// sky-to-sky zone correction on top — segment the sky in BOTH images
+/// (`seg`, the same sidecar the GUI's mask panel uses), compare zone moments,
+/// attach a Bitmap-masked [`LocalAdjustment`] when it measurably helps.
+///
+/// `mask_path` is where the SOURCE sky mask lands (the recipe references it;
+/// use the GUI convention `out/<stem>.mask-sky.png` so the mask panel shows
+/// the same raster). GRACEFUL BY CONTRACT: segmentation missing/failing, a
+/// degenerate sky, or a correction that does not improve the look all fall
+/// back to the plain global fit with an honest rationale note — never an
+/// error, because the global fit in hand is already a valid result.
+pub fn fit_recipe_zoned(
+    src: &DynamicImage,
+    target: &DynamicImage,
+    seg: &SegmentOpts,
+    mask_path: &Path,
+) -> FitReport {
+    let mut report = fit::fit_recipe(src, target);
+    match segment_both(src, target, seg, mask_path) {
+        Ok((src_mask, tgt_mask)) => {
+            attach_sky_zone(src, target, &mut report, &src_mask, &tgt_mask, mask_path);
+        }
+        Err(e) => {
+            report.recipe.rationale.push_str(&format!(
+                " Zoned sky fit unavailable ({e:#}) — global fit only.",
+            ));
+        }
+    }
+    report
+}
+
+/// Run the segmentation sidecar on both images. The source mask persists at
+/// `mask_path` (the recipe references it); the target's inputs/mask are
+/// temporary siblings, removed before returning. Any failure aborts the
+/// whole zoned attempt — the caller degrades to the global fit.
+fn segment_both(
+    src: &DynamicImage,
+    target: &DynamicImage,
+    seg: &SegmentOpts,
+    mask_path: &Path,
+) -> Result<(GrayImage, GrayImage)> {
+    let sibling = |suffix: &str| -> std::path::PathBuf {
+        let mut s = mask_path.as_os_str().to_owned();
+        s.push(suffix);
+        s.into()
+    };
+    let tmp_src = sibling(".src-in.png");
+    let tmp_tgt = sibling(".tgt-in.png");
+    let tmp_tgt_mask = sibling(".tgt-mask.png");
+    let run = || -> Result<(GrayImage, GrayImage)> {
+        src.to_rgb8().save(&tmp_src).context("write segmentation input (source)")?;
+        target.to_rgb8().save(&tmp_tgt).context("write segmentation input (target)")?;
+        segment_file(seg, &tmp_src, mask_path).context("segment source sky")?;
+        segment_file(seg, &tmp_tgt, &tmp_tgt_mask).context("segment target sky")?;
+        let sm = image::open(mask_path).context("read source sky mask")?.to_luma8();
+        let tm = image::open(&tmp_tgt_mask).context("read target sky mask")?.to_luma8();
+        Ok((sm, tm))
+    };
+    let out = run();
+    for p in [&tmp_src, &tmp_tgt, &tmp_tgt_mask] {
+        std::fs::remove_file(p).ok();
+    }
+    out
+}
+
+/// The post-segmentation half (separable so tests drive it with hand-built
+/// masks, no python): measure sky-to-sky moments, solve the dials, refine
+/// saturation closed-loop, keep the mask only if the end-to-end look error
+/// improves. Appends its own honest rationale notes either way. The source
+/// zone is measured on the GLOBALLY-FITTED render — the mask stacks after
+/// the global stages in the engine, so that is the residual it corrects.
+fn attach_sky_zone(
+    src: &DynamicImage,
+    target: &DynamicImage,
+    report: &mut FitReport,
+    src_mask: &GrayImage,
+    tgt_mask: &GrayImage,
+    mask_path: &Path,
+) {
+    let s_img = src.thumbnail(fit::ANALYZE_EDGE, fit::ANALYZE_EDGE);
+    let t_img = target.thumbnail(fit::ANALYZE_EDGE, fit::ANALYZE_EDGE);
+    let cur = render::develop_preview(&s_img, &report.recipe);
+    let cur_px = fit::pixels_of(&cur);
+    let tgt_px = fit::pixels_of(&t_img);
+    let sw = mask_weights(src_mask, cur.width(), cur.height());
+    let tw = mask_weights(tgt_mask, t_img.width(), t_img.height());
+    let ms = zone_moments(&cur_px, &sw);
+    let mt = zone_moments(&tgt_px, &tw);
+    if ms.share < MIN_ZONE_SHARE || mt.share < MIN_ZONE_SHARE {
+        report.recipe.rationale.push_str(&format!(
+            " Zoned sky fit skipped: sky covers too little of the frame \
+             (source {:.0}%, target {:.0}%).",
+            ms.share * 100.0,
+            mt.share * 100.0,
+        ));
+        std::fs::remove_file(mask_path).ok();
+        return;
+    }
+    let d = fit_zone_dials(&ms, &mt);
+    let round2 = |v: f32| (v * 100.0).round() / 100.0;
+    report.recipe.masks.push(LocalAdjustment {
+        mask: MaskGeometry::Bitmap { path: mask_path.to_string_lossy().into_owned() },
+        name: "反推·天空".into(),
+        amount: 1.0,
+        exposure_ev: round2(d.exposure_ev),
+        color_gains: Some(d.color_gains.map(round2)),
+        ..Default::default()
+    });
+    // Closed-loop zone saturation on real renders (the gains change chroma
+    // by themselves — only a render knows where the zone landed).
+    for _ in 0..2 {
+        let rp = fit::pixels_of(&render::develop_preview(&s_img, &report.recipe));
+        let zone_chroma = zone_moments(&rp, &sw).chroma;
+        let Some(step) = zone_sat_step(zone_chroma, mt.chroma) else { break };
+        let m = report.recipe.masks.last_mut().expect("zone mask just pushed");
+        let next = clamp_zone_sat((m.saturation + step).round());
+        if next == m.saturation {
+            break;
+        }
+        m.saturation = next;
+    }
+    // Do-no-harm, zoned edition: the mask stays only if the END-TO-END look
+    // error beats the global-only fit it stacked onto.
+    let zoned_px = fit::pixels_of(&render::develop_preview(&s_img, &report.recipe));
+    let zoned_err = fit::look_err(&zoned_px, &tgt_px);
+    if zoned_err + 1e-4 < report.err_after {
+        let m = report.recipe.masks.last().expect("zone mask just pushed");
+        report.recipe.rationale.push_str(&format!(
+            " Zoned sky correction attached (sky-to-sky moments → local \
+             exposure {:+.2} EV, colour gains [{:.2} {:.2} {:.2}], saturation \
+             {:+.0}): residual look error {:.3} → {:.3}. The correction is a \
+             BITMAP mask — rendered in-app; the Lightroom sidecar carries the \
+             global fit only (classic XMP cannot hold raster masks).",
+            m.exposure_ev,
+            m.color_gains.unwrap_or([1.0; 3])[0],
+            m.color_gains.unwrap_or([1.0; 3])[1],
+            m.color_gains.unwrap_or([1.0; 3])[2],
+            m.saturation,
+            report.err_after,
+            zoned_err,
+        ));
+        report.err_after = zoned_err;
+        report.recipe.confidence = (1.0 - zoned_err * 6.0).clamp(0.25, 0.95);
+    } else {
+        report.recipe.masks.pop();
+        report.recipe.rationale.push_str(
+            " Zoned sky correction measured no improvement over the global \
+             fit and was dropped.",
+        );
+        std::fs::remove_file(mask_path).ok();
+    }
+}
+
+/// Per-pixel mask weights for an analysis frame of `w`×`h` — the SAME
+/// normalisation and bilinear sampling the engine's mask stage uses
+/// (`render::sample_gray_norm` with x/w, y/h), so the moments are measured
+/// exactly where the render will apply them.
+fn mask_weights(mask: &GrayImage, w: u32, h: u32) -> Vec<f32> {
+    let mut out = Vec::with_capacity((w * h) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            out.push(render::sample_gray_norm(mask, x as f32 / w as f32, y as f32 / h as f32));
+        }
+    }
+    out
 }
 
 // --------------------------------------------------------------------------
@@ -218,12 +397,11 @@ mod tests {
         let mt = zone_moments(&tgt, &w);
         let d = fit_zone_dials(&ms, &mt);
         let bright = 2.0f32.powf(d.exposure_ev);
-        for c in 0..3 {
+        for (c, &truth) in g_true.iter().enumerate() {
             let total = d.color_gains[c] * bright;
             assert!(
-                (total - g_true[c]).abs() < 5e-3,
-                "channel {c}: recovered {total} vs true {}",
-                g_true[c]
+                (total - truth).abs() < 5e-3,
+                "channel {c}: recovered {total} vs true {truth}"
             );
         }
         // The brightness split itself must be sane (the transform brightens
@@ -335,5 +513,100 @@ mod tests {
             );
         }
         std::fs::remove_file(mask_path).ok();
+    }
+
+    // ---- orchestration ----------------------------------------------------
+
+    use image::{DynamicImage, GrayImage, RgbImage};
+
+    /// The golden-pair toy geometry shared by the orchestration tests:
+    /// identical warm rocks (top 12 rows), only the sky differs.
+    fn zoned_pair() -> (DynamicImage, DynamicImage, GrayImage) {
+        let (w, h) = (16u32, 16u32);
+        let build = |sky: [f32; 3]| -> DynamicImage {
+            let img = RgbImage::from_fn(w, h, |_, y| {
+                let p = if y >= 12 { sky } else { [0.55f32, 0.45, 0.35] };
+                image::Rgb(p.map(|c| (c * 255.0).round() as u8))
+            });
+            DynamicImage::ImageRgb8(img)
+        };
+        let sky_mask =
+            GrayImage::from_fn(w, h, |_, y| image::Luma([if y >= 12 { 255u8 } else { 0 }]));
+        (build([0.60, 0.63, 0.67]), build([0.92, 0.72, 0.48]), sky_mask)
+    }
+
+    #[test]
+    fn zoned_orchestration_attaches_the_sky_mask_and_improves_the_look() {
+        let (src, tgt, sky_mask) = zoned_pair();
+        std::fs::create_dir_all("out").ok();
+        let mask_path = Path::new("out/_zoned_orch_mask.png");
+        sky_mask.save(mask_path).unwrap();
+        let mut report = fit::fit_recipe(&src, &tgt);
+        let err_global = report.err_after;
+        attach_sky_zone(&src, &tgt, &mut report, &sky_mask, &sky_mask, mask_path);
+        assert_eq!(report.recipe.masks.len(), 1, "sky correction must attach");
+        assert!(
+            report.err_after < err_global,
+            "zoned err {} must beat global {err_global}",
+            report.err_after
+        );
+        assert!(
+            report.recipe.rationale.contains("Zoned sky correction attached"),
+            "rationale must document the zone: {}",
+            report.recipe.rationale
+        );
+        assert!(
+            report.recipe.rationale.contains("global fit only"),
+            "rationale must carry the XMP honesty note: {}",
+            report.recipe.rationale
+        );
+        std::fs::remove_file(mask_path).ok();
+    }
+
+    #[test]
+    fn zoned_orchestration_skips_a_degenerate_sky() {
+        let (src, tgt, _) = zoned_pair();
+        let empty = GrayImage::from_pixel(16, 16, image::Luma([0u8]));
+        let mask_path = Path::new("out/_zoned_orch_empty_mask.png");
+        let mut report = fit::fit_recipe(&src, &tgt);
+        attach_sky_zone(&src, &tgt, &mut report, &empty, &empty, mask_path);
+        assert!(report.recipe.masks.is_empty(), "no mask on a degenerate zone");
+        assert!(
+            report.recipe.rationale.contains("Zoned sky fit skipped"),
+            "rationale must say why: {}",
+            report.recipe.rationale
+        );
+    }
+
+    #[test]
+    fn zoned_fit_degrades_gracefully_without_python() {
+        // A missing/broken python must yield the plain global fit plus an
+        // honest note — never an error (the graceful-fallback contract).
+        let (src, tgt, _) = zoned_pair();
+        let seg = SegmentOpts {
+            python_bin: "autoshop-test-no-such-python".into(),
+            // Must EXIST so the failure exercised is the launch, not the
+            // script check.
+            script: "Cargo.toml".into(),
+            target: "sky".into(),
+        };
+        std::fs::create_dir_all("out").ok();
+        let mask_path = Path::new("out/_zoned_orch_nopython_mask.png");
+        let report = fit_recipe_zoned(&src, &tgt, &seg, mask_path);
+        assert!(report.recipe.masks.is_empty(), "fallback must not attach masks");
+        assert!(
+            report.recipe.rationale.contains("global fit only"),
+            "rationale must explain the fallback: {}",
+            report.recipe.rationale
+        );
+        // The temporary segmentation inputs must not survive the fallback.
+        for suffix in [".src-in.png", ".tgt-in.png", ".tgt-mask.png"] {
+            let mut p = mask_path.as_os_str().to_owned();
+            p.push(suffix);
+            assert!(
+                !Path::new(&p).exists(),
+                "temp file {suffix} leaked past the fallback"
+            );
+        }
     }
 }
