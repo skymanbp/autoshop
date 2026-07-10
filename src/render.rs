@@ -678,16 +678,16 @@ fn apply_masks(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
         };
         let lut = build_tone_lut(&local);
         let sat = m.saturation / 100.0;
-        // Local colour gains, computed ONCE per mask (never inside the pixel
-        // loop): the Temp/Tint WB gains composed multiplicatively with the
-        // zoned fit's recolour gains (recipe.rs `color_gains` — repaints the
-        // WB parametrisation cannot express). None when everything is
-        // neutral, so the common tone-only mask pays nothing for this stage.
-        let wb = (m.temperature != 0.0 || m.tint != 0.0 || m.color_gains.is_some()).then(|| {
-            let g = wb_gains(5500.0, local_temp_to_kelvin(m.temperature), m.tint);
-            let cg = m.color_gains.unwrap_or([1.0; 3]);
-            [g[0] * cg[0], g[1] * cg[1], g[2] * cg[2]]
-        });
+        // Local colour transform, computed ONCE per mask (never inside the
+        // pixel loop): compose Temp/Tint WB with the zoned recolour gains,
+        // then compile the exact linear-light formula into channel LUTs.
+        // None when neutral, so tone-only masks pay no colour-stage cost.
+        let colour_luts =
+            (m.temperature != 0.0 || m.tint != 0.0 || m.color_gains.is_some()).then(|| {
+                let g = wb_gains(5500.0, local_temp_to_kelvin(m.temperature), m.tint);
+                let cg = m.color_gains.unwrap_or([1.0; 3]);
+                colour_gain_luts([g[0] * cg[0], g[1] * cg[1], g[2] * cg[2]])
+            });
         let amount = m.amount.clamp(0.0, 1.0);
         // Bitmap geometry: decode the raster ONCE per mask per develop (never
         // inside the pixel loop); both the tone and the NR pass share it.
@@ -721,16 +721,14 @@ fn apply_masks(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
                         continue;
                     }
                 }
-                // Local WB first (linear-light gains — exactly the global
-                // apply_wb per-pixel math), then luminance-preserving local
-                // tone (same anti-greying reason as the global pass), then
-                // local saturation. The fully-shifted pixel `t` is blended
-                // with the original by the mask weight below, so weight 1
-                // reproduces the global stages and weight 0 is a no-op.
+                // Local WB/recolour first (the same exact linear-light model
+                // as global apply_wb, sampled through its 4096-entry LUT), then
+                // luminance-preserving local tone and saturation. The fully-
+                // shifted pixel `t` is blended with the original by mask weight.
                 let mut t = p;
-                if let Some(g) = &wb {
-                    for (c, gc) in t.iter_mut().zip(g) {
-                        *c = linear_to_srgb((srgb_to_linear(*c) * gc).clamp(0.0, 1.0));
+                if let Some(luts) = &colour_luts {
+                    for c in 0..3 {
+                        t[c] = sample_lut(&luts[c], t[c]);
                     }
                 }
                 let l_old = luma601(&t);
@@ -1110,16 +1108,38 @@ pub(crate) fn local_temp_to_kelvin(t: f32) -> f32 {
     1e6 / mired
 }
 
+/// Build one LUT per channel for a linear-light RGB gain. The exact transform
+/// is `linear_to_srgb(srgb_to_linear(x) * gain)`, but evaluating both transfer
+/// curves (`powf`) for every pixel/channel dominated v0.8 zoned preview time:
+/// measured on the production-shaped 1280×853 probe, one colour-gain bitmap
+/// mask cost 609 ms vs 53 ms for the SAME mask without colour gains; the
+/// sky+land pair cost 1188 ms vs 92 ms. A 4096-entry LUT evaluates the exact
+/// formula only 12k times per adjustment, then the existing linear sampler
+/// handles millions of pixels. `LUT_N=4096` keeps interpolation error below
+/// the engine's 8/16-bit output quantisation (pinned by the test below).
+fn colour_gain_luts(g: [f32; 3]) -> [Vec<f32>; 3] {
+    std::array::from_fn(|ch| {
+        (0..LUT_N)
+            .map(|i| {
+                let x = i as f32 / (LUT_N - 1) as f32;
+                linear_to_srgb((srgb_to_linear(x) * g[ch]).clamp(0.0, 1.0))
+            })
+            .collect()
+    })
+}
+
 /// Apply white-balance gains in linear light. No-op when gains are ~neutral.
+/// Uses [`colour_gain_luts`] so preview cost scales with pixels, not with six
+/// transcendental operations per pixel.
 fn apply_wb(data: &mut [[f32; 3]], as_shot_k: f32, target_k: f32, tint: f32) {
     let g = wb_gains(as_shot_k, target_k, tint);
     if (g[0] - 1.0).abs() < 1e-3 && (g[1] - 1.0).abs() < 1e-3 && (g[2] - 1.0).abs() < 1e-3 {
         return;
     }
+    let luts = colour_gain_luts(g);
     for px in data.iter_mut() {
         for c in 0..3 {
-            let lin = srgb_to_linear(px[c]) * g[c];
-            px[c] = linear_to_srgb(lin.clamp(0.0, 1.0));
+            px[c] = sample_lut(&luts[c], px[c]);
         }
     }
 }
@@ -2124,6 +2144,30 @@ mod tests {
     }
 
     #[test]
+    fn colour_gain_lut_matches_the_exact_linear_light_formula() {
+        // Pin the optimization's fidelity independently of apply_wb: compare
+        // LUT interpolation against the old exact formula over dark values
+        // (where the sRGB knee is hardest), midtones and highlights, across
+        // both sub-unity and strong zoned-fit gains. The tolerance is below
+        // one 16-bit code value (1/65535 ≈ 1.53e-5).
+        for gains in [[0.41f32, 0.91, 1.45], [1.65, 0.76, 0.38], [1.0, 1.0, 1.0]] {
+            let luts = colour_gain_luts(gains);
+            for x in [0.0f32, 0.001, 0.003, 0.01, 0.04, 0.1, 0.25, 0.5, 0.8, 0.99, 1.0] {
+                for ch in 0..3 {
+                    let exact =
+                        linear_to_srgb((srgb_to_linear(x) * gains[ch]).clamp(0.0, 1.0));
+                    let fast = sample_lut(&luts[ch], x);
+                    assert!(
+                        (fast - exact).abs() < 1.5e-5,
+                        "gain {} x {x}: LUT {fast} vs exact {exact}",
+                        gains[ch]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn full_frame_local_wb_matches_the_global_wb_stage() {
         // The local Temp/Tint must MIRROR apply_recipe_wb's semantics — same
         // wb_gains model, same 5500 K anchor, WB→tone→sat order — so a
@@ -3002,5 +3046,97 @@ mod tests {
         let p = data[0];
         assert!(p[0] > 0.15, "red channel lifted: {p:?}");
         assert!(p[1] < 0.02 && p[2] < 0.02, "green/blue untouched: {p:?}");
+    }
+
+    /// Manual, machine-relative regression probe for the GUI's engine hot path.
+    /// Ignored in normal CI because wall-clock budgets are hardware-dependent;
+    /// run release-only and compare same-machine ratios:
+    /// `cargo test --release --lib preview_mask_perf_probe -- --ignored --nocapture`.
+    /// The checksum prevents a future fast path from "winning" by skipping work.
+    #[test]
+    #[ignore]
+    fn preview_mask_perf_probe() {
+        use std::time::Instant;
+
+        let (w, h) = (1280u32, 853u32);
+        let base = DynamicImage::ImageRgb8(RgbImage::from_fn(w, h, |x, y| {
+            let fx = x as f32 / (w - 1) as f32;
+            let fy = y as f32 / (h - 1) as f32;
+            Rgb([
+                (255.0 * (0.15 + 0.75 * fx)).round() as u8,
+                (255.0 * (0.12 + 0.65 * fy)).round() as u8,
+                (255.0 * (0.18 + 0.55 * (1.0 - fx * fy))).round() as u8,
+            ])
+        }));
+        std::fs::create_dir_all("out").unwrap();
+        let mask_path = "out/_preview_perf_mask.png";
+        image::GrayImage::from_fn(w / 4, h / 4, |x, _| {
+            image::Luma([((x as f32 / (w / 4 - 1) as f32) * 255.0).round() as u8])
+        })
+        .save(mask_path)
+        .unwrap();
+        let zone = |inverted| LocalAdjustment {
+            mask: MaskGeometry::Bitmap { path: mask_path.into() },
+            inverted,
+            exposure_ev: if inverted { -0.35 } else { 0.45 },
+            contrast: if inverted { 8.0 } else { -6.0 },
+            saturation: if inverted { -4.0 } else { 9.0 },
+            color_gains: Some(if inverted { [1.35, 0.88, 0.62] } else { [1.15, 0.96, 0.78] }),
+            ..Default::default()
+        };
+        let no_colour_zone = |inverted| LocalAdjustment {
+            mask: MaskGeometry::Bitmap { path: mask_path.into() },
+            inverted,
+            exposure_ev: if inverted { -0.35 } else { 0.45 },
+            contrast: if inverted { 8.0 } else { -6.0 },
+            saturation: if inverted { -4.0 } else { 9.0 },
+            ..Default::default()
+        };
+        let recipes = [
+            ("zero", EditRecipe { exposure_ev: 0.2, saturation: 8.0, ..Default::default() }),
+            ("one_no_colour", EditRecipe {
+                exposure_ev: 0.2,
+                saturation: 8.0,
+                masks: vec![no_colour_zone(false)],
+                ..Default::default()
+            }),
+            ("one", EditRecipe {
+                exposure_ev: 0.2,
+                saturation: 8.0,
+                masks: vec![zone(false)],
+                ..Default::default()
+            }),
+            ("shared_pair_no_colour", EditRecipe {
+                exposure_ev: 0.2,
+                saturation: 8.0,
+                masks: vec![no_colour_zone(false), no_colour_zone(true)],
+                ..Default::default()
+            }),
+            ("shared_pair", EditRecipe {
+                exposure_ev: 0.2,
+                saturation: 8.0,
+                masks: vec![zone(false), zone(true)],
+                ..Default::default()
+            }),
+        ];
+        for (name, recipe) in recipes {
+            let _ = develop_preview(&base, &recipe); // warm bitmap decode cache
+            let start = Instant::now();
+            let mut checksum = 0u64;
+            const N: usize = 5;
+            for _ in 0..N {
+                let out = develop_preview(&base, &recipe).to_rgb8();
+                checksum = out
+                    .as_raw()
+                    .iter()
+                    .step_by(997)
+                    .fold(checksum, |acc, &v| acc.wrapping_mul(16777619) ^ v as u64);
+            }
+            eprintln!(
+                "PERF preview/{name}: {:.2} ms/frame checksum={checksum}",
+                start.elapsed().as_secs_f64() * 1000.0 / N as f64,
+            );
+        }
+        std::fs::remove_file(mask_path).ok();
     }
 }
