@@ -678,11 +678,16 @@ fn apply_masks(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
         };
         let lut = build_tone_lut(&local);
         let sat = m.saturation / 100.0;
-        // Local WB gains, computed ONCE per mask (never inside the pixel
-        // loop). None when both sliders are neutral, so the common tone-only
-        // mask pays nothing for the WB stage.
-        let wb = (m.temperature != 0.0 || m.tint != 0.0)
-            .then(|| wb_gains(5500.0, local_temp_to_kelvin(m.temperature), m.tint));
+        // Local colour gains, computed ONCE per mask (never inside the pixel
+        // loop): the Temp/Tint WB gains composed multiplicatively with the
+        // zoned fit's recolour gains (recipe.rs `color_gains` — repaints the
+        // WB parametrisation cannot express). None when everything is
+        // neutral, so the common tone-only mask pays nothing for this stage.
+        let wb = (m.temperature != 0.0 || m.tint != 0.0 || m.color_gains.is_some()).then(|| {
+            let g = wb_gains(5500.0, local_temp_to_kelvin(m.temperature), m.tint);
+            let cg = m.color_gains.unwrap_or([1.0; 3]);
+            [g[0] * cg[0], g[1] * cg[1], g[2] * cg[2]]
+        });
         let amount = m.amount.clamp(0.0, 1.0);
         // Bitmap geometry: decode the raster ONCE per mask per develop (never
         // inside the pixel loop); both the tone and the NR pass share it.
@@ -1074,8 +1079,9 @@ fn kelvin_to_rgb(k: f32) -> [f32; 3] {
 
 /// Per-channel gains to move WB from `as_shot_k` to `target_k` (+ tint), green
 /// normalised to 1.0 (WB changes colour, not brightness). Lightroom convention:
-/// higher target K = warmer result (boosts red, cuts blue).
-fn wb_gains(as_shot_k: f32, target_k: f32, tint: f32) -> [f32; 3] {
+/// higher target K = warmer result (boosts red, cuts blue). `pub(crate)` so the
+/// zoned fit can INVERT the engine's own model instead of duplicating it.
+pub(crate) fn wb_gains(as_shot_k: f32, target_k: f32, tint: f32) -> [f32; 3] {
     let a = kelvin_to_rgb(as_shot_k);
     let t = kelvin_to_rgb(target_k);
     let g1 = a[1] / t[1].max(1e-4);
@@ -1097,7 +1103,7 @@ fn wb_gains(as_shot_k: f32, target_k: f32, tint: f32) -> [f32; 3] {
 /// local-temp model is proprietary — this is our documented approximation
 /// (same stance as [`apply_vignette`]); the XMP carries the raw slider value,
 /// so Lightroom re-renders with its own model.
-fn local_temp_to_kelvin(t: f32) -> f32 {
+pub(crate) fn local_temp_to_kelvin(t: f32) -> f32 {
     const ANCHOR_K: f32 = 5500.0;
     const MIRED_FULL_SCALE: f32 = 80.0;
     let mired = 1e6 / ANCHOR_K - (t.clamp(-100.0, 100.0) / 100.0) * MIRED_FULL_SCALE;
@@ -1163,7 +1169,9 @@ pub fn solve_wb_from_neutral(px: [f32; 3]) -> (f32, f32) {
     (k, tint)
 }
 
-fn srgb_to_linear(c: f32) -> f32 {
+// `pub(crate)`: the zoned fit computes zone moments in linear light with the
+// engine's exact transfer curve (a duplicated constant would drift).
+pub(crate) fn srgb_to_linear(c: f32) -> f32 {
     if c <= 0.04045 {
         c / 12.92
     } else {

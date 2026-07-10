@@ -312,6 +312,17 @@ pub struct LocalAdjustment {
     /// Local luminance noise reduction, 0..=100 → `crs:LocalLuminanceNoise`.
     /// For "this region is noisy" requests; smooths only inside the mask.
     pub noise_reduction: f32,
+    /// Per-channel LINEAR-light gains for zone RECOLOURING, `1.0` = neutral.
+    /// Produced by the zoned reverse-fit (fit_zoned.rs): a palette-transplant
+    /// target (pale-blue sky → gold) demands channel ratios far beyond what
+    /// any white-balance parametrisation can express (measured: blue→gold
+    /// needs r/b ≈ 5.3×; the full 2000–40000 K blackbody range caps at
+    /// ≈ 1.9×), so the fit writes the exact gains instead. ENGINE-ONLY: no
+    /// classic-ACR counterpart exists, so the XMP writer cannot carry it —
+    /// the fit only attaches it to Bitmap-masked corrections, which classic
+    /// XMP skips anyway (see [`MaskGeometry::Bitmap`]). Composes
+    /// multiplicatively with the temperature/tint gains in the engine.
+    pub color_gains: Option<[f32; 3]>,
 }
 
 impl Default for LocalAdjustment {
@@ -335,6 +346,7 @@ impl Default for LocalAdjustment {
             temperature: 0.0,
             tint: 0.0,
             noise_reduction: 0.0,
+            color_gains: None,
         }
     }
 }
@@ -436,6 +448,18 @@ impl EditRecipe {
                 *v = (*v).clamp(-100.0, 100.0);
             }
             m.noise_reduction = m.noise_reduction.clamp(0.0, 100.0);
+            // Recolour gains: keep each channel strictly positive and inside
+            // a generous-but-sane range (0 would kill a channel outright; the
+            // real repaint demands measure ≲ 3×). Neutral-ish gains collapse
+            // back to None so a hand-rounded recipe stays clean.
+            if let Some(g) = &mut m.color_gains {
+                for c in g.iter_mut() {
+                    *c = c.clamp(0.05, 8.0);
+                }
+                if g.iter().all(|c| (c - 1.0).abs() < 1e-3) {
+                    m.color_gains = None;
+                }
+            }
             // Range mask invariants: everything in 0..=1, and the luminance
             // trapezoid non-decreasing (lo_outer ≤ lo ≤ hi ≤ hi_outer) so the
             // render's ramps and ACR's LumRange both stay well-formed.
