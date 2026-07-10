@@ -939,7 +939,10 @@ fn noise_reduce_luma(data: &mut [[f32; 3]], w: usize, h: usize, t: f32) {
 /// running sum, so cost is O(N) regardless of `radius` — essential for clarity's
 /// large radius on a 60 MP frame.
 fn blur_plane(src: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> {
-    if radius == 0 {
+    // Zero-dim guard: the box-blur seeds use `Ord::clamp(0, w-1)`, which PANICS
+    // when w or h is 0 (min > max). No caller produces a 0-dim buffer today —
+    // this turns a future one into a no-op instead of a crash.
+    if radius == 0 || w == 0 || h == 0 {
         return src.to_vec();
     }
     let mut buf = src.to_vec();

@@ -375,10 +375,14 @@ fn call_images_edit(
             sizes.enum_size
         };
         let body = build_body(include_fidelity, size);
-        let resp = ureq::post(&url)
-            .set("Authorization", &format!("Bearer {key}"))
-            .set("Content-Type", &format!("multipart/form-data; boundary={BOUNDARY}"))
-            .send_bytes(&body);
+        // 300 s: image generation legitimately takes 60-120 s+ (more through a
+        // local subscription bridge); each retry in this loop re-posts, so
+        // every attempt gets its own full budget.
+        let resp =
+            crate::advisor::post_with_timeout(&url, std::time::Duration::from_secs(300))
+                .set("Authorization", &format!("Bearer {key}"))
+                .set("Content-Type", &format!("multipart/form-data; boundary={BOUNDARY}"))
+                .send_bytes(&body);
         match resp {
             Ok(r) => {
                 break (r.into_json().context("parse image API response")?, size.to_string())

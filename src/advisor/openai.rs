@@ -141,7 +141,9 @@ follow it closely): ");
         });
 
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-        let resp = ureq::post(&url)
+        // 120 s: a high-detail image + strict structured output is the slowest
+        // text call in the app (the codex bridge adds its own hop).
+        let resp = super::post_with_timeout(&url, std::time::Duration::from_secs(120))
             .set("Authorization", &format!("Bearer {key}"))
             .set("Content-Type", "application/json")
             .send_json(body);
@@ -210,7 +212,8 @@ so the same prompt can restyle ANY other photograph. Output ONLY the prompt text
     });
 
     let url = format!("{}/responses", cfg.openai_base_url.trim_end_matches('/'));
-    let resp = ureq::post(&url)
+    // 90 s: two low-detail images, short prose out.
+    let resp = super::post_with_timeout(&url, std::time::Duration::from_secs(90))
         .set("Authorization", &format!("Bearer {key}"))
         .set("Content-Type", "application/json")
         .send_json(body);

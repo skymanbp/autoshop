@@ -105,6 +105,26 @@ pub trait Advisor {
     }
 }
 
+/// POST builder with a hard overall deadline. The default `ureq::post` agent
+/// has NO read/overall timeout: a server that accepts the TCP connection and
+/// then never responds (a dead local bridge, a stalled proxy) blocks the
+/// worker thread FOREVER — and every GUI action gates on that worker's `busy`
+/// flag, so the whole app soft-locks. Per-call budgets reflect each
+/// endpoint's real latency class; `AUTOSHOP_HTTP_TIMEOUT_SECS` overrides all
+/// of them for outlier deployments.
+pub(crate) fn post_with_timeout(url: &str, overall: std::time::Duration) -> ureq::Request {
+    let overall = std::env::var("AUTOSHOP_HTTP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(overall);
+    ureq::builder()
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .timeout(overall)
+        .build()
+        .post(url)
+}
+
 /// Compact, prompt-friendly histogram summary (the full 4×256 bins are too
 /// large and noisy to put in a prompt). Reports clipping, mean luma, and a
 /// 16-bucket luma distribution as percentages.

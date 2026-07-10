@@ -51,7 +51,8 @@ impl Advisor for OpenAiVerifier {
             "temperature": 0
         });
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let resp = ureq::post(&url)
+        // 60 s: text-only chat at temperature 0 — the fastest AI call here.
+        let resp = super::post_with_timeout(&url, std::time::Duration::from_secs(60))
             .set("Authorization", &format!("Bearer {key}"))
             .set("Content-Type", "application/json")
             .send_json(body);

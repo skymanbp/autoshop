@@ -855,6 +855,36 @@ impl AutoshopApp {
         self.toast(ToastKind::Error, text);
         self.busy = false;
     }
+
+    /// Spawn a worker whose PANIC still delivers a terminal message. Every
+    /// worker's last act is sending the `Msg` that clears `busy` (or an
+    /// inflight counter); a panic before that send unwinds the thread, the
+    /// message never arrives, and the whole app soft-locks — every action
+    /// gates on `!busy`, and only killing the process recovers. One decode
+    /// panic inside `rawler`/`image` on a malformed file is enough. So: run
+    /// the body under `catch_unwind` and synthesize the site's failure `Msg`
+    /// from the panic payload. `AssertUnwindSafe` is sound here — all
+    /// captured state is moved in and dropped on unwind; the UI only ever
+    /// observes the channel message.
+    fn spawn_worker(
+        &self,
+        body: impl FnOnce() -> Msg + Send + 'static,
+        on_panic: impl FnOnce(anyhow::Error) -> Msg + Send + 'static,
+    ) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body))
+                .unwrap_or_else(|p| {
+                    let s = p
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| p.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".into());
+                    on_panic(anyhow::anyhow!("worker panicked: {s}"))
+                });
+            let _ = tx.send(msg);
+        });
+    }
 }
 
 /// 64-bin RGB+luma histogram of a preview, each channel normalised to its own
@@ -945,27 +975,29 @@ impl AutoshopApp {
         self.busy = true;
         self.src_path = Some(path.clone());
         self.status = format!("decoding {} …", path.display());
-        let tx = self.tx.clone();
         // Working-preview size is a user choice now (gap batch E): 1280 keeps
         // sliders fluid; 2560/4096 trade tick latency for real 1:1 detail when
         // checking focus / noise.
         let edge = self.preview_edge.clamp(640, 8192);
-        std::thread::spawn(move || {
-            // Build a CLEAN preview base by developing the RAW sensor data
-            // (downscaled), NOT the camera's already-baked 8-bit JPEG preview:
-            // re-developing that double-processes it and amplifies its grain when
-            // you push tone/clarity. Baked images (PNG/TIFF/JPEG) are their own
-            // source. Demosaic is slow, so this runs off the UI thread.
-            let res = (|| -> anyhow::Result<image::DynamicImage> {
-                let full = if autoshop::decode::is_raw(&path) {
-                    autoshop::render::render_to_image(&path, &EditRecipe::default(), None)?
-                } else {
-                    autoshop::decode::load_image(&path)?
-                };
-                Ok(full.thumbnail(edge, edge))
-            })();
-            let _ = tx.send(Msg::Opened(Box::new(res)));
-        });
+        self.spawn_worker(
+            move || {
+                // Build a CLEAN preview base by developing the RAW sensor data
+                // (downscaled), NOT the camera's already-baked 8-bit JPEG preview:
+                // re-developing that double-processes it and amplifies its grain when
+                // you push tone/clarity. Baked images (PNG/TIFF/JPEG) are their own
+                // source. Demosaic is slow, so this runs off the UI thread.
+                let res = (|| -> anyhow::Result<image::DynamicImage> {
+                    let full = if autoshop::decode::is_raw(&path) {
+                        autoshop::render::render_to_image(&path, &EditRecipe::default(), None)?
+                    } else {
+                        autoshop::decode::load_image(&path)?
+                    };
+                    Ok(full.thumbnail(edge, edge))
+                })();
+                Msg::Opened(Box::new(res))
+            },
+            |e| Msg::Opened(Box::new(Err(e))),
+        );
     }
 
     /// The active variant, if a photo is open.
@@ -1183,11 +1215,13 @@ impl AutoshopApp {
         }
         self.busy = true;
         self.status = format!("scanning {} …", dir.display());
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let res = autoshop::pipeline::find_sources(&dir).map(|list| (dir, list));
-            let _ = tx.send(Msg::Folder(Box::new(res)));
-        });
+        self.spawn_worker(
+            move || {
+                let res = autoshop::pipeline::find_sources(&dir).map(|list| (dir, list));
+                Msg::Folder(Box::new(res))
+            },
+            |e| Msg::Folder(Box::new(Err(e))),
+        );
     }
 
     /// Reset undo history — call when a brand-new photo opens (you can't undo
@@ -1303,37 +1337,24 @@ impl AutoshopApp {
         self.settings.status = "fetching models…".into();
         let form_key = self.settings.image_api_key.trim().to_string();
         let form_base = self.settings.image_base_url.trim().to_string();
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            // RAII: guarantee the UI's `fetching_models` flag is always cleared —
-            // if this thread panics before sending, the guard sends an Err on unwind
-            // so the button never stays stuck disabled.
-            struct Guard {
-                tx: Sender<Msg>,
-                armed: bool,
-            }
-            impl Drop for Guard {
-                fn drop(&mut self) {
-                    if self.armed {
-                        let _ = self
-                            .tx
-                            .send(Msg::Models(Err(anyhow::anyhow!("fetch worker ended unexpectedly"))));
-                    }
-                }
-            }
-            let mut guard = Guard { tx: tx.clone(), armed: true };
-
-            let cfg = autoshop::config::Config::load();
-            let base = if form_base.is_empty() { cfg.openai_base_url.clone() } else { form_base };
-            let key = if form_key.is_empty() {
-                cfg.openai_api_key.clone().unwrap_or_default()
-            } else {
-                form_key
-            };
-            let res = autoshop::openai_models::list_models(&base, &key);
-            guard.armed = false; // normal completion — don't double-send from Drop
-            let _ = tx.send(Msg::Models(res));
-        });
+        // spawn_worker's catch_unwind guarantees the UI's `fetching_models`
+        // flag always clears — a panic still delivers Msg::Models(Err) (this
+        // site used to hand-roll a Drop guard for exactly that; the helper
+        // now covers every worker uniformly).
+        self.spawn_worker(
+            move || {
+                let cfg = autoshop::config::Config::load();
+                let base =
+                    if form_base.is_empty() { cfg.openai_base_url.clone() } else { form_base };
+                let key = if form_key.is_empty() {
+                    cfg.openai_api_key.clone().unwrap_or_default()
+                } else {
+                    form_key
+                };
+                Msg::Models(autoshop::openai_models::list_models(&base, &key))
+            },
+            |e| Msg::Models(Err(e)),
+        );
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
@@ -1498,14 +1519,17 @@ impl AutoshopApp {
         let Some(path) = self.gallery.get(idx).cloned() else { return };
         self.thumb_requested.insert(idx);
         self.thumb_inflight += 1;
-        let tx = self.tx.clone();
         let generation = self.gallery_gen;
-        std::thread::spawn(move || {
-            let res = (|| -> anyhow::Result<image::DynamicImage> {
-                Ok(autoshop::decode::preview_only(&path)?.thumbnail(THUMB_EDGE, THUMB_EDGE))
-            })();
-            let _ = tx.send(Msg::Thumb { generation, idx, img: Box::new(res) });
-        });
+        self.spawn_worker(
+            move || {
+                let res = (|| -> anyhow::Result<image::DynamicImage> {
+                    Ok(autoshop::decode::preview_only(&path)?.thumbnail(THUMB_EDGE, THUMB_EDGE))
+                })();
+                Msg::Thumb { generation, idx, img: Box::new(res) }
+            },
+            // The Err handler decrements thumb_inflight like any decode failure.
+            move |e| Msg::Thumb { generation, idx, img: Box::new(Err(e)) },
+        );
     }
 
     /// Re-develop the working preview through the current recipe, and refresh
@@ -1908,7 +1932,6 @@ impl AutoshopApp {
         } else {
             "analyzing with AI (GPT + Claude)…".into()
         };
-        let tx = self.tx.clone();
         let style = self.style_strength;
         // Free-text direction ("warmer, moodier") steers the proposal; when
         // `refine` is on, the AI ADJUSTS the current recipe instead of starting
@@ -1929,19 +1952,22 @@ impl AutoshopApp {
             }
         };
         let base = self.refine.then(|| self.recipe.clone());
-        std::thread::spawn(move || {
-            // Config is reloaded in-thread (cheap) so we don't need it to be Clone.
-            let cfg = autoshop::config::Config::load();
-            let res = autoshop::pipeline::produce_recipe(
-                &path,
-                &cfg,
-                false,
-                guidance.as_deref(),
-                base.as_ref(),
-                style,
-            );
-            let _ = tx.send(Msg::Analyzed(Box::new(res)));
-        });
+        self.spawn_worker(
+            move || {
+                // Config is reloaded in-thread (cheap) so we don't need it to be Clone.
+                let cfg = autoshop::config::Config::load();
+                let res = autoshop::pipeline::produce_recipe(
+                    &path,
+                    &cfg,
+                    false,
+                    guidance.as_deref(),
+                    base.as_ref(),
+                    style,
+                );
+                Msg::Analyzed(Box::new(res))
+            },
+            |e| Msg::Analyzed(Box::new(Err(e))),
+        );
     }
 
     /// `./out/<stem>.developed.{tif|jpg}` — the default export target. The stem
@@ -1974,24 +2000,26 @@ impl AutoshopApp {
         } else {
             format!("rendering full-resolution → {} …", out.display())
         };
-        let tx = self.tx.clone();
         let recipe = self.recipe.clone();
         let denoise = self.save_denoise;
         let export = self.export_opts();
-        std::thread::spawn(move || {
-            let res = (|| {
-                if let Some(p) = out.parent() {
-                    std::fs::create_dir_all(p)?;
-                }
-                // SCUNet AI denoise (python sidecar) runs before the develop when on.
-                let opts = denoise.then(|| {
-                    autoshop::denoise::DenoiseOpts::from_config(&autoshop::config::Config::load(), None, 1.0)
-                });
-                autoshop::render::render_to_file(&path, &recipe, &out, opts.as_ref(), Some(&export))?;
-                Ok::<String, anyhow::Error>(out.display().to_string())
-            })();
-            let _ = tx.send(Msg::Exported(res));
-        });
+        self.spawn_worker(
+            move || {
+                let res = (|| {
+                    if let Some(p) = out.parent() {
+                        std::fs::create_dir_all(p)?;
+                    }
+                    // SCUNet AI denoise (python sidecar) runs before the develop when on.
+                    let opts = denoise.then(|| {
+                        autoshop::denoise::DenoiseOpts::from_config(&autoshop::config::Config::load(), None, 1.0)
+                    });
+                    autoshop::render::render_to_file(&path, &recipe, &out, opts.as_ref(), Some(&export))?;
+                    Ok::<String, anyhow::Error>(out.display().to_string())
+                })();
+                Msg::Exported(res)
+            },
+            |e| Msg::Exported(Err(e)),
+        );
     }
 
     /// Run the AI segmentation sidecar on the ORIGINAL-frame preview and attach
@@ -2005,29 +2033,31 @@ impl AutoshopApp {
         let Some(src) = self.src_path.clone() else { return };
         self.busy = true;
         self.status = format!("AI {label}分割中…（首次运行会自动下载模型，看控制台日志）");
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let res = (|| -> anyhow::Result<(String, PathBuf)> {
-                let cfg = autoshop::config::Config::load();
-                let opts = autoshop::segment::SegmentOpts::from_config(&cfg, target);
-                // The sidecar sees the ORIGINAL-frame preview — the space recipe
-                // masks live in. Preview resolution is enough: the engine samples
-                // the raster bilinearly in normalised coords at any render size.
-                let mut tmp = std::env::temp_dir();
-                tmp.push(format!("autoshop_seg_{}_{target}.png", std::process::id()));
-                base.to_rgb8()
-                    .save(&tmp)
-                    .map_err(|e| anyhow::anyhow!("write segmentation input {}: {e}", tmp.display()))?;
-                // One raster per (photo, target): re-running a segmentation
-                // refreshes the same file, and the existing mask follows it.
-                let mask = autoshop::pipeline::default_out(&src, &format!("mask-{target}"), "png");
-                let run = autoshop::segment::segment_file(&opts, &tmp, &mask);
-                let _ = std::fs::remove_file(&tmp);
-                run?;
-                Ok((label.to_string(), mask))
-            })();
-            let _ = tx.send(Msg::Segmented(res));
-        });
+        self.spawn_worker(
+            move || {
+                let res = (|| -> anyhow::Result<(String, PathBuf)> {
+                    let cfg = autoshop::config::Config::load();
+                    let opts = autoshop::segment::SegmentOpts::from_config(&cfg, target);
+                    // The sidecar sees the ORIGINAL-frame preview — the space recipe
+                    // masks live in. Preview resolution is enough: the engine samples
+                    // the raster bilinearly in normalised coords at any render size.
+                    let mut tmp = std::env::temp_dir();
+                    tmp.push(format!("autoshop_seg_{}_{target}.png", std::process::id()));
+                    base.to_rgb8()
+                        .save(&tmp)
+                        .map_err(|e| anyhow::anyhow!("write segmentation input {}: {e}", tmp.display()))?;
+                    // One raster per (photo, target): re-running a segmentation
+                    // refreshes the same file, and the existing mask follows it.
+                    let mask = autoshop::pipeline::default_out(&src, &format!("mask-{target}"), "png");
+                    let run = autoshop::segment::segment_file(&opts, &tmp, &mask);
+                    let _ = std::fs::remove_file(&tmp);
+                    run?;
+                    Ok((label.to_string(), mask))
+                })();
+                Msg::Segmented(res)
+            },
+            |e| Msg::Segmented(Err(e)),
+        );
     }
 
     /// The delivery options the export UI currently dials in (gap batch F) —
@@ -2069,39 +2099,44 @@ impl AutoshopApp {
         self.busy = true;
         self.status = format!("批量渲染 {} 张 → ./out …", targets.len());
         self.batch_progress = Some((0, targets.len())); // the top-bar progress bar
+        // Interim BatchProgress ticks flow through this extra clone; the
+        // TERMINAL Msg::Exported is owned by spawn_worker (panic-safe).
         let tx = self.tx.clone();
         let ext = ext.to_string();
-        std::thread::spawn(move || {
-            let res = (|| {
-                let total = targets.len();
-                let (mut okn, mut errs) = (0usize, Vec::<String>::new());
-                for p in &targets {
-                    let one = (|| -> anyhow::Result<()> {
-                        let rj = autoshop::pipeline::default_out(p, "recipe", "json");
-                        let recipe = if rj.exists() {
-                            serde_json::from_str::<EditRecipe>(&std::fs::read_to_string(&rj)?)?
-                        } else {
-                            EditRecipe::default()
-                        };
-                        let out = autoshop::pipeline::default_out(p, "developed", &ext);
-                        autoshop::pipeline::ensure_parent(&out)?;
-                        autoshop::render::render_to_file(p, &recipe, &out, None, Some(&export))?;
-                        Ok(())
-                    })();
-                    match one {
-                        Ok(()) => okn += 1,
-                        Err(e) => errs.push(format!("{}: {e}", autoshop::pipeline::stem(p))),
+        self.spawn_worker(
+            move || {
+                let res = (|| {
+                    let total = targets.len();
+                    let (mut okn, mut errs) = (0usize, Vec::<String>::new());
+                    for p in &targets {
+                        let one = (|| -> anyhow::Result<()> {
+                            let rj = autoshop::pipeline::default_out(p, "recipe", "json");
+                            let recipe = if rj.exists() {
+                                serde_json::from_str::<EditRecipe>(&std::fs::read_to_string(&rj)?)?
+                            } else {
+                                EditRecipe::default()
+                            };
+                            let out = autoshop::pipeline::default_out(p, "developed", &ext);
+                            autoshop::pipeline::ensure_parent(&out)?;
+                            autoshop::render::render_to_file(p, &recipe, &out, None, Some(&export))?;
+                            Ok(())
+                        })();
+                        match one {
+                            Ok(()) => okn += 1,
+                            Err(e) => errs.push(format!("{}: {e}", autoshop::pipeline::stem(p))),
+                        }
+                        let _ = tx.send(Msg::BatchProgress { done: okn + errs.len(), total });
                     }
-                    let _ = tx.send(Msg::BatchProgress { done: okn + errs.len(), total });
-                }
-                if errs.is_empty() {
-                    Ok(format!("./out — 批量 {okn} 张完成"))
-                } else {
-                    anyhow::bail!("批量：{okn} 成功、{} 失败：{}", errs.len(), errs.join("; "))
-                }
-            })();
-            let _ = tx.send(Msg::Exported(res));
-        });
+                    if errs.is_empty() {
+                        Ok(format!("./out — 批量 {okn} 张完成"))
+                    } else {
+                        anyhow::bail!("批量：{okn} 成功、{} 失败：{}", errs.len(), errs.join("; "))
+                    }
+                })();
+                Msg::Exported(res)
+            },
+            |e| Msg::Exported(Err(e)),
+        );
     }
 
     fn start_export(&mut self) {
@@ -2164,38 +2199,40 @@ impl AutoshopApp {
         }
         self.busy = true;
         self.status = format!("粘贴配方到 {} 张…", targets.len());
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let res = (|| -> anyhow::Result<String> {
-                let (mut okn, mut xmpn) = (0usize, 0usize);
-                let mut errs: Vec<String> = Vec::new();
-                for path in &targets {
-                    let step = || -> anyhow::Result<bool> {
-                        autoshop::pipeline::write_recipe(path, &recipe, None)?;
-                        if autoshop::decode::is_raw(path) {
-                            autoshop::pipeline::write_xmp(path, &recipe)?;
-                            return Ok(true);
+        self.spawn_worker(
+            move || {
+                let res = (|| -> anyhow::Result<String> {
+                    let (mut okn, mut xmpn) = (0usize, 0usize);
+                    let mut errs: Vec<String> = Vec::new();
+                    for path in &targets {
+                        let step = || -> anyhow::Result<bool> {
+                            autoshop::pipeline::write_recipe(path, &recipe, None)?;
+                            if autoshop::decode::is_raw(path) {
+                                autoshop::pipeline::write_xmp(path, &recipe)?;
+                                return Ok(true);
+                            }
+                            Ok(false)
+                        };
+                        match step() {
+                            Ok(wrote_xmp) => {
+                                okn += 1;
+                                xmpn += usize::from(wrote_xmp);
+                            }
+                            Err(e) => errs.push(format!("{}: {e}", autoshop::pipeline::stem(path))),
                         }
-                        Ok(false)
-                    };
-                    match step() {
-                        Ok(wrote_xmp) => {
-                            okn += 1;
-                            xmpn += usize::from(wrote_xmp);
-                        }
-                        Err(e) => errs.push(format!("{}: {e}", autoshop::pipeline::stem(path))),
                     }
-                }
-                // Any failure surfaces as an error toast WITH the success count —
-                // a partial failure must never read as a clean success.
-                if errs.is_empty() {
-                    Ok(format!("配方已粘贴到 {okn} 张（{xmpn} 个 XMP）→ ./out"))
-                } else {
-                    anyhow::bail!("{okn} 成功、{} 失败：{}", errs.len(), errs.join(" · "))
-                }
-            })();
-            let _ = tx.send(Msg::Pasted(res));
-        });
+                    // Any failure surfaces as an error toast WITH the success count —
+                    // a partial failure must never read as a clean success.
+                    if errs.is_empty() {
+                        Ok(format!("配方已粘贴到 {okn} 张（{xmpn} 个 XMP）→ ./out"))
+                    } else {
+                        anyhow::bail!("{okn} 成功、{} 失败：{}", errs.len(), errs.join(" · "))
+                    }
+                })();
+                Msg::Pasted(res)
+            },
+            |e| Msg::Pasted(Err(e)),
+        );
     }
 
     fn poll_workers(&mut self, ctx: &egui::Context) {
@@ -4152,28 +4189,30 @@ impl AutoshopApp {
         } else {
             "generative fill via gpt-image… (~15-40s)".into()
         };
-        let tx = self.tx.clone();
         let quality = ["high", "medium", "low"][self.fill_quality.min(2)].to_string();
         let full_res = self.fill_fullres;
         let edge = self.preview_edge.clamp(640, 8192); // bake at the working res, not a fixed 1280
-        std::thread::spawn(move || {
-            let res = (|| -> RetouchDone {
-                let cfg = autoshop::config::Config::load();
-                let out = autoshop::pipeline::default_out(&path, "retouch", "png");
-                let mask_tmp =
-                    std::env::temp_dir().join(format!("autoshop_gui_fill_{}.png", std::process::id()));
-                std::fs::write(&mask_tmp, &mask_png)?;
-                let r = autoshop::generative::retouch(&cfg, &path, &mask_tmp, &prompt, &quality, full_res, &out);
-                let _ = std::fs::remove_file(&mask_tmp);
-                r?;
-                let img = autoshop::decode::load_image(&out)?.thumbnail(edge, edge);
-                // InPlace: refine the current rendition — bake into the active
-                // variant's base AND repoint its origin at this saved artifact
-                // so export / reverse-fit / next retouch follow the fill.
-                Ok((img, format!("filled → {} (更新当前变体)", out.display()), out, RetouchKind::InPlace))
-            })();
-            let _ = tx.send(Msg::Retouched(Box::new(res)));
-        });
+        self.spawn_worker(
+            move || {
+                let res = (|| -> RetouchDone {
+                    let cfg = autoshop::config::Config::load();
+                    let out = autoshop::pipeline::default_out(&path, "retouch", "png");
+                    let mask_tmp = std::env::temp_dir()
+                        .join(format!("autoshop_gui_fill_{}.png", std::process::id()));
+                    std::fs::write(&mask_tmp, &mask_png)?;
+                    let r = autoshop::generative::retouch(&cfg, &path, &mask_tmp, &prompt, &quality, full_res, &out);
+                    let _ = std::fs::remove_file(&mask_tmp);
+                    r?;
+                    let img = autoshop::decode::load_image(&out)?.thumbnail(edge, edge);
+                    // InPlace: refine the current rendition — bake into the active
+                    // variant's base AND repoint its origin at this saved artifact
+                    // so export / reverse-fit / next retouch follow the fill.
+                    Ok((img, format!("filled → {} (更新当前变体)", out.display()), out, RetouchKind::InPlace))
+                })();
+                Msg::Retouched(Box::new(res))
+            },
+            |e| Msg::Retouched(Box::new(Err(e))),
+        );
     }
 
     /// Heal: AI auto-detect (use_mask=false) or the painted mask (use_mask=true).
@@ -4201,33 +4240,35 @@ impl AutoshopApp {
         } else {
             "AI 去瑕疵中… (~10-30s)".into()
         };
-        let tx = self.tx.clone();
         let full_res = self.heal_fullres;
         let edge = self.preview_edge.clamp(640, 8192); // bake at the working res, not a fixed 1280
-        std::thread::spawn(move || {
-            let res = (|| -> RetouchDone {
-                let cfg = autoshop::config::Config::load();
-                let out = autoshop::pipeline::default_out(&path, "heal", "png");
-                let mask_tmp = match mask_png {
-                    Some(bytes) => {
-                        let t = std::env::temp_dir()
-                            .join(format!("autoshop_gui_heal_{}.png", std::process::id()));
-                        std::fs::write(&t, &bytes)?;
-                        Some(t)
+        self.spawn_worker(
+            move || {
+                let res = (|| -> RetouchDone {
+                    let cfg = autoshop::config::Config::load();
+                    let out = autoshop::pipeline::default_out(&path, "heal", "png");
+                    let mask_tmp = match mask_png {
+                        Some(bytes) => {
+                            let t = std::env::temp_dir()
+                                .join(format!("autoshop_gui_heal_{}.png", std::process::id()));
+                            std::fs::write(&t, &bytes)?;
+                            Some(t)
+                        }
+                        None => None,
+                    };
+                    let rep = autoshop::retouch::heal(&cfg, &path, mask_tmp.as_deref(), !use_mask, full_res, &out);
+                    if let Some(t) = &mask_tmp {
+                        let _ = std::fs::remove_file(t);
                     }
-                    None => None,
-                };
-                let rep = autoshop::retouch::heal(&cfg, &path, mask_tmp.as_deref(), !use_mask, full_res, &out);
-                if let Some(t) = &mask_tmp {
-                    let _ = std::fs::remove_file(t);
-                }
-                let rep = rep?;
-                let img = autoshop::decode::load_image(&out)?.thumbnail(edge, edge);
-                // InPlace: bake into the active variant's base + repoint origin.
-                Ok((img, format!("healed {} spot(s) → {}", rep.spots, out.display()), out, RetouchKind::InPlace))
-            })();
-            let _ = tx.send(Msg::Retouched(Box::new(res)));
-        });
+                    let rep = rep?;
+                    let img = autoshop::decode::load_image(&out)?.thumbnail(edge, edge);
+                    // InPlace: bake into the active variant's base + repoint origin.
+                    Ok((img, format!("healed {} spot(s) → {}", rep.spots, out.display()), out, RetouchKind::InPlace))
+                })();
+                Msg::Retouched(Box::new(res))
+            },
+            |e| Msg::Retouched(Box::new(Err(e))),
+        );
     }
 
     /// Run the clone stamp on a worker: painted target mask + the Alt+picked
@@ -4249,25 +4290,27 @@ impl AutoshopApp {
         };
         self.busy = true;
         self.status = "克隆中…（本地像素运算）".into();
-        let tx = self.tx.clone();
         let full_res = self.clone_fullres;
         let edge = self.preview_edge.clamp(640, 8192); // bake at the working res, not a fixed 1280
-        std::thread::spawn(move || {
-            let res = (|| -> RetouchDone {
-                let out = autoshop::pipeline::default_out(&path, "clone", "png");
-                let mask_tmp = std::env::temp_dir()
-                    .join(format!("autoshop_gui_clone_{}.png", std::process::id()));
-                std::fs::write(&mask_tmp, &mask_png)?;
-                let rep = autoshop::retouch::clone_stamp(&path, &mask_tmp, src_pt, full_res, &out);
-                let _ = std::fs::remove_file(&mask_tmp);
-                let rep = rep?;
-                let img = autoshop::decode::load_image(&out)?.thumbnail(edge, edge);
-                // InPlace: a pixel transplant of the current rendition — bake it
-                // into the active variant's base + repoint origin at the artifact.
-                Ok((img, format!("克隆 {} 处 → {}", rep.spots, out.display()), out, RetouchKind::InPlace))
-            })();
-            let _ = tx.send(Msg::Retouched(Box::new(res)));
-        });
+        self.spawn_worker(
+            move || {
+                let res = (|| -> RetouchDone {
+                    let out = autoshop::pipeline::default_out(&path, "clone", "png");
+                    let mask_tmp = std::env::temp_dir()
+                        .join(format!("autoshop_gui_clone_{}.png", std::process::id()));
+                    std::fs::write(&mask_tmp, &mask_png)?;
+                    let rep = autoshop::retouch::clone_stamp(&path, &mask_tmp, src_pt, full_res, &out);
+                    let _ = std::fs::remove_file(&mask_tmp);
+                    let rep = rep?;
+                    let img = autoshop::decode::load_image(&out)?.thumbnail(edge, edge);
+                    // InPlace: a pixel transplant of the current rendition — bake it
+                    // into the active variant's base + repoint origin at the artifact.
+                    Ok((img, format!("克隆 {} 处 → {}", rep.spots, out.display()), out, RetouchKind::InPlace))
+                })();
+                Msg::Retouched(Box::new(res))
+            },
+            |e| Msg::Retouched(Box::new(Err(e))),
+        );
     }
 
     /// Full-frame generative re-render via gpt-image — the OPTIONAL "let GPT
@@ -4313,20 +4356,22 @@ impl AutoshopApp {
         };
         self.busy = true;
         self.status = "AI 生成出片中… (gpt-image, ~15–60s; 高分辨率输入需先全幅显影)".into();
-        let tx = self.tx.clone();
         let edge = self.preview_edge.clamp(640, 8192);
-        std::thread::spawn(move || {
-            let res = (|| -> RetouchDone {
-                let cfg = autoshop::config::Config::load();
-                // fidelity "high" keeps it recognisably the same photo.
-                autoshop::generative::reimagine(&cfg, &path, &prompt, "high", &cfg.openai_image_quality, &out)?;
-                let img = autoshop::decode::load_image(&out)?.thumbnail(edge, edge);
-                let msg = format!("已生成「AI 生成」变体 → {} · 可继续微调或「反推配方」", out.display());
-                // NewGenerated: a whole-frame rendition → a new Generated variant.
-                Ok((img, msg, out, RetouchKind::NewGenerated))
-            })();
-            let _ = tx.send(Msg::Retouched(Box::new(res)));
-        });
+        self.spawn_worker(
+            move || {
+                let res = (|| -> RetouchDone {
+                    let cfg = autoshop::config::Config::load();
+                    // fidelity "high" keeps it recognisably the same photo.
+                    autoshop::generative::reimagine(&cfg, &path, &prompt, "high", &cfg.openai_image_quality, &out)?;
+                    let img = autoshop::decode::load_image(&out)?.thumbnail(edge, edge);
+                    let msg = format!("已生成「AI 生成」变体 → {} · 可继续微调或「反推配方」", out.display());
+                    // NewGenerated: a whole-frame rendition → a new Generated variant.
+                    Ok((img, msg, out, RetouchKind::NewGenerated))
+                })();
+                Msg::Retouched(Box::new(res))
+            },
+            |e| Msg::Retouched(Box::new(Err(e))),
+        );
     }
 
     /// Reverse-fit ("match"): statistically solve the develop parameters that map
@@ -4348,23 +4393,25 @@ impl AutoshopApp {
         let src_path = self.src_path.clone();
         self.busy = true;
         self.status = "反推配方中…（统计拟合，本地运算）".into();
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let res = (|| -> anyhow::Result<(EditRecipe, String)> {
-                let target = autoshop::decode::load_image(&tgt)?;
-                let rep = autoshop::fit::fit_recipe(&base, &target);
-                let mut note = format!(
-                    "反推完成：look 残差 {:.3}→{:.3} · 已建「反推」变体（可编辑/导 XMP/出全分辨率）",
-                    rep.err_before, rep.err_after
-                );
-                if let Some(p) = src_path.filter(|p| autoshop::decode::is_raw(p)) {
-                    let x = autoshop::pipeline::write_xmp(&p, &rep.recipe)?;
-                    note.push_str(&format!(" · XMP → {}", x.display()));
-                }
-                Ok((rep.recipe, note))
-            })();
-            let _ = tx.send(Msg::Fitted(Box::new(res)));
-        });
+        self.spawn_worker(
+            move || {
+                let res = (|| -> anyhow::Result<(EditRecipe, String)> {
+                    let target = autoshop::decode::load_image(&tgt)?;
+                    let rep = autoshop::fit::fit_recipe(&base, &target);
+                    let mut note = format!(
+                        "反推完成：look 残差 {:.3}→{:.3} · 已建「反推」变体（可编辑/导 XMP/出全分辨率）",
+                        rep.err_before, rep.err_after
+                    );
+                    if let Some(p) = src_path.filter(|p| autoshop::decode::is_raw(p)) {
+                        let x = autoshop::pipeline::write_xmp(&p, &rep.recipe)?;
+                        note.push_str(&format!(" · XMP → {}", x.display()));
+                    }
+                    Ok((rep.recipe, note))
+                })();
+                Msg::Fitted(Box::new(res))
+            },
+            |e| Msg::Fitted(Box::new(Err(e))),
+        );
     }
 
     /// Extract a reusable STYLE PROMPT from the before/after pair via the vision
@@ -4381,27 +4428,29 @@ impl AutoshopApp {
         let src_path = self.src_path.clone();
         self.busy = true;
         self.status = "提取风格提示词中… (vision, ~5-20s)".into();
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let res = (|| -> anyhow::Result<String> {
-                let cfg = autoshop::config::Config::load();
-                let jpg = |img: &image::DynamicImage| -> anyhow::Result<Vec<u8>> {
-                    let mut buf = Vec::new();
-                    image::DynamicImage::ImageRgb8(img.thumbnail(768, 768).to_rgb8())
-                        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)?;
-                    Ok(buf)
-                };
-                let target = autoshop::decode::load_image(&tgt)?;
-                let prompt = autoshop::advisor::describe_style(&cfg, &jpg(&base)?, &jpg(&target)?)?;
-                if let Some(p) = &src_path {
-                    let out = autoshop::pipeline::default_out(p, "style", "txt");
-                    autoshop::pipeline::ensure_parent(&out)?;
-                    std::fs::write(&out, &prompt)?;
-                }
-                Ok(prompt)
-            })();
-            let _ = tx.send(Msg::Styled(Box::new(res)));
-        });
+        self.spawn_worker(
+            move || {
+                let res = (|| -> anyhow::Result<String> {
+                    let cfg = autoshop::config::Config::load();
+                    let jpg = |img: &image::DynamicImage| -> anyhow::Result<Vec<u8>> {
+                        let mut buf = Vec::new();
+                        image::DynamicImage::ImageRgb8(img.thumbnail(768, 768).to_rgb8())
+                            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)?;
+                        Ok(buf)
+                    };
+                    let target = autoshop::decode::load_image(&tgt)?;
+                    let prompt = autoshop::advisor::describe_style(&cfg, &jpg(&base)?, &jpg(&target)?)?;
+                    if let Some(p) = &src_path {
+                        let out = autoshop::pipeline::default_out(p, "style", "txt");
+                        autoshop::pipeline::ensure_parent(&out)?;
+                        std::fs::write(&out, &prompt)?;
+                    }
+                    Ok(prompt)
+                })();
+                Msg::Styled(Box::new(res))
+            },
+            |e| Msg::Styled(Box::new(Err(e))),
+        );
     }
 
     /// The variant strip (版本条): one card per rendition — 原片 / AI 生成 /
