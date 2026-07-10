@@ -3288,6 +3288,11 @@ impl AutoshopApp {
                 changed |= Self::slider(ui, "Whites", &mut m.whites, -100.0, 100.0, 0.0);
                 changed |= Self::slider(ui, "Blacks", &mut m.blacks, -100.0, 100.0, 0.0);
                 changed |= Self::slider(ui, "Saturation", &mut m.saturation, -100.0, 100.0, 0.0);
+                // Engine-rendered since batch #2-B (render.rs apply_masks
+                // mirrors the global WB model inside the mask) — live in the
+                // preview like the tone sliders above.
+                changed |= Self::slider(ui, "Temp", &mut m.temperature, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, "Tint", &mut m.tint, -100.0, 100.0, 0.0);
                 changed |= Self::slider(ui, "Noise Red.", &mut m.noise_reduction, 0.0, 100.0, 0.0);
                 // These serialise to the XMP but the in-app preview doesn't
                 // render them yet (documented engine scope) — honest label.
@@ -3299,8 +3304,6 @@ impl AutoshopApp {
                         changed |= Self::slider(ui, "Clarity", &mut m.clarity, -100.0, 100.0, 0.0);
                         changed |= Self::slider(ui, "Dehaze", &mut m.dehaze, -100.0, 100.0, 0.0);
                         changed |= Self::slider(ui, "Texture", &mut m.texture, -100.0, 100.0, 0.0);
-                        changed |= Self::slider(ui, "Temp", &mut m.temperature, -100.0, 100.0, 0.0);
-                        changed |= Self::slider(ui, "Tint", &mut m.tint, -100.0, 100.0, 0.0);
                     });
             } else if n_masks == 0 {
                 ui.label(

@@ -1,14 +1,62 @@
 # ROADMAP — “一定程度直接取代 Photoshop” 路线（v0.5.0 之后 · UX 阶段）
 
 > 交接文档：每项都附实现要点与 `file:line` 锚点，供新会话不重读全库即可
-> 开工。更新于 2026-07-09 深夜（**v0.7.0 已发布** + 其后**反馈批次 #2-A
-> 本地 1 提交未推送** `7471d35`：反推旋转预算门+色调证据对称化+do-no-harm
-> ——用户复测"效果还是不好"的根治；**#2-B 语义分区反推已立项未开工**——
-> 见「当前状态」前两条；反馈驱动阶段——用户试用 → 报障/提需 → 修复/打磨
-> → 发布）。
+> 开工。更新于 2026-07-09/10 夜（**v0.7.0 已发布** + 其后**反馈批次 #2-A
+> `7471d35` 与 #2-B 语义分区反推全套 5 提交
+> `d58ca60`/`9c55e24`/`a5173b2`/`b78daeb`/`09172f2`，本地未推送**；真机对
+> v4 渲染已目视+数值验收，待用户 GUI 复测；反馈驱动阶段——用户试用 →
+> 报障/提需 → 修复/打磨 → 发布）。
 
 ## 当前状态（已完成，勿重做）
 
+- **反馈批次 #2-B：语义分区反推（2026-07-09/10 夜，5 提交本地未推送）**
+  ——跨"区域性观感 vs 全局滑杆"表达力鸿沟的正路，全程 fail-first +
+  真机对（_DSC9621 × reimagine-5）驱动迭代 4 轮渲染目视：
+  1. **引擎局部 temp/tint（`d58ca60`，render.rs）**：LocalAdjustment 自 v1
+     就带 Temp/Tint 且 XMP 会导出，但引擎从不渲染（GUI 蒙版滑杆拖了没反
+     应的既有缺口）。`local_temp_to_kelvin`（相对 ±100 → mired 线性 ∓80
+     围绕 5500K 锚，≈半张 CTO/CTB，render.rs）+ apply_masks 每蒙版一次
+     `wb_gains`、线性光逐像素、WB→tone→sat 镜像全局次序。fail-first 红→
+     绿 + 满帧蒙版≈全局 WB 等价性测试钉死映射与 tint 符号。
+  2. **color_gains 重着色增益（`9c55e24`，recipe.rs/render.rs/fit_zoned.rs）**
+     ——实测出的模型上限：调色板移植（蓝天→金天）要求线性 r/b ≈5.3×，而
+     **任何** WB 参数化（扫满 2000–40000K 黑体）封顶 ≈1.9×、±100 饱和只
+     ×2——Temp/Tint/Sat 物理上画不出重绘。新字段
+     `LocalAdjustment.color_gains: Option<[f32;3]>`（线性光逐通道增益，
+     0.05..8 钳制，中性收敛回 None；引擎专用——经典 ACR 无对应物，本来就
+     只挂在 XMP 会跳过的 Bitmap 蒙版上），apply_masks 与 WB 增益乘法合成。
+     可识别性论证：全局 cast 曲线必须重门槛是因为"哪里"未知；蒙版回答了
+     "哪里"，区上逐通道增益就是可识别的——这正是表达力升级本身。
+  3. **fit_zoned.rs 新模块（`9c55e24`+`a5173b2`+`09172f2`，~700 行）**：
+     zone_moments（蒙版加权线性光一阶矩）→ fit_zone_dials（增益=want/2^EV
+     精确闭式）→ `fit_recipe_zoned` 编排：全局 fit 先行 → `segment_file`
+     ×2（源+目标各一次天空分割）→ **天空区 + 地景区**（同一栅格
+     `inverted=true` 复用——第一轮真机渲染的教训：只修天空留下蓝晕带贴着
+     金天空）→ 每区独立验收。分割/依赖/退化任何失败 → 优雅回退纯全局
+     fit + rationale 注记，绝不报错。
+  4. **分区验收哲学（`09172f2`，真机实测驱动）**：帧全局 look_err 会按构
+     造否决正确的分区重绘（实测：天空区矩 0.507→0.016 落点几乎精确，帧
+     全局却 0.1768→0.1792——生成式目标的天空占比 8% vs 23% 构图不同 +
+     蓝→金迁移带质量被 worst-band 色相项读成伤害）。分区 do-no-harm 裁判
+     = **区内矩误差**（zone_err ≤50% 原值）+ 帧全局仅作**有界漂移保险**
+     （±0.02，实测漂移 +0.0024）。非对称占比回归测试钉死该几何。
+  5. **区内色调 CDF 求解（`09172f2`）**：线性均值匹配后地景仍读起来暗很
+     多（目标地景=日照台地+深峡谷阴影，亮像素统治线性均值、感知跟随分
+     布）。区内加权 luma CDF → quantile 映射 → 复用 `fit::fit_tone_sliders`
+     （同全局 stage-1 基底+幅度先验）解 6 个局部色调滑杆；**可识别性守卫**
+     （实测）：近单值源区（平雾天空 IQR<0.05）上 quantile 映射退化（解出
+     EV −0.70、区残差 0.016→0.108 倒退）→ 回退矩-EV、色调保持平。
+  6. **接线（`b78daeb`）**：CLI `match --zoned`（蒙版落 GUI 约定
+     out/<stem>.mask-sky.png）；GUI `zoned_fit` Pref（eframe 持久化，默认
+     ON——有优雅回退）、Settings「反推」区开关、start_fit 分支 + 完成注记；
+     XMP 诚实注记由构造完成（rationale 进 sidecar 注释 xmp.rs:350，Bitmap
+     蒙版被跳过 xmp.rs:79）。
+  7. **真机 v4 验收（无头 CLI + 渲染目视 + 数值）**：双分区 attach（天空
+     0.507→0.016、地景 0.151→0.006）；天空奶金 [0.69 0.60 0.48]（目标上
+     天空 [0.63 0.56 0.50]）、地景暖红棕有结构、无蓝晕、无 re-hue；地景
+     亮度较目标仍差 ~0.1 sRGB——目标重打光了构图（诚实残余，rationale 有
+     注记），且蒙版滑杆现已实时渲染，用户面板一拖即补。测试基线
+     **96 lib + 5 gui**，clippy(gui) 零警告。**待用户 GUI 真机验收**。
 - **反馈批次 #2-A：反推统计加固（2026-07-09 深夜，`7471d35`，本地未推送）**
   ——用户 v0.7.0 真机复测报"效果还是不好"（_DSC9621 × reimagine-5：全图刷
   成高饱和橙、天空由雾蓝变橙桃）。实测定位三个根因并全部 fail-first 修复
@@ -41,16 +89,6 @@
   0.275→0.177 诚实上报。附注：多代理对抗审查揪出 9 项实证问题全部处置
   （含两个变异验证的"未承重"洞、rationale 误导措辞、文档漂移、测试复制生
   产代码——审查代理曾误留 eprintln/stash 污染工作树，已恢复并全量复验）。
-- **反馈批次 #2-B：语义分区反推（方向已定，未开工）**——跨"区域性观感 vs
-  全局滑杆"表达力鸿沟的正路：对源中性渲染和目标各跑一次天空分割
-  （`segment_file` 是库代码、任意路径可用，src/segment.rs:40；sky =
-  segformer-b0 ~14MB），天空对天空、地面对地面分别拟合，天空区落成 Bitmap
-  蒙版 LocalAdjustment。**前置工作**：① 引擎不渲染局部 temp/tint
-  （render.rs:662-663 XMP-only）——天空色相修正靠它，须先实现（顺带修复
-  GUI 蒙版 temp/tint 拖了没反应的既有缺口）；② Bitmap 蒙版不导出 XMP
-  （xmp.rs:79，经典 ACR 表达不了栅格）——分区结果 LR 不可见，需线性渐变+
-  亮度范围近似导出或接受 in-app only；③ fit 时依赖 python sidecar，需
-  优雅回退全局拟合。
 - **反馈批次 #1 → v0.7.0 已发布**（2026-07-09，tag `v0.7.0` → `7c36ee3`，
   双 exe 资产字节核对 33286921/25914296，标记 Latest）——用户真机报障
   "反推紫天空 + 扁平"（峡谷照截图对）+ 四项指令（解决问题/加去雾、修 bug、
@@ -233,7 +271,14 @@
   Save XMP 提示先反推；⑤ 在生成变体上 fill/heal/clone 修补的是生成图、且导出
   跟随修补（WYSIWYG）；⑥ × 删除非原片变体；⑦ 生成两次得两个独立「AI 生成」
   变体互不覆盖；⑧ 统一主题观感。真机点击全链未走（状态机经编译+75/5 测试+
-  两轮多代理对抗审查+同步终审 CLEAN）。
+  两轮多代理对抗审查+同步终审 CLEAN）。**#2-B 分区反推新增待验（GUI 链路）**：
+  ① 新 build 里对 _DSC9621 × reimagine-5 重跑反推（Settings「反推」区开关
+  默认 ON）——应出现「反推·天空」「反推·地景」两个蒙版、天空转奶金、无蓝晕
+  无紫（CLI 无头链路 v4 已目视+数值验收，GUI 点击链路同函数）；② 地景若嫌
+  暗，在蒙版面板拖「反推·地景」的 Exposure——蒙版滑杆现已实时渲染（顺带验
+  Temp/Tint 从"仅 XMP"组移入实时区后拖动即时生效）；③ 首跑天空分割会下载
+  segformer-b0（~14MB，看状态栏提示）；python 依赖缺失时应静默回退纯全局
+  反推且 rationale 有说明。
 
 ## 关键架构事实（新会话必读）
 
@@ -259,7 +304,15 @@
   tone_exposure_curve`（pub(crate)，fit.rs 逆着它解）；曲线采样单一事实来源
   `render::curve_lut`（pub，GUI 曲线编辑器直接画它）。
 - `recipe.masks` 是 AI 与手动共用的同一列表；引擎 `apply_masks` 实时渲染
-  tone+saturation+NR，clarity/dehaze/texture/temp/tint 仅进 XMP（GUI 已如实分组）。
+  **WB(temp/tint)+color_gains → tone → saturation → NR**（#2-B 起；WB 镜像
+  全局 `wb_gains` 模型、mired 映射 `local_temp_to_kelvin`；`color_gains`
+  是分区反推的重着色增益，引擎专用），clarity/dehaze/texture 仍仅进 XMP
+  （GUI 已如实分组：Temp/Tint 移入实时区）。
+- 分区反推 `fit_zoned.rs`：`fit_recipe_zoned`（CLI `match --zoned` /
+  GUI `zoned_fit` Pref）= 全局 fit → 天空分割×2 → 天空+地景（同栅格反相）
+  双分区 → 每区 zone_err 矩裁判（帧全局 look_err 只作 ±0.02 漂移保险——
+  帧级指标会否决正确分区重绘，实测记录在 ZONE_ACCEPT_RATIO 注释）＋区内
+  luma-CDF 色调求解（源区 IQR<0.05 退化守卫）。任何失败优雅回退全局 fit。
 - 照片库 `D:/Photography` 只读；输出一律 `./out`（`pipeline::guard_readonly`，
   项目自身 `./out` 永远可写）。
 
