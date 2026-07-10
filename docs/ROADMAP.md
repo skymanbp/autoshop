@@ -1,15 +1,17 @@
 # ROADMAP — “一定程度直接取代 Photoshop” 路线（v0.5.0 之后 · UX 阶段）
 
 > 交接文档：每项都附实现要点与 `file:line` 锚点，供新会话不重读全库即可
-> 开工。更新于 2026-07-10（**v0.8.0 已发布**：tag `v0.8.0` → `1c1ea36`，
-> "Autoshop v0.8.0 — zoned reverse-fit (sky/land) + engine local WB"，双 exe
-> 资产字节核对 gui 33304506 / cli 25937114，标记 Latest；其后**性能批次
-> #2-C 本地 2 提交未推送** `759c9ca`/`c1e8b8d`；反馈驱动阶段——用户试用 →
-> 报障/提需 → 修复/打磨 → 发布）。
+> 开工。更新于 2026-07-10（**v0.8.1 已发布**：tag `v0.8.1` → `ce69f27`，
+> "v0.8.1 — preview lag root-fix (LUT colour gains + async latest-wins)"，
+> 双 exe 资产字节核对 gui 33344521 / cli 25945946，标记 Latest；性能批次
+> #2-C（`759c9ca`/`c1e8b8d`/`393c496` + bump `ce69f27`）随此 patch 版发布——
+> 渲染输出较 v0.8.0 逐字节不变，故 patch 而非 minor。前一版 v0.8.0 →
+> `1c1ea36`（zoned reverse-fit + engine local WB）。反馈驱动阶段——用户
+> 试用 → 报障/提需 → 修复/打磨 → 发布）。
 
 ## 当前状态（已完成，勿重做）
 
-- **性能批次 #2-C：预览卡顿根治（2026-07-10，本地 2 提交未推送）**——用户报
+- **性能批次 #2-C：预览卡顿根治（2026-07-10，已随 v0.8.1 发布 → `ce69f27`）**——用户报
   "处理图片时会有些卡"。多代理只读剖析 + 无头基准定位两层根因，各根修：
   1. **色偏增益 LUT 化（`759c9ca`，render.rs）**：v0.8 分区蒙版的
      `color_gains` 在 apply_wb / apply_masks 里逐像素逐通道跑两次
