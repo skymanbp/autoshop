@@ -172,6 +172,14 @@ enum Command {
         /// (./out/<stem>.matched.tif, 16-bit).
         #[arg(long)]
         render: bool,
+        /// Add a sky-to-sky ZONED correction on top of the global fit: segment
+        /// the sky in both images (python sidecar, local) and attach a
+        /// bitmap-masked local adjustment. Rendered in-app / by our engine;
+        /// the Lightroom XMP carries the global fit only (classic sidecars
+        /// cannot hold raster masks). Falls back to the plain global fit with
+        /// a note if segmentation is unavailable.
+        #[arg(long)]
+        zoned: bool,
         /// Also extract a reusable style PROMPT from the pair via the vision
         /// model (./out/<stem>.style.txt; needs OPENAI_API_KEY).
         #[arg(long)]
@@ -258,8 +266,8 @@ fn main() -> Result<()> {
             let q = quality.unwrap_or_else(|| cfg.openai_image_quality.clone());
             generative::reimagine(&cfg, &raw, &prompt, &fidelity, &q, &out)
         }
-        Command::Match { raw, target, render, style_prompt, out } => {
-            match_cmd(&raw, &target, render, style_prompt, out)
+        Command::Match { raw, target, render, zoned, style_prompt, out } => {
+            match_cmd(&raw, &target, render, zoned, style_prompt, out)
         }
         Command::Retouch { raw, mask, prompt, quality, full_res, out } => {
             let cfg = Config::load();
@@ -452,13 +460,25 @@ fn match_cmd(
     raw: &Path,
     target: &Path,
     render_full: bool,
+    zoned: bool,
     style_prompt: bool,
     out: Option<PathBuf>,
 ) -> Result<()> {
     let src = decode::preview_only(raw)?;
     let tgt = decode::load_image(target)?;
     println!("reverse-fitting {} onto the look of {} …", raw.display(), target.display());
-    let rep = fit::fit_recipe(&src, &tgt);
+    let rep = if zoned {
+        // Sky mask lands at the GUI's convention (out/<stem>.mask-sky.png) so
+        // opening the photo in the GUI shows the same raster in the mask panel.
+        let cfg = Config::load();
+        let seg = autoshop::segment::SegmentOpts::from_config(&cfg, "sky");
+        let mask = default_out(raw, "mask-sky", "png");
+        pipeline::guard_readonly(&mask, raw)?;
+        println!("  zoned: segmenting the sky in both images (local python sidecar) …");
+        autoshop::fit_zoned::fit_recipe_zoned(&src, &tgt, &seg, &mask)
+    } else {
+        fit::fit_recipe(&src, &tgt)
+    };
     println!(
         "  look error {:.3} → {:.3}  (0 = identical distributions; masks/local edits are not recoverable)",
         rep.err_before, rep.err_after

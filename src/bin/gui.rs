@@ -65,6 +65,7 @@ struct Prefs {
     style_strength: f32,
     save_jpeg: bool,
     save_denoise: bool,
+    zoned_fit: bool,
     view_mode: ViewMode,
     exp_long_edge: u32,
     exp_sharpen: f32,
@@ -83,6 +84,9 @@ impl Default for Prefs {
             style_strength: 0.30,
             save_jpeg: false,
             save_denoise: false,
+            // Zoned sky reverse-fit ON by default: it degrades gracefully to
+            // the plain global fit when segmentation is unavailable.
+            zoned_fit: true,
             view_mode: ViewMode::SideBySide,
             exp_long_edge: 0,
             exp_sharpen: 0.0,
@@ -543,6 +547,7 @@ struct AutoshopApp {
     redo_stack: Vec<EditRecipe>,  // states undone away (cleared on a new edit)
     // --- settings / denoise ---
     save_denoise: bool,     // run SCUNet AI denoise before the full-res render
+    zoned_fit: bool,        // 反推 adds a sky-to-sky zoned correction (bitmap mask)
     show_settings: bool,    // the Settings window is open
     show_shortcuts: bool,   // the keyboard cheat-sheet window is open (F1 / ? / ⌨)
     settings: SettingsForm, // editable buffers for that window
@@ -750,6 +755,7 @@ impl Default for AutoshopApp {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             save_denoise: false,
+            zoned_fit: true,
             show_settings: false,
             show_shortcuts: false,
             settings: SettingsForm::default(),
@@ -828,6 +834,7 @@ impl AutoshopApp {
             app.style_strength = prefs.style_strength.clamp(0.0, 1.0);
             app.save_jpeg = prefs.save_jpeg;
             app.save_denoise = prefs.save_denoise;
+            app.zoned_fit = prefs.zoned_fit;
             app.view_mode = prefs.view_mode;
             app.exp_long_edge = prefs.exp_long_edge;
             app.exp_sharpen = prefs.exp_sharpen.clamp(0.0, 100.0);
@@ -1383,6 +1390,13 @@ impl AutoshopApp {
             )
             .weak()
             .small(),
+        );
+        ui.separator();
+        ui.heading("反推 / Reverse-fit");
+        ui.checkbox(&mut self.zoned_fit, "分区反推：天空 / Zoned fit (sky)").on_hover_text(
+            "反推时自动分割两侧天空，天空↔天空单独校色（曝光/重着色增益/饱和，位图蒙版）。\
+             蒙版由本机引擎渲染；LR sidecar 只携带全局部分。需要 python 分割依赖\
+             （transformers + torch）；不可用时自动退回纯全局反推并在理由里说明。",
         );
         {
             let f = &mut self.settings;
@@ -4415,17 +4429,40 @@ impl AutoshopApp {
             return;
         }
         let src_path = self.src_path.clone();
+        let zoned = self.zoned_fit;
         self.busy = true;
-        self.status = "反推配方中…（统计拟合，本地运算）".into();
+        self.status = if zoned {
+            "反推配方中…（统计拟合 + 天空分割，首次分割会下载模型）".into()
+        } else {
+            "反推配方中…（统计拟合，本地运算）".into()
+        };
         self.spawn_worker(
             move || {
                 let res = (|| -> anyhow::Result<(EditRecipe, String)> {
                     let target = autoshop::decode::load_image(&tgt)?;
-                    let rep = autoshop::fit::fit_recipe(&base, &target);
+                    // Zoned sky pass only when enabled AND the photo has a real
+                    // path (the mask raster lands at the GUI convention
+                    // out/<stem>.mask-sky.png, which needs a stem). Everything
+                    // that can go wrong inside degrades to the global fit with
+                    // a rationale note — never an error.
+                    let rep = match (zoned, &src_path) {
+                        (true, Some(p)) => {
+                            let cfg = autoshop::config::Config::load();
+                            let seg =
+                                autoshop::segment::SegmentOpts::from_config(&cfg, "sky");
+                            let mask =
+                                autoshop::pipeline::default_out(p, "mask-sky", "png");
+                            autoshop::fit_zoned::fit_recipe_zoned(&base, &target, &seg, &mask)
+                        }
+                        _ => autoshop::fit::fit_recipe(&base, &target),
+                    };
                     let mut note = format!(
                         "反推完成：look 残差 {:.3}→{:.3} · 已建「反推」变体（可编辑/导 XMP/出全分辨率）",
                         rep.err_before, rep.err_after
                     );
+                    if !rep.recipe.masks.is_empty() {
+                        note.push_str(" · 含天空分区校正（蒙版面板可调；XMP 只带全局部分）");
+                    }
                     if let Some(p) = src_path.filter(|p| autoshop::decode::is_raw(p)) {
                         let x = autoshop::pipeline::write_xmp(&p, &rep.recipe)?;
                         note.push_str(&format!(" · XMP → {}", x.display()));
@@ -5330,6 +5367,7 @@ impl eframe::App for AutoshopApp {
                 style_strength: self.style_strength,
                 save_jpeg: self.save_jpeg,
                 save_denoise: self.save_denoise,
+                zoned_fit: self.zoned_fit,
                 view_mode: self.view_mode,
                 exp_long_edge: self.exp_long_edge,
                 exp_sharpen: self.exp_sharpen,
