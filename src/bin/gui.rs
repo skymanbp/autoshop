@@ -103,9 +103,19 @@ const MAX_THUMB_INFLIGHT: usize = 6; // cap concurrent thumbnail decodes
 const HSL_BANDS: [&str; 8] = ["Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta"];
 const GRADE_REGIONS: [&str; 4] = ["shadow", "midtone", "highlight", "global"];
 
+// Two-tier colour rule (deliberate, not drift):
+//  * PILL gold is the ONE chrome accent — panel selections, badges, active
+//    variant, theme selection stroke all use the gold family below.
+//  * ACCENT blue is for ON-CANVAS tool overlays ONLY (mask knobs, region
+//    box): they sit on arbitrary photo content, and gold vanishes on warm
+//    frames (a golden canyon) exactly where masks get drawn most — a colour
+//    the theme never uses reads as "tool, not photo, not chrome".
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x4c, 0x8b, 0xf5);
-const SEL_BG: egui::Color32 = egui::Color32::from_rgb(0x26, 0x41, 0x7a);
 const PILL: egui::Color32 = egui::Color32::from_rgb(0xc9, 0xa1, 0x4a);
+/// Gallery selected-row fill: the PILL family at panel-background depth.
+const SEL_BG: egui::Color32 = egui::Color32::from_rgb(0x45, 0x38, 0x1a);
+/// Multi-select row fill — dimmer than [`SEL_BG`], same family.
+const SEL_BG_DIM: egui::Color32 = egui::Color32::from_rgb(0x2e, 0x26, 0x12);
 
 /// How a finished retouch enters the variant strip.
 #[derive(Clone, Copy, PartialEq)]
@@ -512,6 +522,9 @@ struct AutoshopApp {
     after_tex: Option<egui::TextureHandle>,
     recipe: EditRecipe,
     dirty: bool, // recipe changed → re-develop the after preview
+    // --- develop throttle (mid-drag coalescing; see the dirty check in update) ---
+    last_dev: Option<Instant>, // when the last develop ran
+    dev_cost: Duration,        // how long it took — sets the adaptive cadence
     status: String,
     busy: bool, // an analyze/export thread is running
     rx: Option<Receiver<Msg>>,
@@ -531,6 +544,7 @@ struct AutoshopApp {
     // --- settings / denoise ---
     save_denoise: bool,     // run SCUNet AI denoise before the full-res render
     show_settings: bool,    // the Settings window is open
+    show_shortcuts: bool,   // the keyboard cheat-sheet window is open (F1 / ? / ⌨)
     settings: SettingsForm, // editable buffers for that window
     // --- library / gallery ---
     gallery: Vec<PathBuf>,          // sources in the working folder (sorted)
@@ -718,6 +732,8 @@ impl Default for AutoshopApp {
             after_tex: None,
             recipe: EditRecipe::default(),
             dirty: false,
+            last_dev: None,
+            dev_cost: Duration::from_millis(16),
             status: "Open a photo, or open a folder to browse your library.".into(),
             busy: false,
             rx: Some(rx),
@@ -735,6 +751,7 @@ impl Default for AutoshopApp {
             redo_stack: Vec::new(),
             save_denoise: false,
             show_settings: false,
+            show_shortcuts: false,
             settings: SettingsForm::default(),
             gallery: Vec::new(),
             gallery_dir: None,
@@ -1555,13 +1572,18 @@ impl AutoshopApp {
             self.after_tex = Some(ctx.load_texture("after", to_color_image(&after), egui::TextureOptions::LINEAR));
             // Keep the active variant's strip thumbnail in step with its
             // develop (the other variants' thumbs were built when last active).
-            let thumb = ctx.load_texture(
-                "vthumb",
-                to_color_image(&after.thumbnail(96, 96)),
-                egui::TextureOptions::LINEAR,
-            );
-            if let Some(v) = self.variants.get_mut(self.active) {
-                v.thumb = Some(thumb);
+            // Skipped MID-DRAG: the 96×96 rebuild is a full-image downscale on
+            // the hot path, and the guaranteed release develop (plus every
+            // programmatic edit — Analyze, Reset, undo) lands the final one.
+            if !ctx.input(|i| i.pointer.any_down()) {
+                let thumb = ctx.load_texture(
+                    "vthumb",
+                    to_color_image(&after.thumbnail(96, 96)),
+                    egui::TextureOptions::LINEAR,
+                );
+                if let Some(v) = self.variants.get_mut(self.active) {
+                    v.thumb = Some(thumb);
+                }
             }
         }
         // Any recipe change can move the selected mask's coverage (geometry,
@@ -2573,7 +2595,7 @@ impl AutoshopApp {
     /// are laid out (show_rows) and only their thumbnails are queued to decode.
     fn gallery_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("Library");
+            ui.heading("图库 · Library");
             if ui.button("Open folder…").clicked()
                 && let Some(dir) = rfd::FileDialog::new().pick_folder()
             {
@@ -2657,7 +2679,7 @@ impl AutoshopApp {
                     let fill = if is_sel {
                         SEL_BG
                     } else if is_multi {
-                        egui::Color32::from_rgb(0x1a, 0x2a, 0x4e) // dimmer than SEL_BG
+                        SEL_BG_DIM
                     } else {
                         egui::Color32::TRANSPARENT
                     };
@@ -2686,7 +2708,7 @@ impl AutoshopApp {
                                 ui.vertical(|ui| {
                                     let mut name = egui::RichText::new(autoshop::pipeline::stem(path)).small();
                                     if is_sel {
-                                        name = name.strong().color(ACCENT);
+                                        name = name.strong().color(PILL);
                                     }
                                     ui.label(name);
                                     let edited = autoshop::pipeline::default_out(path, "recipe", "json").exists()
@@ -2694,13 +2716,13 @@ impl AutoshopApp {
                                     let baked = !autoshop::decode::is_raw(path);
                                     ui.horizontal(|ui| {
                                         if is_multi {
-                                            ui.label(egui::RichText::new("✓ 选中").color(ACCENT).small());
+                                            ui.label(egui::RichText::new("✓ 选中").color(PILL).small());
                                         }
                                         if baked {
                                             ui.label(egui::RichText::new("PNG/TIFF").color(PILL).small());
                                         }
                                         if edited {
-                                            ui.label(egui::RichText::new("● edited").color(ACCENT).small());
+                                            ui.label(egui::RichText::new("● edited").color(PILL).small());
                                         }
                                     });
                                 });
@@ -2737,7 +2759,7 @@ impl AutoshopApp {
 
     fn develop_panel(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
-        ui.heading("Develop");
+        ui.heading("显影 · Develop");
         self.histogram_ui(ui);
         ui.add_space(4.0);
 
@@ -3203,9 +3225,9 @@ impl AutoshopApp {
                             // their averaged feather until a slider is touched).
                             let mut f = ((*lo - *lo_outer) + (*hi_outer - *hi)) * 0.5;
                             let mut ch = false;
-                            ch |= Self::slider(ui, "亮度下限", lo, 0.0, 1.0, 0.0);
-                            ch |= Self::slider(ui, "亮度上限", hi, 0.0, 1.0, 1.0);
-                            ch |= Self::slider(ui, "羽化", &mut f, 0.0, 0.5, 0.1);
+                            ch |= Self::slider(ui, "亮度下限 Lo", lo, 0.0, 1.0, 0.0);
+                            ch |= Self::slider(ui, "亮度上限 Hi", hi, 0.0, 1.0, 1.0);
+                            ch |= Self::slider(ui, "羽化 Feather", &mut f, 0.0, 0.5, 0.1);
                             if ch {
                                 if *lo > *hi {
                                     std::mem::swap(lo, hi);
@@ -3227,7 +3249,7 @@ impl AutoshopApp {
                                     want_pick = true;
                                 }
                             });
-                            changed |= Self::slider(ui, "容差", amount, 0.0, 1.0, 0.5);
+                            changed |= Self::slider(ui, "容差 Tolerance", amount, 0.0, 1.0, 0.5);
                         }
                         None => {}
                     }
@@ -3255,7 +3277,7 @@ impl AutoshopApp {
                 changed |= Self::slider(ui, "Noise Red.", &mut m.noise_reduction, 0.0, 100.0, 0.0);
                 // These serialise to the XMP but the in-app preview doesn't
                 // render them yet (documented engine scope) — honest label.
-                egui::CollapsingHeader::new("更多（仅 XMP/Lightroom 生效）")
+                egui::CollapsingHeader::new("更多 · More（仅 XMP/Lightroom 生效）")
                     .id_salt("sec_local_xmp")
                     .default_open(false)
                     .show(ui, |ui| {
@@ -3385,7 +3407,7 @@ impl AutoshopApp {
                 if ui.small_button("1:1").on_hover_text("预览像素 1:1（双击图片可切换）").clicked() {
                     self.zoom = (vis_px.x * self.zoom / disp.x).max(1.0);
                 }
-                if ui.small_button("Fit").clicked() {
+                if ui.small_button("Fit").on_hover_text("整图适配画布（双击图片可切换）").clicked() {
                     self.zoom = 1.0;
                     self.pan = egui::vec2(0.5, 0.5);
                 }
@@ -3810,7 +3832,9 @@ impl AutoshopApp {
 
         // Draw the live drag box, else the committed region outline.
         let stroke = egui::Stroke::new(2.0, ACCENT);
-        let fill = egui::Color32::from_rgba_unmultiplied(0x4c, 0x8b, 0xf5, 40);
+        // The box fill is ACCENT at low alpha (was a hardcoded copy of it).
+        let fill =
+            egui::Color32::from_rgba_unmultiplied(ACCENT.r(), ACCENT.g(), ACCENT.b(), 40);
         let draw = |r: egui::Rect| {
             ui.painter().rect_filled(r, 0.0, fill);
             ui.painter().rect_stroke(r, 0.0, stroke);
@@ -4530,7 +4554,7 @@ impl AutoshopApp {
 
     fn retouch_panel(&mut self, ui: &mut egui::Ui) {
         ui.separator();
-        ui.heading("Retouch");
+        ui.heading("修饰 · Retouch");
 
         // Whole-image generative re-render: let gpt-image DIRECTLY produce the
         // picture (the optional "GPT makes the image" path). Distinct from
@@ -4730,6 +4754,7 @@ impl eframe::App for AutoshopApp {
             let (mut do_undo, mut do_redo, mut do_open, mut do_export, mut do_xmp) =
                 (false, false, false, false, false);
             let (mut do_escape, mut do_overlay, mut do_clip) = (false, false, false);
+            let mut do_cheatsheet = false;
             let mut nav: i32 = 0;
             ctx.input_mut(|i| {
                 if i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z) { do_redo = true; }
@@ -4743,11 +4768,26 @@ impl eframe::App for AutoshopApp {
                 if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) { do_escape = true; }
                 if i.consume_key(egui::Modifiers::NONE, egui::Key::O) { do_overlay = true; }
                 if i.consume_key(egui::Modifiers::NONE, egui::Key::J) { do_clip = true; }
+                // F1 / ? — the cheat-sheet (Shift+/ produces ? on most layouts).
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::F1)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Questionmark)
+                    || i.consume_key(egui::Modifiers::SHIFT, egui::Key::Questionmark)
+                {
+                    do_cheatsheet = true;
+                }
             });
             if do_undo { self.undo(); }
             if do_redo { self.redo(); }
-            // Esc = leave whatever on-image tool is active (the universal
+            if do_cheatsheet {
+                self.show_shortcuts = !self.show_shortcuts;
+            }
+            // Esc closes an open cheat-sheet FIRST (the topmost transient),
+            // else leaves whatever on-image tool is active (the universal
             // editor exit); painted canvases/samples stay for resuming.
+            if do_escape && self.show_shortcuts {
+                self.show_shortcuts = false;
+                do_escape = false;
+            }
             if do_escape {
                 let any = self.crop_mode
                     || self.placing_mask.is_some()
@@ -4854,12 +4894,20 @@ impl eframe::App for AutoshopApp {
                     self.open_path(path);
                 }
                 let ready = self.src_path.is_some() && !self.busy;
-                if ui.add_enabled(ready, egui::Button::new("✨ AI Analyze")).clicked() {
+                if ui
+                    .add_enabled(ready, egui::Button::new("✨ AI Analyze"))
+                    .on_hover_text("AI 提配方（GPT 提议 + 验证），写进滑杆 — 可撤销")
+                    .clicked()
+                {
                     self.start_analyze();
                 }
                 ui.add_enabled(ready, egui::Checkbox::new(&mut self.refine, "Refine"))
                     .on_hover_text("Adjust the CURRENT edit instead of proposing from scratch");
-                if ui.add_enabled(ready, egui::Button::new("Reset")).clicked() {
+                if ui
+                    .add_enabled(ready, egui::Button::new("Reset"))
+                    .on_hover_text("清空全部滑杆回中性（一步撤销可回来）")
+                    .clicked()
+                {
                     self.recipe = EditRecipe::default();
                     self.region = None;
                     self.dirty = true;
@@ -4880,8 +4928,11 @@ impl eframe::App for AutoshopApp {
                     self.redo();
                 }
                 ui.separator();
-                ui.label("Style");
-                ui.add(egui::Slider::new(&mut self.style_strength, 0.0..=1.0).show_value(false));
+                ui.label("Style").on_hover_text(
+                    "个人风格强度：AI 提案向你过往 XMP 编辑习惯靠拢的程度（0 = 不参考）",
+                );
+                ui.add(egui::Slider::new(&mut self.style_strength, 0.0..=1.0).show_value(false))
+                    .on_hover_text("个人风格强度：AI 提案向你过往编辑习惯靠拢的程度");
                 ui.label(format!("{:.0}%", self.style_strength * 100.0));
                 ui.separator();
                 // View mode: side-by-side vs a full-width edit (hold B = compare).
@@ -4893,6 +4944,9 @@ impl eframe::App for AutoshopApp {
                 if ui.button("⚙ Settings").on_hover_text("AI provider / model / API key").clicked() {
                     self.show_settings = true;
                     self.load_settings_form();
+                }
+                if ui.button("⌨").on_hover_text("快捷键速查（F1 / ?）").clicked() {
+                    self.show_shortcuts = !self.show_shortcuts;
                 }
             });
             // AI direction (free text) + save options. Export SETTINGS
@@ -4949,10 +5003,18 @@ impl eframe::App for AutoshopApp {
                 ui.checkbox(&mut self.save_denoise, "AI Denoise").on_hover_text(
                     "SCUNet AI denoise before developing — high-ISO / astro (slow, GPU; needs the python sidecar)",
                 );
-                if ui.add_enabled(ready, egui::Button::new("Export → ./out")).clicked() {
+                if ui
+                    .add_enabled(ready, egui::Button::new("Export → ./out"))
+                    .on_hover_text("Ctrl+E · 全分辨率渲染到 ./out（跟随当前变体像素）")
+                    .clicked()
+                {
                     self.start_export();
                 }
-                if ui.add_enabled(ready, egui::Button::new("Download…")).clicked() {
+                if ui
+                    .add_enabled(ready, egui::Button::new("Download…"))
+                    .on_hover_text("另存为…（选路径的全分辨率导出）")
+                    .clicked()
+                {
                     let ext = if self.save_jpeg { "jpg" } else { "tif" };
                     // Suggest a name from the ACTIVE variant's pixel source (a
                     // Generated variant → its reimagine stem), matching what
@@ -4972,7 +5034,11 @@ impl eframe::App for AutoshopApp {
                         self.start_render_to(p);
                     }
                 }
-                if ui.add_enabled(ready, egui::Button::new("Save XMP")).clicked() {
+                if ui
+                    .add_enabled(ready, egui::Button::new("Save XMP"))
+                    .on_hover_text("Ctrl+S · 写 Lightroom/ACR sidecar 到 ./out（仅 RAW）")
+                    .clicked()
+                {
                     self.save_xmp();
                 }
             });
@@ -4983,7 +5049,10 @@ impl eframe::App for AutoshopApp {
                 if self.busy {
                     ui.spinner();
                 }
-                ui.label(&self.status);
+                // Long messages (paths, batch reports) must clip, not blow the
+                // panel wide; the full text is one hover away.
+                ui.add(egui::Label::new(&self.status).truncate())
+                    .on_hover_text(&self.status);
             });
         });
 
@@ -5023,8 +5092,32 @@ impl eframe::App for AutoshopApp {
         });
 
         // Re-develop AFTER the controls are read (so this frame reflects edits).
+        // Mid-drag the develop is COALESCED: egui repaints every frame during a
+        // slider drag, and a synchronous full-image develop per frame freezes
+        // the UI at 2560/4096 preview (100-300 ms/tick measured — the loop runs
+        // at develop speed). Cadence adapts to the measured develop cost — a
+        // fast 1280 preview stays effectively unthrottled (~1.5 frames), a slow
+        // one develops at ~40% duty cycle so the pointer keeps tracking.
+        // `dirty` persists until a develop runs, and the release frame is
+        // !dragging → develops immediately, BEFORE commit_if_settled — the
+        // final state is never stale.
         if self.dirty {
-            self.redevelop(ctx);
+            let dragging = ctx.input(|i| i.pointer.any_down());
+            let interval = (self.dev_cost.mul_f32(1.5))
+                .clamp(Duration::from_millis(33), Duration::from_millis(500));
+            let due = self.last_dev.is_none_or(|t| t.elapsed() >= interval);
+            if !dragging || due {
+                let t0 = Instant::now();
+                self.redevelop(ctx); // clears self.dirty
+                self.dev_cost = t0.elapsed().max(Duration::from_millis(1));
+                self.last_dev = Some(t0);
+            } else {
+                // The pointer may be held still — without a scheduled repaint
+                // the due develop would wait for the next input event.
+                ctx.request_repaint_after(
+                    interval.saturating_sub(self.last_dev.map_or(Duration::ZERO, |t| t.elapsed())),
+                );
+            }
         }
         // The mask coverage overlay follows develop / selection / toggle /
         // hover (a changed hover target includes "left the list entirely").
@@ -5105,14 +5198,68 @@ impl eframe::App for AutoshopApp {
         // double &mut self borrow (Window::open vs the closure that reads self).
         if self.show_settings {
             let mut open = true;
+            // Scroll inside the window, capped below the screen height: the
+            // provider sections outgrow a small display, and without a scroll
+            // area the 保存 button ends up unreachable off-screen.
+            let max_h = ctx.screen_rect().height() * 0.85;
             egui::Window::new("⚙ Settings")
                 .collapsible(false)
                 .resizable(false)
                 .default_width(480.0)
                 .open(&mut open)
-                .show(ctx, |ui| self.settings_ui(ui));
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(max_h)
+                        .show(ui, |ui| self.settings_ui(ui));
+                });
             if !open {
                 self.show_settings = false;
+            }
+        }
+
+        // Keyboard cheat-sheet (F1 / ? / the ⌨ toolbar button) — the full
+        // shortcut + gesture map lived only in tooltips and a code comment;
+        // O (mask overlay) had no visible control at all.
+        if self.show_shortcuts {
+            let mut open = true;
+            egui::Window::new("⌨ 快捷键 · Shortcuts")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    const ROWS: [(&str, &str); 18] = [
+                        ("Ctrl+O", "打开照片"),
+                        ("Ctrl+E", "导出 → ./out"),
+                        ("Ctrl+S", "保存 XMP sidecar"),
+                        ("Ctrl+Z / Ctrl+Y", "撤销 / 重做"),
+                        ("← / →", "图库走图"),
+                        ("B（按住）", "对比原图"),
+                        ("O", "蒙版覆盖层开关"),
+                        ("J", "削波警告开关"),
+                        ("Esc", "退出当前工具 / 关闭本窗"),
+                        ("F1 / ?", "本速查表"),
+                        ("滚轮", "缩放（指向光标）"),
+                        ("双击画布", "Fit ↔ 1:1"),
+                        ("空格+拖 / 中键拖", "平移"),
+                        ("放大后直接拖", "平移（Ctrl+拖 = 框选）"),
+                        ("Alt+点击", "克隆取源点"),
+                        ("滑杆双击", "归零"),
+                        ("曲线：点击/拖/拖出框", "加点 / 移点 / 删点"),
+                        ("蒙版手柄拖拽", "改形 / 移动选中蒙版"),
+                    ];
+                    egui::Grid::new("shortcut_grid").num_columns(2).striped(true).show(
+                        ui,
+                        |ui| {
+                            for (keys, what) in ROWS {
+                                ui.label(egui::RichText::new(keys).monospace().color(PILL));
+                                ui.label(what);
+                                ui.end_row();
+                            }
+                        },
+                    );
+                });
+            if !open {
+                self.show_shortcuts = false;
             }
         }
 
@@ -5123,7 +5270,8 @@ impl eframe::App for AutoshopApp {
                 egui::Id::new("drop_overlay"),
             ));
             let rect = ctx.screen_rect();
-            painter.rect_filled(rect, 0.0, egui::Color32::from_rgba_unmultiplied(16, 36, 72, 150));
+            // Chrome-side veil → the PILL gold family (see the colour rule at ACCENT).
+            painter.rect_filled(rect, 0.0, egui::Color32::from_rgba_unmultiplied(58, 47, 20, 150));
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,

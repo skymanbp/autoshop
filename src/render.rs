@@ -681,7 +681,7 @@ fn apply_masks(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
         let bmp = load_mask_bitmap(&m.mask);
         // mask coverage × master amount at a pixel (with optional inversion).
         let weight_at = |x: usize, y: usize| -> f32 {
-            let mut wgt = mask_weight(&m.mask, x as f32 / w as f32, y as f32 / h as f32, bmp.as_ref());
+            let mut wgt = mask_weight(&m.mask, x as f32 / w as f32, y as f32 / h as f32, bmp.as_deref());
             if m.inverted {
                 wgt = 1.0 - wgt;
             }
@@ -784,13 +784,47 @@ fn mask_weight(g: &MaskGeometry, nx: f32, ny: f32, bmp: Option<&image::GrayImage
     }
 }
 
-/// Decode the raster of a Bitmap mask geometry, greyscale. Called once per
-/// mask per develop by `apply_masks` — never per pixel. Failure warns and
-/// returns None (the mask renders inert instead of killing the develop).
-fn load_mask_bitmap(g: &MaskGeometry) -> Option<image::GrayImage> {
+/// Decode the raster of a Bitmap mask geometry, greyscale — through a
+/// process-wide (path, mtime)-keyed cache. The GUI re-develops the preview on
+/// every slider tick, and decoding the segmentation PNG from DISK per tick
+/// dominated the develop whenever a bitmap mask was present. Keyed by mtime
+/// because re-running a segmentation OVERWRITES the same file (one raster per
+/// photo+target, see the GUI's start_segment) — a path-only key would serve
+/// the stale mask forever. Failure warns and returns None (the mask renders
+/// inert instead of killing the develop).
+fn load_mask_bitmap(g: &MaskGeometry) -> Option<std::sync::Arc<image::GrayImage>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Cache = Mutex<
+        std::collections::HashMap<String, (std::time::SystemTime, Arc<image::GrayImage>)>,
+    >;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
     let MaskGeometry::Bitmap { path } = g else { return None };
+    let cache = CACHE.get_or_init(Default::default);
+    let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    if let Some(t) = mtime {
+        // No user code runs under the lock, so poisoning is not reachable —
+        // recover anyway rather than turning a past panic into a new one.
+        let map = cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((cached_t, img)) = map.get(path.as_str())
+            && *cached_t == t
+        {
+            return Some(img.clone());
+        }
+    }
     match image::open(path) {
-        Ok(img) => Some(img.to_luma8()),
+        Ok(img) => {
+            let img = Arc::new(img.to_luma8());
+            if let Some(t) = mtime {
+                let mut map = cache.lock().unwrap_or_else(|p| p.into_inner());
+                // A recipe holds a handful of masks — a rare hard reset beats
+                // LRU bookkeeping on this hot path.
+                if map.len() > 16 {
+                    map.clear();
+                }
+                map.insert(path.clone(), (t, img.clone()));
+            }
+            Some(img)
+        }
         Err(e) => {
             eprintln!("⚠ bitmap mask '{path}' could not be loaded ({e}) — mask is inert");
             None
@@ -833,7 +867,7 @@ pub fn mask_coverage(
     let mut out = image::GrayImage::new(w, h);
     for (x, y, px) in out.enumerate_pixels_mut() {
         // Same normalisation as apply_masks' weight_at (x/w, not x/(w-1)).
-        let mut wgt = mask_weight(&m.mask, x as f32 / w as f32, y as f32 / h as f32, bmp.as_ref());
+        let mut wgt = mask_weight(&m.mask, x as f32 / w as f32, y as f32 / h as f32, bmp.as_deref());
         if m.inverted {
             wgt = 1.0 - wgt;
         }
