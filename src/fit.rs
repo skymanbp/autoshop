@@ -26,13 +26,24 @@
 //!      control points, which the engine composes exactly on top.
 //!   2. **Saturation** — global mean-chroma ratio, secant-refined through real
 //!      [`render::develop_preview`] renders (closed loop, not open-loop math).
+//!      Chroma matching against a non-aligned target is a heuristic, so the
+//!      pipeline ends with a DO-NO-HARM check: if the finished recipe renders
+//!      farther from the target than the untouched source, saturation is
+//!      halved (cast curves refit each step — they depend on the saturated
+//!      state) until the end-to-end error stops objecting (the 2026-07-09
+//!      golden-sky pair dragged the chroma chase to the cap and rendered
+//!      worse than doing nothing). Saturation cannot be judged mid-pipeline:
+//!      a correct value legitimately amplifies a latent cast that the curve
+//!      stage then removes.
 //!   3. **Colour cast** — per-channel CDF residuals → red/green/blue curves,
 //!      last as the catch-all (cast-before-saturation measured worse on the
 //!      haze regression — see the stage comments in [`fit_recipe`]). Accepted
-//!      only through TWO gates: the aggregate look-error ratio AND the
+//!      only through THREE gates: the aggregate look-error ratio, the
 //!      foreign-hue veto (the curves must not paint a region of the frame in
 //!      hues the target holds nowhere — the 2026-07-09 violet-sky failure was
-//!      cross-band invisible to the aggregate; see the veto const block).
+//!      cross-band invisible to the aggregate) and the rotation budget (nor
+//!      re-hue a region into hues the target DOES hold — the golden-sky
+//!      failure passed both earlier gates; see the veto const blocks).
 //!
 //! There is deliberately NO per-band HSL stage — per-band statistics against
 //! a non-pixel-aligned generative target conflate content with style and are
@@ -53,7 +64,9 @@ use crate::recipe::{CurvePoint, EditRecipe};
 use crate::render;
 
 /// Analysis resolution (long edge). CDFs and band means are stable well below
-/// this; keeping it small makes the 4 closed-loop renders interactive-fast.
+/// this; keeping it small keeps the closed-loop renders interactive-fast
+/// (5 in the common path; up to ~20 if the do-no-harm loop shrinks
+/// saturation, each a 384-px develop).
 const ANALYZE_EDGE: u32 = 384;
 const HIST_BINS: usize = 1024;
 /// Quantile clip for CDF inversion — the extreme tails of a generative render
@@ -95,10 +108,13 @@ const CAST_ACCEPT_RATIO: f32 = 0.85;
 // mismatch (already-foreign pixels the curves didn't create) out of the
 // verdict.
 //
-// Known non-goal: a cast that rotates a region into a hue the target DOES
-// contain elsewhere (sky turned rock-red) passes this veto; that failure is
-// near-band and the band-centroid hue term in `look_err` is the signal that
-// sees it. The observed failure class is the foreign hue.
+// A cast that rotates a region into a hue the target DOES contain elsewhere
+// (sky turned rock-gold) passes this veto BY DESIGN — that failure class is
+// covered by the rotation budget below, added when it materialised on a real
+// pair (2026-07-09 #2, _DSC9621 × reimagine-5: the hazy pale-blue sky was
+// re-hued ~170° into the target's own vivid orange; both earlier gates
+// passed — the destination hue was target-native and the frame-dominant win
+// carried the aggregate).
 
 /// Target pixels feeding the hue-support bins must clear this chroma —
 /// deliberately BELOW the 0.06 band-stats gate so a pale sky still testifies.
@@ -122,6 +138,34 @@ const VETO_FAR_BINS: usize = 3;
 /// rejected: 5% of the frame is a REGION (the canyon sky measures ~12-15%),
 /// not boundary speckle (the haze pair measures ≈ 0.04%).
 const VETO_CREATED_SHARE: f32 = 0.05;
+
+// --- cast rotation budget (the third gate) ----------------------------------
+// The foreign-hue veto cannot see a rotation whose DESTINATION the target
+// populates (see above). The rotation budget closes that hole from the
+// pixel-aligned side alone: a pixel visibly tinted BOTH before and after the
+// curves that lands ≥ [`ROT_DEG`] away has been RE-HUED, not corrected; when
+// a region-sized share of the frame is re-hued, the curves are a regional
+// regrade masquerading as a global cast — reject. Measured on the live pairs
+// (calibration probe, 2026-07-09): the accepted haze correction moves 0.01%
+// of the frame past 60° (its cast-dominated pixels stay under); the violet
+// canyon rotates 12.5% of the frame by 112°; the golden-sky canyon by ~170°.
+// 75° sits 15° above the measured-legit ceiling and 37° below the smallest
+// observed wreck.
+//
+// Deliberate cost: a HEAVY global cast (strong tungsten drift) whose honest
+// correction would rotate still-tinted pixels past 75° is refused too — the
+// fit then under-corrects (tone + saturation only) rather than risk a
+// regional re-hue it cannot statistically tell apart. A conservative miss is
+// recoverable in the develop panel; a re-hued region is not. True regional
+// regrades (a sky genuinely gone gold) belong to the zoned fit, not to
+// global curves.
+
+/// Circular hue distance (degrees) beyond which a still-tinted pixel counts
+/// as re-hued rather than corrected.
+const ROT_DEG: f32 = 75.0;
+/// Frame share of re-hued pixels that constitutes a REGION (same region-vs-
+/// speckle logic as [`VETO_CREATED_SHARE`]; the live wrecks measure 12.5%).
+const ROT_SHARE: f32 = 0.05;
 
 /// The fit outcome: the recipe plus the distribution error (mean |Δ| over luma
 /// quantiles and channel means, 0 = identical look) before and after.
@@ -147,8 +191,7 @@ pub fn fit_recipe(src: &DynamicImage, target: &DynamicImage) -> FitReport {
     // channels at the gamut ceiling under chroma scaling, so their luma lands
     // short of the tone map and would bias the solve (measured: one polluted
     // knot skews contrast by tens of points). Greys carry clean evidence.
-    let s_cdf = tone_cdf(&sp);
-    let t_cdf = tone_cdf(&tp);
+    let (s_cdf, t_cdf) = tone_cdf_pair(&sp, &tp);
     let tone_map = |x: f32| quantile(&t_cdf, cdf_at(&s_cdf, x).clamp(P_CLIP, 1.0 - P_CLIP));
     let (ev, sliders) = fit_tone_sliders(&tone_map);
     recipe.exposure_ev = round2(ev);
@@ -170,6 +213,7 @@ pub fn fit_recipe(src: &DynamicImage, target: &DynamicImage) -> FitReport {
     // cast, but stage 5 fits the cast residual CLOSED-LOOP on the saturated
     // render, so it is measured and removed rather than compounded.
     let t_chroma = mean_chroma(&tp);
+    let mut sat_pegged = false;
     for _ in 0..2 {
         let cur = pixels_of(&render::develop_preview(&s_img, &recipe));
         let c_chroma = mean_chroma(&cur);
@@ -180,8 +224,24 @@ pub fn fit_recipe(src: &DynamicImage, target: &DynamicImage) -> FitReport {
         if step.abs() < 1.0 {
             break;
         }
-        recipe.saturation = round1((recipe.saturation + step).clamp(-60.0, 60.0));
+        let want = recipe.saturation + step;
+        let clamped = want.clamp(-60.0, 60.0);
+        // Hitting the model cap with demand to spare = the target's chroma is
+        // out of the global model's reach — flagged into the rationale so the
+        // user learns WHY the fit stays approximate.
+        if (want - clamped).abs() > 0.5 {
+            sat_pegged = true;
+        }
+        recipe.saturation = round1(clamped);
     }
+    // NOTE deliberately NO validation here: a correct saturation legitimately
+    // makes every colour metric worse at THIS point in the pipeline (it
+    // amplifies a latent cast into the channel means and the hue bands; the
+    // curve stage then measures and removes it — see the ordering comment
+    // above). The only fair evaluation point is the finished recipe: the
+    // do-no-harm check after stage 4 shrinks saturation if the END result
+    // regressed. (A stage-local gate was tried first and it zeroed the haze
+    // regression's saturation, degrading the whole fit.)
 
     // --- 4) per-channel colour-cast curves — the catch-all, LAST so its
     // closed-loop residual sees every earlier stage's composed output
@@ -212,36 +272,104 @@ pub fn fit_recipe(src: &DynamicImage, target: &DynamicImage) -> FitReport {
     // lavender. Per-band intent is statistically unidentifiable here — like
     // local masks, it belongs to the AI style-prompt path, not to
     // distribution matching.
-    let cur = pixels_of(&render::develop_preview(&s_img, &recipe));
-    let err_without = look_err(&cur, &tp);
-    recipe.red_curve = residual_channel_curve(&cur, &tp, 0);
-    recipe.green_curve = residual_channel_curve(&cur, &tp, 1);
-    recipe.blue_curve = residual_channel_curve(&cur, &tp, 2);
-    if !(recipe.red_curve.is_empty()
-        && recipe.green_curve.is_empty()
-        && recipe.blue_curve.is_empty())
-    {
-        let with_px = pixels_of(&render::develop_preview(&s_img, &recipe));
-        // Two gates, both must pass: the aggregate ratio (a marginal win does
-        // not earn regional risk) and the phantom-family veto (a large
-        // aggregate win does not earn a wrecked region the aggregate is
-        // cross-band-blind to — the veto only ever rejects, never rescues).
-        let ratio_fail = look_err(&with_px, &tp) > err_without * CAST_ACCEPT_RATIO;
-        if ratio_fail || cast_paints_foreign_hues(&cur, &with_px, &tp) {
-            recipe.red_curve = Vec::new();
-            recipe.green_curve = Vec::new();
-            recipe.blue_curve = Vec::new();
+    let fit_cast_stage = |recipe: &mut EditRecipe| -> bool {
+        recipe.red_curve = Vec::new();
+        recipe.green_curve = Vec::new();
+        recipe.blue_curve = Vec::new();
+        let cur = pixels_of(&render::develop_preview(&s_img, recipe));
+        let err_without = look_err(&cur, &tp);
+        recipe.red_curve = residual_channel_curve(&cur, &tp, 0);
+        recipe.green_curve = residual_channel_curve(&cur, &tp, 1);
+        recipe.blue_curve = residual_channel_curve(&cur, &tp, 2);
+        let mut rehue_blocked = false;
+        if !(recipe.red_curve.is_empty()
+            && recipe.green_curve.is_empty()
+            && recipe.blue_curve.is_empty())
+        {
+            let with_px = pixels_of(&render::develop_preview(&s_img, recipe));
+            // Three gates, all must pass: the aggregate ratio (a marginal win
+            // does not earn regional risk), the foreign-hue veto (a large
+            // aggregate win does not earn a region painted in hues the target
+            // holds nowhere) and the rotation budget (nor a region re-hued
+            // into hues it does hold — golden-sky case). The vetoes only ever
+            // reject, never rescue.
+            let ratio_fail = look_err(&with_px, &tp) > err_without * CAST_ACCEPT_RATIO;
+            rehue_blocked = cast_paints_foreign_hues(&cur, &with_px, &tp)
+                || cast_rotates_a_region(&cur, &with_px);
+            if ratio_fail || rehue_blocked {
+                recipe.red_curve = Vec::new();
+                recipe.green_curve = Vec::new();
+                recipe.blue_curve = Vec::new();
+            }
         }
+        rehue_blocked
+    };
+    let mut curves_rehue_blocked = fit_cast_stage(&mut recipe);
+
+    // --- 4b) do-no-harm — the pipeline-END check ------------------------------
+    // Goal: don't hand back a recipe that renders FARTHER from the target
+    // than the untouched source. Saturation is the one dial fitted by
+    // heuristic (mean-chroma chase) rather than by a validated residual, and
+    // it cannot be judged mid-pipeline (see the stage-3 note), so when the
+    // finished recipe regresses, halve saturation — refitting the cast curves
+    // each step, they depend on the saturated state — until the end-to-end
+    // error stops objecting. Saturation is the only shrinkable dial here: if
+    // the regression persists at zero, it is reported honestly through
+    // err_after/confidence rather than hidden. NOTE the case that motivated
+    // this loop (golden-sky pair: a distorted tone map made the whole fit
+    // regress) was root-fixed by `tone_cdf_pair`, and no current fixture
+    // reaches the loop body — it stays as insurance for pair geometries we
+    // have not seen, because the saturation heuristic remains unvalidated by
+    // construction. If you find a triggering pair, pin it in the tests.
+    let sat_fitted = recipe.saturation;
+    let mut err_after = look_err(&pixels_of(&render::develop_preview(&s_img, &recipe)), &tp);
+    while err_after > err_before + 1e-4 && recipe.saturation != 0.0 {
+        let next = if recipe.saturation.abs() < 4.0 { 0.0 } else { recipe.saturation / 2.0 };
+        recipe.saturation = round1(next);
+        curves_rehue_blocked = fit_cast_stage(&mut recipe);
+        err_after = look_err(&pixels_of(&render::develop_preview(&s_img, &recipe)), &tp);
     }
+    let sat_reduced = recipe.saturation != sat_fitted;
 
     // --- report ---------------------------------------------------------------
-    let final_px = pixels_of(&render::develop_preview(&s_img, &recipe));
-    let err_after = look_err(&final_px, &tp);
+    // Honest-mismatch notes: the user reads WHY a fit stayed approximate
+    // instead of wondering what went wrong (real-machine feedback,
+    // 2026-07-09: a palette-transplant target produced a faithful-but-ugly
+    // max-saturation fit with zero explanation).
+    let mut notes = String::new();
+    // Keyed on the RESIDUAL, not the pre-fit distance: a large but perfectly
+    // fittable tone gap (2 EV of exposure) starts far and ends near — only a
+    // look the model cannot approach deserves the warning.
+    if err_after > 0.12 {
+        notes.push_str(&format!(
+            " NOTE: the fitted recipe still renders far from the target \
+             (residual {err_after:.2}) — this look exceeds what global \
+             sliders can express; consider the AI variant itself or a zoned \
+             edit.",
+        ));
+    }
+    if sat_pegged {
+        notes.push_str(" Saturation demand exceeded the model cap (±60).");
+    }
+    if sat_reduced {
+        notes.push_str(&format!(
+            " Saturation was pulled back from the chroma-matched {sat_fitted:+.0} \
+             to {:+.0} after the full-strength fit rendered farther from the \
+             target than the untouched source (do-no-harm check).",
+            recipe.saturation,
+        ));
+    }
+    if curves_rehue_blocked {
+        notes.push_str(
+            " Colour-cast curves were withheld: they would have re-hued a \
+             region of the frame (pixel-aligned hue-damage gates).",
+        );
+    }
     recipe.rationale = format!(
         "Reverse-fit from a target rendition (statistical match; the target is not \
          pixel-aligned, so local masks and per-band HSL are not recovered): luma-CDF \
          → tone sliders {}, chroma → saturation, per-channel cast curves. Residual \
-         look error {err_before:.3} → {err_after:.3}.",
+         look error {err_before:.3} → {err_after:.3}.{notes}",
         if recipe.tone_curve.is_empty() { "(no residual curve)" } else { "+ residual tone curve" },
     );
     recipe.confidence = (1.0 - err_after * 6.0).clamp(0.25, 0.95);
@@ -516,6 +644,39 @@ fn cast_paints_foreign_hues(cur: &[[f32; 3]], with_px: &[[f32; 3]], tp: &[[f32; 
     foreign_share(with_px, &foreign) - foreign_share(cur, &foreign) >= VETO_CREATED_SHARE
 }
 
+/// Frame share of RE-HUED pixels: visibly tinted on BOTH sides (chroma ≥
+/// [`VETO_TINT_CHROMA`]) yet landing ≥ [`ROT_DEG`] of circular hue away.
+/// Pixel-aligned: `cur`/`with_px` render the SAME source, so per-pixel hue
+/// movement is exact. De-tinting (end chroma under the gate) is exempt —
+/// removing colour is what a corrective cast does. Exposed separately from
+/// the boolean gate so the pin test measures the same census the gate uses.
+fn rehued_share(cur: &[[f32; 3]], with_px: &[[f32; 3]]) -> f32 {
+    let mut cnt = 0usize;
+    for (c, w) in cur.iter().zip(with_px) {
+        let cc = c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2]);
+        let wc = w[0].max(w[1]).max(w[2]) - w[0].min(w[1]).min(w[2]);
+        if cc < VETO_TINT_CHROMA || wc < VETO_TINT_CHROMA {
+            continue;
+        }
+        let h0 = render::rgb_to_hsl(c[0], c[1], c[2]).0 * 360.0;
+        let h1 = render::rgb_to_hsl(w[0], w[1], w[2]).0 * 360.0;
+        let mut d = (h1 - h0).abs() % 360.0;
+        if d > 180.0 {
+            d = 360.0 - d;
+        }
+        if d >= ROT_DEG {
+            cnt += 1;
+        }
+    }
+    cnt as f32 / cur.len().max(1) as f32
+}
+
+/// Did the curves re-hue a REGION ([`ROT_SHARE`] of the frame)? See
+/// [`rehued_share`] and the rotation-budget const block.
+fn cast_rotates_a_region(cur: &[[f32; 3]], with_px: &[[f32; 3]]) -> bool {
+    rehued_share(cur, with_px) >= ROT_SHARE
+}
+
 // --------------------------------------------------------------------------
 // statistics primitives
 // --------------------------------------------------------------------------
@@ -564,16 +725,33 @@ fn is_neutralish(p: &[f32; 3]) -> bool {
     mx < 0.04 || (mx - mn) / mx < 0.15
 }
 
-/// Luma CDF over near-neutral pixels only — the clean tone evidence (see the
-/// call site). Falls back to every pixel when the frame is too colourful to
-/// leave a reliable neutral sample (< 5 %, or < 512 px).
-fn tone_cdf(px: &[[f32; 3]]) -> Vec<f32> {
-    let neutral: Vec<f32> = px.iter().filter(|p| is_neutralish(p)).map(luma601).collect();
-    if neutral.len() >= (px.len() / 20).max(512) {
-        let n = neutral.len();
-        cdf_from_values(neutral.into_iter(), n)
+/// Tone-evidence CDF pair. Near-neutral gating only carries clean evidence
+/// when the SAME population is neutral on BOTH sides — the tone map is
+/// quantile-to-quantile, so the gate is an identification assumption about
+/// pixel correspondence, not a per-image preference. Two observed breakages:
+/// a side's neutral sample is too small (< 5% or < 512 px — noise), or the
+/// neutral SHARES diverge, meaning the target re-hued (or de-hued) part of
+/// the population — golden-sky pair, 2026-07-09: the source's pale sky is
+/// neutralish ((max−min)/max ≈ 0.12), the target's vivid gold one is not
+/// (≈ 0.37), and an asymmetric gate mapped the sky's luma cluster across a
+/// ramp it doesn't belong to, distorting the whole tone solve. Either way
+/// the assumption is dead: fall back to full-pixel CDFs on BOTH sides
+/// (deciding per side, as the original code did, can even compare a
+/// neutral-gated CDF against a full one). 1.75× keeps the matched-population
+/// regressions (identity / roundtrip / violet canyon ≈ 1.0×) while catching
+/// the golden-sky asymmetry (2.0×).
+fn tone_cdf_pair(sp: &[[f32; 3]], tp: &[[f32; 3]]) -> (Vec<f32>, Vec<f32>) {
+    let s_n: Vec<f32> = sp.iter().filter(|p| is_neutralish(p)).map(luma601).collect();
+    let t_n: Vec<f32> = tp.iter().filter(|p| is_neutralish(p)).map(luma601).collect();
+    let enough = |n: usize, total: usize| -> bool { n >= (total / 20).max(512) };
+    let share_s = s_n.len() as f32 / sp.len().max(1) as f32;
+    let share_t = t_n.len() as f32 / tp.len().max(1) as f32;
+    let comparable = share_s.max(share_t) <= 1.75 * share_s.min(share_t);
+    if enough(s_n.len(), sp.len()) && enough(t_n.len(), tp.len()) && comparable {
+        let (ns, nt) = (s_n.len(), t_n.len());
+        (cdf_from_values(s_n.into_iter(), ns), cdf_from_values(t_n.into_iter(), nt))
     } else {
-        luma_cdf(px)
+        (luma_cdf(sp), luma_cdf(tp))
     }
 }
 
@@ -624,12 +802,12 @@ fn mean_chroma(px: &[[f32; 3]]) -> f32 {
 }
 
 /// One scalar "how different do these look" — mean |Δ| over 21 luma quantiles
-/// (60 %), the 3 channel means (20 %), and the weight-averaged per-band
-/// centroid hue disagreement (20 %). 0 = identical distributions. The hue
-/// term exists because matched luma quantiles + channel MEANS can hide a
-/// full-blown hue disaster (a purple sky and a blue one can share all four
-/// global numbers — exactly how the 2026-07-07 real-photo failure reported
-/// err 0.034 / confidence 0.80 for an unusable render).
+/// (60 %), the 3 channel means (20 %), and the worst per-band centroid hue
+/// disagreement (20 %). 0 = identical distributions. The hue term exists
+/// because matched luma quantiles + channel MEANS can hide a full-blown hue
+/// disaster (a purple sky and a blue one can share all four global numbers —
+/// exactly how the 2026-07-07 real-photo failure reported err 0.034 /
+/// confidence 0.80 for an unusable render).
 fn look_err(a: &[[f32; 3]], b: &[[f32; 3]]) -> f32 {
     let (ca, cb) = (luma_cdf(a), luma_cdf(b));
     let mut tonal = 0.0f32;
@@ -647,6 +825,7 @@ fn look_err(a: &[[f32; 3]], b: &[[f32; 3]]) -> f32 {
         px.iter().map(|p| p[ch]).sum::<f32>() / px.len() as f32
     };
     let colour = (0..3).map(|ch| (mean(a, ch) - mean(b, ch)).abs()).sum::<f32>() / 3.0;
+    let base = 0.6 * tonal + 0.2 * colour;
     // Per-band centroid hue disagreement — the WORST qualifying band, not a
     // weighted mean: one region with wrecked hue ruins a photo no matter how
     // small its area share (a lavender sky over perfect rocks), and an
@@ -672,7 +851,7 @@ fn look_err(a: &[[f32; 3]], b: &[[f32; 3]]) -> f32 {
             hue = hue.max((d.abs().min(60.0) / 60.0) as f32);
         }
     }
-    0.6 * tonal + 0.2 * colour + 0.2 * hue
+    base + 0.2 * hue
 }
 
 fn round1(v: f32) -> f32 {
@@ -973,7 +1152,8 @@ mod tests {
                 n += 1.0;
             }
         }
-        if n > 0.0 {
+        assert!(n > 0.0, "no chromatic sky pixels to audit — the fixture or a stage broke");
+        {
             let mean = sin.atan2(cos).to_degrees().rem_euclid(360.0);
             let d = (mean - 213.0 + 540.0).rem_euclid(360.0) - 180.0;
             assert!(
@@ -988,6 +1168,301 @@ mod tests {
             rep.err_before,
             rep.err_after
         );
+    }
+
+    /// Same geometry as [`canyon`], but the target regrades the WHOLE scene
+    /// warm: rocks red-lifted AND the pale-blue sky replaced by a pale gold
+    /// one ([0.92, 0.78, 0.58]: hue ≈ 35°, chroma ≈ 0.34, luma ≈ 0.80 vs the
+    /// source sky's 0.67 — brighter, like the real golden-hour target). The
+    /// destination hue is TARGET-NATIVE, so the foreign-hue veto stays silent
+    /// — this models the 2026-07-09 real-machine failure #2 (reimagine-5):
+    /// the hazy pale sky was rotated ~170° into the target's own orange.
+    fn canyon_gold_target() -> DynamicImage {
+        let (w, h) = (192u32, 128u32);
+        let mut img = RgbImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let l = 0.15 + 0.80 * x as f32 / (w - 1) as f32;
+                let p = if y < 16 {
+                    [l, l, l]
+                } else if y < 112 {
+                    [(0.85 * l + 0.18).min(1.0), 0.52 * l, 0.30 * l]
+                } else {
+                    // PALE gold sky: bright golden-hour skies keep a HIGH blue
+                    // channel (b ≈ 0.6) — the demanded blue curve is a gentle
+                    // top-end dip (like the real pair's 255→188), not a global
+                    // crush that would wake the aggregate gate on rock damage.
+                    [0.92, 0.78, 0.58]
+                };
+                img.put_pixel(
+                    x,
+                    y,
+                    image::Rgb(p.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)),
+                );
+            }
+        }
+        DynamicImage::ImageRgb8(img)
+    }
+
+    /// POLICY regression for real-machine failure #2 (2026-07-09, _DSC9621 ×
+    /// reimagine-5): when the target's statistics demand rotating a large
+    /// coherent chromatic region into a hue the target DOES populate (blue
+    /// hazy sky → vivid target-native orange, ~170°), both existing gates
+    /// pass — the foreign-hue veto by design (fit.rs "Known non-goal"), the
+    /// aggregate ratio because the frame-dominant demand is genuine. From
+    /// non-pixel-aligned statistics such a rotation is INDISTINGUISHABLE from
+    /// content mismatch, so the policy is to refuse it: hue-preserving stages
+    /// (tone + saturation) may chase the look, the cast curves may not
+    /// re-hue a region. Deliberate cost: a true whole-scene regrade (sky
+    /// genuinely gone gold) is not chased either — that expressiveness
+    /// belongs to the zoned fit, not to global curves.
+    #[test]
+    fn cast_must_not_rotate_the_sky_into_a_target_native_hue() {
+        let src = canyon(false);
+        let tgt = canyon_gold_target();
+        let rep = fit_recipe(&src, &tgt);
+        let out = render::develop_preview(&src, &rep.recipe).to_rgb8();
+        let (mut sin, mut cos, mut n) = (0.0f64, 0.0f64, 0.0f64);
+        for y in 108..128 {
+            for x in 0..192 {
+                let p = out.get_pixel(x, y);
+                let (r, g, b) =
+                    (p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0);
+                if r.max(g).max(b) - r.min(g).min(b) < 0.03 {
+                    continue;
+                }
+                let hue = render::rgb_to_hsl(r, g, b).0 as f64 * std::f64::consts::TAU;
+                sin += hue.sin();
+                cos += hue.cos();
+                n += 1.0;
+            }
+        }
+        assert!(n > 0.0, "no chromatic sky pixels to audit — the fixture or a stage broke");
+        {
+            let mean = sin.atan2(cos).to_degrees().rem_euclid(360.0);
+            let d = (mean - 213.0 + 540.0).rem_euclid(360.0) - 180.0;
+            assert!(
+                d.abs() < 30.0,
+                "sky hue rotated to {mean:.0}° (Δ{d:.0}°) — a target-native re-hue leaked through"
+            );
+        }
+        assert!(
+            rep.recipe.red_curve.is_empty()
+                && rep.recipe.green_curve.is_empty()
+                && rep.recipe.blue_curve.is_empty(),
+            "the whole-scene regrade's cast curves must be withheld"
+        );
+        assert!(
+            rep.err_after <= rep.err_before + 0.01,
+            "fit made the look worse: {} -> {}",
+            rep.err_before,
+            rep.err_after
+        );
+    }
+
+    /// The REAL-pair geometry (2026-07-09 #2, _DSC9621 × reimagine-5), where
+    /// the rotation gate is the UNIQUE rejector — measured on this fixture:
+    /// stage-4 ratio 0.450 (aggregate gate PASSES: crushing blue genuinely
+    /// fixes the channel means frame-wide), foreign-hue veto false (the
+    /// destination orange is target-native), rotation gate true (the hazy
+    /// pale-blue sky re-hues ~170°). Unwiring the rotation gate from
+    /// `fit_cast_stage` flips this test (curves accepted → orange sky),
+    /// which the synthetic `canyon` pairs cannot detect: there the re-hue
+    /// also damages the aggregate, so the ratio gate rejects redundantly.
+    fn hazy_canyon_source() -> DynamicImage {
+        let (w, h) = (192u32, 128u32);
+        let mut img = RgbImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let l = 0.25 + 0.60 * x as f32 / (w - 1) as f32;
+                let p = if y < 16 {
+                    [l, l, l]
+                } else if y < 112 {
+                    // hazy desaturated rocks: warm but muted
+                    [0.95 * l + 0.03, 0.88 * l + 0.03, 0.80 * l + 0.04]
+                } else {
+                    [0.60, 0.63, 0.67] // hazy pale-blue sky, hue ≈ 214°
+                };
+                img.put_pixel(
+                    x,
+                    y,
+                    image::Rgb(p.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)),
+                );
+            }
+        }
+        DynamicImage::ImageRgb8(img)
+    }
+
+    fn vivid_warm_target() -> DynamicImage {
+        let (w, h) = (192u32, 128u32);
+        let mut img = RgbImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let l = 0.25 + 0.60 * x as f32 / (w - 1) as f32;
+                let p = if y < 16 {
+                    [l, l, l]
+                } else if y < 112 {
+                    [(1.05 * l + 0.15).min(1.0), 0.55 * l, 0.30 * l] // vivid warm rocks
+                } else {
+                    [0.92, 0.72, 0.48] // vivid gold sky
+                };
+                img.put_pixel(
+                    x,
+                    y,
+                    image::Rgb(p.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)),
+                );
+            }
+        }
+        DynamicImage::ImageRgb8(img)
+    }
+
+    #[test]
+    fn rotation_gate_is_the_unique_rejector_on_the_real_pair_geometry() {
+        let src = hazy_canyon_source();
+        let tgt = vivid_warm_target();
+        // Pin the gate DECISIONS at stage 4 so this test keeps meaning "only
+        // the rotation gate stands here" — if a fixture drift makes the ratio
+        // gate reject too, the premise asserts below fail with numbers.
+        let s2 = src.thumbnail(ANALYZE_EDGE, ANALYZE_EDGE);
+        let tp2 = pixels_of(&tgt.thumbnail(ANALYZE_EDGE, ANALYZE_EDGE));
+        let rep = fit_recipe(&src, &tgt);
+        let mut pre = rep.recipe.clone();
+        pre.red_curve = Vec::new();
+        pre.green_curve = Vec::new();
+        pre.blue_curve = Vec::new();
+        let cur = pixels_of(&render::develop_preview(&s2, &pre));
+        let mut with = pre.clone();
+        with.red_curve = residual_channel_curve(&cur, &tp2, 0);
+        with.green_curve = residual_channel_curve(&cur, &tp2, 1);
+        with.blue_curve = residual_channel_curve(&cur, &tp2, 2);
+        assert!(!with.blue_curve.is_empty(), "premise broken: no blue crush demanded");
+        let with_px = pixels_of(&render::develop_preview(&s2, &with));
+        let ratio = look_err(&with_px, &tp2) / look_err(&cur, &tp2);
+        assert!(
+            ratio < CAST_ACCEPT_RATIO,
+            "premise broken: the aggregate gate rejects too (ratio {ratio:.3}) — the \
+             rotation gate is no longer uniquely load-bearing on this fixture"
+        );
+        assert!(
+            !cast_paints_foreign_hues(&cur, &with_px, &tp2),
+            "premise broken: the foreign-hue veto fires — destination should be target-native"
+        );
+        assert!(
+            cast_rotates_a_region(&cur, &with_px),
+            "the rotation gate must fire on the real-pair geometry"
+        );
+        // End-to-end: the fit must have withheld the curves (rotation gate is
+        // the only rejector, per the premises above) and kept the sky blue.
+        assert!(
+            rep.recipe.red_curve.is_empty()
+                && rep.recipe.green_curve.is_empty()
+                && rep.recipe.blue_curve.is_empty(),
+            "cast curves must be withheld on the real-pair geometry"
+        );
+        let out = render::develop_preview(&src, &rep.recipe).to_rgb8();
+        let (mut sin, mut cos, mut n) = (0.0f64, 0.0f64, 0.0f64);
+        for y in 108..128 {
+            for x in 0..192 {
+                let p = out.get_pixel(x, y);
+                let (r, g, b) =
+                    (p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0);
+                if r.max(g).max(b) - r.min(g).min(b) < 0.03 {
+                    continue;
+                }
+                let hue = render::rgb_to_hsl(r, g, b).0 as f64 * std::f64::consts::TAU;
+                sin += hue.sin();
+                cos += hue.cos();
+                n += 1.0;
+            }
+        }
+        assert!(n > 0.0, "no chromatic sky pixels to audit");
+        let mean = sin.atan2(cos).to_degrees().rem_euclid(360.0);
+        let d = (mean - 214.0 + 540.0).rem_euclid(360.0) - 180.0;
+        assert!(
+            d.abs() < 30.0,
+            "sky hue rotated to {mean:.0}° (Δ{d:.0}°) — the rotation gate is unwired"
+        );
+    }
+
+    /// The rotation budget's discriminator, pinned on the three live pairs
+    /// (calibration-probe numbers, 2026-07-09): the golden-sky regrade
+    /// rotates 12.5% of the frame ~170° (must fire — both earlier gates are
+    /// blind to a target-native destination), the violet cast 12.5% at 112°
+    /// (must fire), the haze correction ≈0.01% past 60° and ~0 past 75°
+    /// (must NOT fire). End-to-end verdicts live in
+    /// `cast_must_not_rotate_the_sky_into_a_target_native_hue` /
+    /// `warm_rock_cast_must_not_violet_the_pale_sky`; this pins the primitive
+    /// so a threshold tweak that flips one side fails HERE with numbers.
+    #[test]
+    fn rotation_gate_separates_regrade_from_haze() {
+        // Reconstruct stage-4's exact inputs for each pair, like the veto pin
+        // test. Also reports whether the re-derived curves are non-empty, so
+        // each leg can assert its premise (an empty-curve pair would make the
+        // share trivially 0 and the leg vacuous).
+        let stage4 = |src: &DynamicImage, tgt: &DynamicImage| {
+            let s2 = src.thumbnail(ANALYZE_EDGE, ANALYZE_EDGE);
+            let tp2 = pixels_of(&tgt.thumbnail(ANALYZE_EDGE, ANALYZE_EDGE));
+            let mut pre = fit_recipe(src, tgt).recipe;
+            pre.red_curve = Vec::new();
+            pre.green_curve = Vec::new();
+            pre.blue_curve = Vec::new();
+            let cur = pixels_of(&render::develop_preview(&s2, &pre));
+            let mut with = pre.clone();
+            with.red_curve = residual_channel_curve(&cur, &tp2, 0);
+            with.green_curve = residual_channel_curve(&cur, &tp2, 1);
+            with.blue_curve = residual_channel_curve(&cur, &tp2, 2);
+            let nonempty = !(with.red_curve.is_empty()
+                && with.green_curve.is_empty()
+                && with.blue_curve.is_empty());
+            let with_px = pixels_of(&render::develop_preview(&s2, &with));
+            (cur, with_px, nonempty)
+        };
+        // Golden-sky regrade: destination hue is target-native, so neither
+        // earlier hue veto sees it.
+        let (c1, w1, ne1) = stage4(&canyon(false), &canyon_gold_target());
+        assert!(ne1, "premise broken: the golden pair no longer provokes cast curves");
+        let s1 = rehued_share(&c1, &w1);
+        assert!(
+            cast_rotates_a_region(&c1, &w1),
+            "rotation gate must fire on the golden-sky regrade (share {s1:.4})"
+        );
+        assert!(s1 > 2.0 * ROT_SHARE, "margin eroded: golden share {s1:.4}");
+        // Violet canyon: also caught here (112° ≥ 75°) — an independent net
+        // under the foreign-hue veto.
+        let (c2, w2, ne2) = stage4(&canyon(false), &canyon(true));
+        assert!(ne2, "premise broken: the violet pair no longer provokes cast curves");
+        let s2 = rehued_share(&c2, &w2);
+        assert!(
+            cast_rotates_a_region(&c2, &w2),
+            "rotation gate must fire on the violet cast (share {s2:.4})"
+        );
+        assert!(s2 > 2.0 * ROT_SHARE, "margin eroded: violet share {s2:.4}");
+        let clean = synth();
+        let mut haze = EditRecipe {
+            exposure_ev: -0.3,
+            contrast: -45.0,
+            blacks: 40.0,
+            saturation: -40.0,
+            blue_curve: vec![
+                CurvePoint { input: 0, output: 25 },
+                CurvePoint { input: 128, output: 132 },
+                CurvePoint { input: 255, output: 255 },
+            ],
+            ..Default::default()
+        };
+        haze.clamp();
+        let base = render::develop_preview(&clean, &haze);
+        let (c3, w3, ne3) = stage4(&base, &clean);
+        assert!(ne3, "premise broken: the haze pair no longer provokes cast curves");
+        let s3 = rehued_share(&c3, &w3);
+        assert!(
+            !cast_rotates_a_region(&c3, &w3),
+            "rotation gate must NOT fire on the haze correction (share {s3:.4})"
+        );
+        // 0.1× also pins ROT_DEG from BELOW: at 45° the haze pair's share is
+        // 0.0134 (0.27× ROT_SHARE) and would fail here; at 75° it measures
+        // ≈ 0.0001.
+        assert!(s3 < 0.1 * ROT_SHARE, "margin eroded: haze share {s3:.4} (measured ≈ 0)");
     }
 
     #[test]
