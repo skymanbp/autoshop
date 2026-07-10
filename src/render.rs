@@ -11,9 +11,9 @@
 //! HONEST SCOPE: these ops are tasteful **approximations**, not bit-exact
 //! Lightroom — clarity/sharpening are luma unsharp masks, noise reduction is a
 //! bilateral-lite, dehaze is a pointwise scattering inversion (see
-//! [`apply_dehaze`]). NOT applied here: LOCAL-mask clarity/dehaze/texture/
-//! temperature/tint (deferred — the XMP→Lightroom path renders those, see
-//! [`apply_masks`]).
+//! [`apply_dehaze`]). NOT applied here: LOCAL-mask clarity/dehaze/texture
+//! (deferred — the XMP→Lightroom path renders those, see [`apply_masks`];
+//! local temperature/tint ARE engine-rendered since batch #2-B).
 
 use std::path::Path;
 
@@ -656,12 +656,15 @@ fn apply_dehaze(data: &mut [[f32; 3]], amount: f32) {
 }
 
 /// Apply each local masked adjustment: blend the masked region toward a locally
-/// re-toned version, weighted by the gradient mask × amount. Applies local tone
-/// (exposure/contrast/highlights/shadows/whites/blacks) + saturation, then local
-/// **noise reduction** (smooth luma toward its neighbourhood, inside the mask —
-/// for "this region is noisy" requests). Local clarity/dehaze/texture/temp/tint
-/// are deferred (the XMP→Lightroom path renders those). Mask coords are
-/// normalised so this works at any resolution.
+/// re-adjusted version, weighted by the gradient mask × amount. Applies local
+/// white balance (temperature/tint — the same [`wb_gains`] model as the global
+/// stage, see [`local_temp_to_kelvin`]), then local tone (exposure/contrast/
+/// highlights/shadows/whites/blacks) + saturation — WB → tone → sat, mirroring
+/// the global pipeline order — then local **noise reduction** (smooth luma
+/// toward its neighbourhood, inside the mask — for "this region is noisy"
+/// requests). Local clarity/dehaze/texture are deferred (the XMP→Lightroom
+/// path renders those). Mask coords are normalised so this works at any
+/// resolution.
 fn apply_masks(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
     for m in &r.masks {
         let local = EditRecipe {
@@ -675,6 +678,11 @@ fn apply_masks(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
         };
         let lut = build_tone_lut(&local);
         let sat = m.saturation / 100.0;
+        // Local WB gains, computed ONCE per mask (never inside the pixel
+        // loop). None when both sliders are neutral, so the common tone-only
+        // mask pays nothing for the WB stage.
+        let wb = (m.temperature != 0.0 || m.tint != 0.0)
+            .then(|| wb_gains(5500.0, local_temp_to_kelvin(m.temperature), m.tint));
         let amount = m.amount.clamp(0.0, 1.0);
         // Bitmap geometry: decode the raster ONCE per mask per develop (never
         // inside the pixel loop); both the tone and the NR pass share it.
@@ -708,10 +716,19 @@ fn apply_masks(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
                         continue;
                     }
                 }
-                // Luminance-preserving local tone (same anti-greying reason as the
-                // global pass), then local saturation.
+                // Local WB first (linear-light gains — exactly the global
+                // apply_wb per-pixel math), then luminance-preserving local
+                // tone (same anti-greying reason as the global pass), then
+                // local saturation. The fully-shifted pixel `t` is blended
+                // with the original by the mask weight below, so weight 1
+                // reproduces the global stages and weight 0 is a no-op.
                 let mut t = p;
-                let l_old = luma601(&p);
+                if let Some(g) = &wb {
+                    for (c, gc) in t.iter_mut().zip(g) {
+                        *c = linear_to_srgb((srgb_to_linear(*c) * gc).clamp(0.0, 1.0));
+                    }
+                }
+                let l_old = luma601(&t);
                 let l_new = sample_lut(&lut, l_old);
                 scale_chroma(&mut t, l_old, l_new);
                 let t = apply_sat_vibrance(t[0], t[1], t[2], sat, 0.0);
@@ -1067,6 +1084,24 @@ fn wb_gains(as_shot_k: f32, target_k: f32, tint: f32) -> [f32; 3] {
     // Tint: positive = magenta (less green), negative = green.
     let gg = 1.0 - 0.20 * (tint / 100.0);
     [gr, gg, gb]
+}
+
+/// Map the local mask Temp slider — a RELATIVE warm/cool shift, ±100 (see
+/// `LocalAdjustment::temperature`) — to the target Kelvin the shared
+/// [`wb_gains`] model expects: a linear shift in MIRED (1e6/K, the unit
+/// photographic conversion gels are specified in, ~perceptually uniform for
+/// WB) around the same 5500 K anchor the global stage uses. Full scale ±100
+/// ⇒ ∓80 mired (≈ half a CTO/CTB gel): +100 → ~9823 K (warmer — matching
+/// wb_gains' "higher target K = warmer" convention), −100 → ~3820 K. Both
+/// endpoints sit inside kelvin_to_rgb's 1000–40000 K validity. ACR's exact
+/// local-temp model is proprietary — this is our documented approximation
+/// (same stance as [`apply_vignette`]); the XMP carries the raw slider value,
+/// so Lightroom re-renders with its own model.
+fn local_temp_to_kelvin(t: f32) -> f32 {
+    const ANCHOR_K: f32 = 5500.0;
+    const MIRED_FULL_SCALE: f32 = 80.0;
+    let mired = 1e6 / ANCHOR_K - (t.clamp(-100.0, 100.0) / 100.0) * MIRED_FULL_SCALE;
+    1e6 / mired
 }
 
 /// Apply white-balance gains in linear light. No-op when gains are ~neutral.
@@ -2046,6 +2081,84 @@ mod tests {
         assert!(spread(data[1]) < 0.05, "dark orange (same hue) must desaturate: {:?}", data[1]);
         assert_eq!(data[2], control[2], "opposite hue: the mask must skip it");
         assert_eq!(data[3], control[3], "neutral grey: the mask must skip it");
+    }
+
+    #[test]
+    fn local_temperature_warms_the_masked_region_only() {
+        // Feedback batch #2-B prerequisite: LocalAdjustment carried Temp/Tint
+        // since v1 and the XMP writer exports them, but the ENGINE ignored
+        // them (render.rs listed them as "deferred") — so the GUI's mask
+        // Temp/Tint sliders did nothing in-app, and the zoned reverse-fit
+        // would have nothing to drive. A warm local temperature must boost
+        // red / cut blue inside the mask; the uncovered end must stay equal
+        // to a mask-less control render (the mask pass skips weight 0).
+        let r = EditRecipe {
+            masks: vec![LocalAdjustment {
+                mask: MaskGeometry::Linear { zero_x: 0.5, zero_y: 0.0, full_x: 0.5, full_y: 1.0 },
+                amount: 1.0,
+                temperature: 100.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let grey = [0.5_f32; 3];
+        let (w, h) = (1usize, 4usize);
+        let mut control = vec![grey; w * h];
+        apply_develop(&mut control, w, h, &EditRecipe::default());
+        let mut data = vec![grey; w * h];
+        apply_develop(&mut data, w, h, &r);
+        assert_eq!(data[0], control[0], "zero end of the gradient: the mask must skip it");
+        let px = data[3];
+        assert!(
+            px[0] > grey[0] + 0.02 && px[2] < grey[2] - 0.02,
+            "full end must warm (red up, blue down): {px:?}"
+        );
+    }
+
+    #[test]
+    fn full_frame_local_wb_matches_the_global_wb_stage() {
+        // The local Temp/Tint must MIRROR apply_recipe_wb's semantics — same
+        // wb_gains model, same 5500 K anchor, WB→tone→sat order — so a
+        // weight-1 full-frame mask must land within LUT-quantization of a
+        // global render whose absolute Kelvin is the mired-mapped target.
+        // This pins local_temp_to_kelvin AND the tint sign end to end.
+        let full = MaskGeometry::Linear { zero_x: 0.5, zero_y: 0.5, full_x: 0.5, full_y: 0.5 };
+        let (t_rel, tint) = (60.0_f32, -25.0_f32);
+        let src = [[0.7_f32, 0.55, 0.35], [0.2, 0.35, 0.6], [0.5, 0.5, 0.5]];
+        let mut global = src.to_vec();
+        apply_recipe_wb(
+            &mut global,
+            &EditRecipe {
+                temperature_k: Some(local_temp_to_kelvin(t_rel)),
+                tint,
+                ..Default::default()
+            },
+        );
+        apply_develop(&mut global, 3, 1, &EditRecipe::default());
+        let mut local = src.to_vec();
+        apply_develop(
+            &mut local,
+            3,
+            1,
+            &EditRecipe {
+                masks: vec![LocalAdjustment {
+                    mask: full,
+                    amount: 1.0,
+                    temperature: t_rel,
+                    tint,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        for (a, b) in global.iter().zip(&local) {
+            for c in 0..3 {
+                assert!(
+                    (a[c] - b[c]).abs() < 3e-3,
+                    "full-frame local WB drifted from the global stage: {a:?} vs {b:?}"
+                );
+            }
+        }
     }
 
     #[test]
