@@ -71,7 +71,7 @@ pub(crate) const ANALYZE_EDGE: u32 = 384;
 const HIST_BINS: usize = 1024;
 /// Quantile clip for CDF inversion — the extreme tails of a generative render
 /// are noise (a few blown/crushed pixels would otherwise own the end knots).
-const P_CLIP: f32 = 0.002;
+pub(crate) const P_CLIP: f32 = 0.002;
 /// Cast-curve acceptance: the fitted per-channel curves must cut the hue-aware
 /// look error to ≤ this fraction of the without-curves error, else they are
 /// rejected as a content mismatch masquerading as a cast (see the stage-4
@@ -400,7 +400,7 @@ const TONE_PRIOR: f64 = 0.02;
 /// knots; keep the (ev, sliders) minimising the PENALISED clamped-solution
 /// score `SSE + TONE_PRIOR·Σs²` — the same prior in the solve and in the
 /// model selection, so the exposure scan cannot smuggle the degeneracy back.
-fn fit_tone_sliders(tone_map: &impl Fn(f32) -> f32) -> (f32, [f32; 5]) {
+pub(crate) fn fit_tone_sliders(tone_map: &impl Fn(f32) -> f32) -> (f32, [f32; 5]) {
     let targets: Vec<f32> = render::TONE_KNOTS_X.iter().map(|&x| tone_map(x)).collect();
     let basis: Vec<[f32; 5]> =
         render::TONE_KNOTS_X.iter().map(|&x| render::tone_slider_basis(x)).collect();
@@ -760,7 +760,7 @@ fn channel_cdf(px: &[[f32; 3]], ch: usize) -> Vec<f32> {
 }
 
 /// F(x): fraction of pixels ≤ x (linear interp between bins).
-fn cdf_at(cdf: &[f32], x: f32) -> f32 {
+pub(crate) fn cdf_at(cdf: &[f32], x: f32) -> f32 {
     let pos = x.clamp(0.0, 1.0) * (cdf.len() - 1) as f32;
     let i = pos.floor() as usize;
     if i >= cdf.len() - 1 {
@@ -771,7 +771,7 @@ fn cdf_at(cdf: &[f32], x: f32) -> f32 {
 }
 
 /// Q(p): the value at quantile `p` (inverse CDF, linear interp within the bin).
-fn quantile(cdf: &[f32], p: f32) -> f32 {
+pub(crate) fn quantile(cdf: &[f32], p: f32) -> f32 {
     let n = cdf.len();
     let mut lo = 0usize;
     let mut hi = n - 1;

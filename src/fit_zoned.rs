@@ -46,6 +46,25 @@ pub(crate) const MIN_ZONE_SHARE: f32 = 0.03;
 const ZONE_EV_LIMIT: f32 = 2.5;
 /// Local saturation shares the global fit's model cap (fit.rs stage 3).
 const ZONE_SAT_LIMIT: f32 = 60.0;
+/// Acceptance: the zone-local error ([`zone_err`]) must fall to ≤ this
+/// fraction of its pre-correction value. The correction is judged on ITS
+/// zone, not on the frame-global `look_err` — measured on the real pair
+/// (2026-07-09, _DSC9621 × reimagine-5): the sky correction landed the zone
+/// moments almost exactly on the target's (zone error 0.507 → 0.015) while
+/// the FRAME-global metric moved 0.1768 → 0.1792, because the generative
+/// target holds ~3× more sky area than the source (the composition differs —
+/// no zone repaint can reconcile frame-level distributions) and a correct
+/// blue→gold repaint migrates band mass, which the worst-band hue term can
+/// only read as damage. A frame-global gate therefore vetoes exactly the
+/// correction this module exists to make.
+const ZONE_ACCEPT_RATIO: f32 = 0.5;
+/// Insurance bound: the mask cannot touch pixels outside its raster (engine
+/// guarantee, pinned by the rocks-bit-equal test), so the only frame-global
+/// drift a correct zone repaint can cause is metric-visible band migration
+/// inside its own region. Allow that small, measured drift (+0.0024 on the
+/// real pair) but refuse anything larger — a big global regression means the
+/// mask is NOT the region we thought it was.
+const ZONE_GLOBAL_REGRESSION_TOL: f32 = 0.02;
 
 /// Mask-weighted first moments of one zone.
 pub(crate) struct ZoneMoments {
@@ -160,6 +179,45 @@ pub(crate) fn clamp_zone_sat(v: f32) -> f32 {
     v.clamp(-ZONE_SAT_LIMIT, ZONE_SAT_LIMIT)
 }
 
+/// Zone-local look distance: mean |Δ| of the linear channel means plus the
+/// chroma gap — the moments the fit steers, measured where the mask acts.
+/// This is the yardstick the zoned do-no-harm judges by (see
+/// [`ZONE_ACCEPT_RATIO`] for why the frame-global `look_err` cannot be).
+pub(crate) fn zone_err(a: &ZoneMoments, b: &ZoneMoments) -> f32 {
+    let mean: f32 =
+        a.mean_lin.iter().zip(&b.mean_lin).map(|(x, y)| (x - y).abs()).sum::<f32>() / 3.0;
+    mean + (a.chroma - b.chroma).abs()
+}
+
+/// Mask-weighted luma CDF of a zone (sRGB Rec.601 luma, the same domain as
+/// the global fit's tone stage). Drives the WITHIN-zone tone solve: a zone
+/// can match the target's linear MEAN and still read far darker (the real
+/// pair's land: the target holds sunlit mesa tops plus deep canyon shadows —
+/// a few bright pixels dominate a linear mean, while perception follows the
+/// distribution). Zones correspond semantically, so quantile-to-quantile
+/// mapping is identified here — unlike the per-band statistics fit.rs bans
+/// on the WHOLE frame, where region correspondence is unknown.
+pub(crate) fn zone_luma_cdf(px: &[[f32; 3]], weights: &[f32]) -> Vec<f32> {
+    const BINS: usize = 1024;
+    let mut hist = vec![0.0f32; BINS];
+    let mut total = 0.0f32;
+    for (p, &w) in px.iter().zip(weights) {
+        if w <= 0.0 {
+            continue;
+        }
+        let l = 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
+        hist[(l.clamp(0.0, 1.0) * (BINS - 1) as f32).round() as usize] += w;
+        total += w;
+    }
+    let total = total.max(1e-6);
+    let mut acc = 0.0f32;
+    for h in hist.iter_mut() {
+        acc += *h;
+        *h = acc / total;
+    }
+    hist
+}
+
 // --------------------------------------------------------------------------
 // orchestration
 // --------------------------------------------------------------------------
@@ -184,7 +242,7 @@ pub fn fit_recipe_zoned(
     let mut report = fit::fit_recipe(src, target);
     match segment_both(src, target, seg, mask_path) {
         Ok((src_mask, tgt_mask)) => {
-            attach_sky_zone(src, target, &mut report, &src_mask, &tgt_mask, mask_path);
+            attach_zones(src, target, &mut report, &src_mask, &tgt_mask, mask_path);
         }
         Err(e) => {
             report.recipe.rationale.push_str(&format!(
@@ -230,12 +288,16 @@ fn segment_both(
 }
 
 /// The post-segmentation half (separable so tests drive it with hand-built
-/// masks, no python): measure sky-to-sky moments, solve the dials, refine
-/// saturation closed-loop, keep the mask only if the end-to-end look error
-/// improves. Appends its own honest rationale notes either way. The source
-/// zone is measured on the GLOBALLY-FITTED render — the mask stacks after
-/// the global stages in the engine, so that is the residual it corrects.
-fn attach_sky_zone(
+/// masks, no python): correct the SKY zone, then the LAND zone — the same
+/// raster reused with `inverted = true`, so one segmentation buys the whole
+/// frame (the first real-pair render showed why land is not optional: the
+/// distant haze-terrain outside the sky mask kept its global-fit blue and
+/// clashed against the repainted gold sky as a hard halo). Each zone is
+/// gated independently; the raster file is removed only when NO zone kept
+/// it. Requires a VALID sky partition first: an empty/degenerate sky mask
+/// makes "land" mean "everything", which would just be a weaker-gated
+/// re-run of the global fit.
+fn attach_zones(
     src: &DynamicImage,
     target: &DynamicImage,
     report: &mut FitReport,
@@ -245,38 +307,121 @@ fn attach_sky_zone(
 ) {
     let s_img = src.thumbnail(fit::ANALYZE_EDGE, fit::ANALYZE_EDGE);
     let t_img = target.thumbnail(fit::ANALYZE_EDGE, fit::ANALYZE_EDGE);
-    let cur = render::develop_preview(&s_img, &report.recipe);
-    let cur_px = fit::pixels_of(&cur);
     let tgt_px = fit::pixels_of(&t_img);
-    let sw = mask_weights(src_mask, cur.width(), cur.height());
+    let (aw, ah) = {
+        let c = render::develop_preview(&s_img, &report.recipe);
+        (c.width(), c.height())
+    };
+    let sw = mask_weights(src_mask, aw, ah);
     let tw = mask_weights(tgt_mask, t_img.width(), t_img.height());
-    let ms = zone_moments(&cur_px, &sw);
-    let mt = zone_moments(&tgt_px, &tw);
-    if ms.share < MIN_ZONE_SHARE || mt.share < MIN_ZONE_SHARE {
+    // Partition validity — judged on the raw mask shares (Σw/n), before any
+    // zone-specific gating.
+    let share = |w: &[f32]| w.iter().sum::<f32>() / w.len().max(1) as f32;
+    let (s_share, t_share) = (share(&sw), share(&tw));
+    if !(MIN_ZONE_SHARE..=1.0 - MIN_ZONE_SHARE).contains(&s_share)
+        || !(MIN_ZONE_SHARE..=1.0 - MIN_ZONE_SHARE).contains(&t_share)
+    {
         report.recipe.rationale.push_str(&format!(
-            " Zoned sky fit skipped: sky covers too little of the frame \
-             (source {:.0}%, target {:.0}%).",
-            ms.share * 100.0,
-            mt.share * 100.0,
+            " Zoned fit skipped: no usable sky partition (sky covers {:.0}% \
+             of the source frame, {:.0}% of the target's).",
+            s_share * 100.0,
+            t_share * 100.0,
         ));
         std::fs::remove_file(mask_path).ok();
         return;
     }
+    let swl: Vec<f32> = sw.iter().map(|w| 1.0 - w).collect();
+    let twl: Vec<f32> = tw.iter().map(|w| 1.0 - w).collect();
+    let sky = attach_one_zone(&s_img, &tgt_px, report, &sw, &tw, mask_path, "sky", "反推·天空", false);
+    let land =
+        attach_one_zone(&s_img, &tgt_px, report, &swl, &twl, mask_path, "land", "反推·地景", true);
+    if !sky && !land {
+        std::fs::remove_file(mask_path).ok();
+    }
+}
+
+/// Fit + gate ONE zone; returns whether its correction was kept. The zone is
+/// measured on a fresh render of the CURRENT recipe (including any zone
+/// already attached), so corrections stack the way the engine renders them.
+/// Judged by the ZONE-LOCAL error (see [`ZONE_ACCEPT_RATIO`] for the
+/// measured reason the frame-global metric cannot be the judge), with the
+/// frame-global error as a bounded-drift insurance only.
+#[allow(clippy::too_many_arguments)] // internal seam; a struct would just rename the args
+fn attach_one_zone(
+    s_img: &DynamicImage,
+    tgt_px: &[[f32; 3]],
+    report: &mut FitReport,
+    sw: &[f32],
+    tw: &[f32],
+    mask_path: &Path,
+    label: &str,
+    name: &str,
+    inverted: bool,
+) -> bool {
+    let cur_px = fit::pixels_of(&render::develop_preview(s_img, &report.recipe));
+    let ms = zone_moments(&cur_px, sw);
+    let mt = zone_moments(tgt_px, tw);
+    if ms.share < MIN_ZONE_SHARE || mt.share < MIN_ZONE_SHARE {
+        report.recipe.rationale.push_str(&format!(
+            " The {label} zone covers too little of the frame (source {:.0}%, \
+             target {:.0}%) — skipped.",
+            ms.share * 100.0,
+            mt.share * 100.0,
+        ));
+        return false;
+    }
     let d = fit_zone_dials(&ms, &mt);
+    let round1 = |v: f32| (v * 10.0).round() / 10.0;
     let round2 = |v: f32| (v * 100.0).round() / 100.0;
     report.recipe.masks.push(LocalAdjustment {
         mask: MaskGeometry::Bitmap { path: mask_path.to_string_lossy().into_owned() },
-        name: "反推·天空".into(),
+        name: name.into(),
         amount: 1.0,
-        exposure_ev: round2(d.exposure_ev),
+        inverted,
         color_gains: Some(d.color_gains.map(round2)),
         ..Default::default()
     });
+    // Within-zone tone: the zone's brightness/contrast is a DISTRIBUTION,
+    // not a mean (see [`zone_luma_cdf`] — the real pair's land matched the
+    // linear mean and still rendered far darker than the target). Map the
+    // zone's weighted luma CDF onto the target zone's and solve the engine's
+    // own local tone sliders from it — the same basis + magnitude prior as
+    // the global stage 1. This SUPERSEDES the moment-EV from fit_zone_dials
+    // (which now only normalises the gains): brightness lives here, on the
+    // render of the gains-only mask so the solve sees the recoloured zone.
+    //
+    // IDENTIFIABILITY GUARD: a quantile map out of a near-uniform source
+    // zone is degenerate — a monotone map cannot spread a luma spike into
+    // the target's wide distribution, and the slider solve goes wild on the
+    // violent pseudo-map instead (measured, real pair: the flat hazy sky
+    // drew exposure −0.70 and its zone residual went 0.016 → 0.108). Below
+    // an IQR floor, fall back to the moment-EV and leave the tone flat.
+    {
+        let rp = fit::pixels_of(&render::develop_preview(s_img, &report.recipe));
+        let s_cdf = zone_luma_cdf(&rp, sw);
+        let src_iqr = fit::quantile(&s_cdf, 0.75) - fit::quantile(&s_cdf, 0.25);
+        let m = report.recipe.masks.last_mut().expect("zone mask just pushed");
+        if src_iqr >= 0.05 {
+            let t_cdf = zone_luma_cdf(tgt_px, tw);
+            let tone_map = |x: f32| {
+                fit::quantile(&t_cdf, fit::cdf_at(&s_cdf, x).clamp(fit::P_CLIP, 1.0 - fit::P_CLIP))
+            };
+            let (ev, sliders) = fit::fit_tone_sliders(&tone_map);
+            m.exposure_ev = round2(ev.clamp(-ZONE_EV_LIMIT, ZONE_EV_LIMIT));
+            m.contrast = round1(sliders[0] * 100.0);
+            m.highlights = round1(sliders[1] * 100.0);
+            m.shadows = round1(sliders[2] * 100.0);
+            m.whites = round1(sliders[3] * 100.0);
+            m.blacks = round1(sliders[4] * 100.0);
+        } else {
+            m.exposure_ev = round2(d.exposure_ev.clamp(-ZONE_EV_LIMIT, ZONE_EV_LIMIT));
+        }
+    }
     // Closed-loop zone saturation on real renders (the gains change chroma
     // by themselves — only a render knows where the zone landed).
     for _ in 0..2 {
-        let rp = fit::pixels_of(&render::develop_preview(&s_img, &report.recipe));
-        let zone_chroma = zone_moments(&rp, &sw).chroma;
+        let rp = fit::pixels_of(&render::develop_preview(s_img, &report.recipe));
+        let zone_chroma = zone_moments(&rp, sw).chroma;
         let Some(step) = zone_sat_step(zone_chroma, mt.chroma) else { break };
         let m = report.recipe.masks.last_mut().expect("zone mask just pushed");
         let next = clamp_zone_sat((m.saturation + step).round());
@@ -285,35 +430,55 @@ fn attach_sky_zone(
         }
         m.saturation = next;
     }
-    // Do-no-harm, zoned edition: the mask stays only if the END-TO-END look
-    // error beats the global-only fit it stacked onto.
-    let zoned_px = fit::pixels_of(&render::develop_preview(&s_img, &report.recipe));
-    let zoned_err = fit::look_err(&zoned_px, &tgt_px);
-    if zoned_err + 1e-4 < report.err_after {
+    let zoned_px = fit::pixels_of(&render::develop_preview(s_img, &report.recipe));
+    let zoned_err = fit::look_err(&zoned_px, tgt_px);
+    let zone_before = zone_err(&ms, &mt);
+    let zone_after = zone_err(&zone_moments(&zoned_px, sw), &mt);
+    if zone_after <= zone_before * ZONE_ACCEPT_RATIO
+        && zoned_err <= report.err_after + ZONE_GLOBAL_REGRESSION_TOL
+    {
         let m = report.recipe.masks.last().expect("zone mask just pushed");
+        let g = m.color_gains.unwrap_or([1.0; 3]);
         report.recipe.rationale.push_str(&format!(
-            " Zoned sky correction attached (sky-to-sky moments → local \
-             exposure {:+.2} EV, colour gains [{:.2} {:.2} {:.2}], saturation \
-             {:+.0}): residual look error {:.3} → {:.3}. The correction is a \
-             BITMAP mask — rendered in-app; the Lightroom sidecar carries the \
-             global fit only (classic XMP cannot hold raster masks).",
-            m.exposure_ev,
-            m.color_gains.unwrap_or([1.0; 3])[0],
-            m.color_gains.unwrap_or([1.0; 3])[1],
-            m.color_gains.unwrap_or([1.0; 3])[2],
-            m.saturation,
-            report.err_after,
-            zoned_err,
+            " Zoned {label} correction attached ({label}-to-{label} moments → \
+             local exposure {:+.2} EV, colour gains [{:.2} {:.2} {:.2}], \
+             saturation {:+.0}): zone residual {:.3} → {:.3}. The correction \
+             is a BITMAP mask — rendered in-app; the Lightroom sidecar \
+             carries the global fit only (classic XMP cannot hold raster \
+             masks).",
+            m.exposure_ev, g[0], g[1], g[2], m.saturation, zone_before, zone_after,
         ));
+        // Honest composition note: when the zone covers very different frame
+        // shares on the two sides, the GLOBAL distributions cannot fully
+        // reconcile no matter how well the zone matches (the real pair's
+        // sky: 7.5% vs 22.6%).
+        let (lo, hi) = (ms.share.min(mt.share), ms.share.max(mt.share));
+        if hi > 2.0 * lo {
+            report.recipe.rationale.push_str(&format!(
+                " Note: the {label} zone covers {:.0}% of the source frame \
+                 but {:.0}% of the target's — the compositions differ, so the \
+                 overall distribution residual stays where the global fit \
+                 left it.",
+                ms.share * 100.0,
+                mt.share * 100.0,
+            ));
+        }
         report.err_after = zoned_err;
         report.recipe.confidence = (1.0 - zoned_err * 6.0).clamp(0.25, 0.95);
+        true
     } else {
         report.recipe.masks.pop();
-        report.recipe.rationale.push_str(
-            " Zoned sky correction measured no improvement over the global \
-             fit and was dropped.",
-        );
-        std::fs::remove_file(mask_path).ok();
+        report.recipe.rationale.push_str(&format!(
+            " Zoned {label} correction dropped: zone residual {:.3} → {:.3} \
+             (needs ≤ {:.0}% of the original) with frame-global drift \
+             {:+.3} (tolerance {:+.3}).",
+            zone_before,
+            zone_after,
+            ZONE_ACCEPT_RATIO * 100.0,
+            zoned_err - report.err_after,
+            ZONE_GLOBAL_REGRESSION_TOL,
+        ));
+        false
     }
 }
 
@@ -536,18 +701,27 @@ mod tests {
     }
 
     #[test]
-    fn zoned_orchestration_attaches_the_sky_mask_and_improves_the_look() {
+    fn zoned_orchestration_attaches_the_sky_mask_and_improves_the_zone() {
         let (src, tgt, sky_mask) = zoned_pair();
         std::fs::create_dir_all("out").ok();
         let mask_path = Path::new("out/_zoned_orch_mask.png");
         sky_mask.save(mask_path).unwrap();
         let mut report = fit::fit_recipe(&src, &tgt);
         let err_global = report.err_after;
-        attach_sky_zone(&src, &tgt, &mut report, &sky_mask, &sky_mask, mask_path);
-        assert_eq!(report.recipe.masks.len(), 1, "sky correction must attach");
+        attach_zones(&src, &tgt, &mut report, &sky_mask, &sky_mask, mask_path);
         assert!(
-            report.err_after < err_global,
-            "zoned err {} must beat global {err_global}",
+            report.recipe.masks.iter().any(|m| m.name == "反推·天空" && !m.inverted),
+            "sky correction must attach: {}",
+            report.recipe.rationale
+        );
+        // The zoned gate judges each ZONE; frame-global error is only bounded
+        // (the insurance tolerance, once per attached zone), never required
+        // to improve.
+        let bound = err_global
+            + ZONE_GLOBAL_REGRESSION_TOL * report.recipe.masks.len() as f32;
+        assert!(
+            report.err_after <= bound,
+            "zoned err {} exceeded the insurance bound {bound}",
             report.err_after
         );
         assert!(
@@ -564,15 +738,114 @@ mod tests {
     }
 
     #[test]
+    fn zoned_orchestration_corrects_the_land_through_the_inverted_raster() {
+        // The first real-pair render's lesson: repainting ONLY the sky leaves
+        // everything outside the mask with the global look — on the real
+        // pair a blue haze band clashed against the new gold sky. The land
+        // zone reuses the SAME raster inverted; when the target's land
+        // differs too (muted vs vivid warm), both zones must attach.
+        let (w, h) = (16u32, 16u32);
+        let build = |sky: [f32; 3], rock: [f32; 3]| -> DynamicImage {
+            let img = RgbImage::from_fn(w, h, |_, y| {
+                let p = if y >= 12 { sky } else { rock };
+                image::Rgb(p.map(|c| (c * 255.0).round() as u8))
+            });
+            DynamicImage::ImageRgb8(img)
+        };
+        // Muted hazy land → bright vivid warm land (the real pair's demand).
+        let src = build([0.60, 0.63, 0.67], [0.45, 0.42, 0.40]);
+        let tgt = build([0.92, 0.72, 0.48], [0.80, 0.50, 0.28]);
+        let sky_mask =
+            GrayImage::from_fn(w, h, |_, y| image::Luma([if y >= 12 { 255u8 } else { 0 }]));
+        std::fs::create_dir_all("out").ok();
+        let mask_path = Path::new("out/_zoned_orch_land_mask.png");
+        sky_mask.save(mask_path).unwrap();
+        let mut report = fit::fit_recipe(&src, &tgt);
+        attach_zones(&src, &tgt, &mut report, &sky_mask, &sky_mask, mask_path);
+        assert!(
+            report.recipe.masks.iter().any(|m| m.name == "反推·天空" && !m.inverted),
+            "sky zone must attach: {}",
+            report.recipe.rationale
+        );
+        let land = report
+            .recipe
+            .masks
+            .iter()
+            .find(|m| m.name == "反推·地景")
+            .unwrap_or_else(|| panic!("land zone must attach: {}", report.recipe.rationale));
+        assert!(land.inverted, "the land zone rides the INVERTED sky raster");
+        assert!(
+            report.recipe.rationale.contains("Zoned land correction attached"),
+            "rationale must document the land zone: {}",
+            report.recipe.rationale
+        );
+        // Render check: a land pixel must move toward the vivid warm target.
+        let out = render::develop_preview(&src, &report.recipe).to_rgb8();
+        let p = out.get_pixel(8, 4);
+        let (r, b) = (p[0] as f32 / 255.0, p[2] as f32 / 255.0);
+        assert!(r > b + 0.10, "land must turn warm (r >> b): {p:?}");
+        std::fs::remove_file(mask_path).ok();
+    }
+
+    #[test]
+    fn zoned_fit_survives_a_composition_share_mismatch() {
+        // The real-pair failure geometry (2026-07-09): the generative target
+        // holds ~3× more sky than the source, so the FRAME-global look_err
+        // barely moves (or drifts up) when the zone is repainted correctly —
+        // the first gate (frame-global improvement) dropped a correction
+        // whose zone moments landed almost exactly on the target's (measured
+        // zone residual 0.507 → 0.015, global drift +0.0024). The zone-local
+        // gate must attach it; the rationale must surface the composition
+        // difference honestly.
+        let (w, h) = (16u32, 16u32);
+        let build = |sky: [f32; 3], sky_rows: u32| -> DynamicImage {
+            let img = RgbImage::from_fn(w, h, |_, y| {
+                let p = if y >= h - sky_rows { sky } else { [0.55f32, 0.45, 0.35] };
+                image::Rgb(p.map(|c| (c * 255.0).round() as u8))
+            });
+            DynamicImage::ImageRgb8(img)
+        };
+        let mask_of = |sky_rows: u32| {
+            GrayImage::from_fn(w, h, |_, y| {
+                image::Luma([if y >= h - sky_rows { 255u8 } else { 0 }])
+            })
+        };
+        // Source: 2 sky rows (12.5%). Target: 6 gold rows (37.5%) — 3× more.
+        let src = build([0.60, 0.63, 0.67], 2);
+        let tgt = build([0.92, 0.72, 0.48], 6);
+        let (sm, tm) = (mask_of(2), mask_of(6));
+        std::fs::create_dir_all("out").ok();
+        let mask_path = Path::new("out/_zoned_orch_share_mask.png");
+        sm.save(mask_path).unwrap();
+        let mut report = fit::fit_recipe(&src, &tgt);
+        attach_zones(&src, &tgt, &mut report, &sm, &tm, mask_path);
+        assert!(
+            report.recipe.rationale.contains("Zoned sky correction attached"),
+            "the zone gate must attach a correct repaint despite the share \
+             mismatch: {}",
+            report.recipe.rationale
+        );
+        assert!(
+            report.recipe.rationale.contains("compositions differ"),
+            "rationale must surface the share mismatch: {}",
+            report.recipe.rationale
+        );
+        std::fs::remove_file(mask_path).ok();
+    }
+
+    #[test]
     fn zoned_orchestration_skips_a_degenerate_sky() {
+        // An empty sky mask must skip BOTH zones: without a valid sky
+        // partition, "land" would mean "everything" — a weaker-gated re-run
+        // of the global fit, not a semantic zone.
         let (src, tgt, _) = zoned_pair();
         let empty = GrayImage::from_pixel(16, 16, image::Luma([0u8]));
         let mask_path = Path::new("out/_zoned_orch_empty_mask.png");
         let mut report = fit::fit_recipe(&src, &tgt);
-        attach_sky_zone(&src, &tgt, &mut report, &empty, &empty, mask_path);
-        assert!(report.recipe.masks.is_empty(), "no mask on a degenerate zone");
+        attach_zones(&src, &tgt, &mut report, &empty, &empty, mask_path);
+        assert!(report.recipe.masks.is_empty(), "no mask on a degenerate partition");
         assert!(
-            report.recipe.rationale.contains("Zoned sky fit skipped"),
+            report.recipe.rationale.contains("no usable sky partition"),
             "rationale must say why: {}",
             report.recipe.rationale
         );
