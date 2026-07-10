@@ -14,6 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -140,10 +141,44 @@ enum RetouchKind {
 /// variant's `origin` — its export / reverse-fit / next-retouch source.
 type RetouchDone = anyhow::Result<(image::DynamicImage, String, PathBuf, RetouchKind)>;
 
+/// CPU-built preview frame. Everything expensive is worker-side: engine
+/// develop, geometry, the one RGB8 conversion, histogram, clipping pixels and
+/// the 96px variant thumbnail. The UI thread only submits the prepared images
+/// to egui textures. `base` + `recipe` are identity tags: if either differs
+/// when the result arrives, the frame is stale and is discarded (latest wins).
+struct PreviewDone {
+    base: Arc<image::DynamicImage>,
+    recipe: EditRecipe,
+    rgb: image::RgbImage,
+    histogram: Vec<[f32; 4]>,
+    clipping: Option<egui::ColorImage>,
+    thumb: egui::ColorImage,
+}
+
+/// Coverage-cache identity. Local effect sliders (Exposure/Temp/Saturation/
+/// color_gains) are intentionally absent: they change pixels INSIDE a mask,
+/// never its coverage. A Range Mask includes the masks-cleared reference recipe
+/// because its weight is judged on those developed pixels.
+#[derive(Clone, PartialEq)]
+struct OverlayKey {
+    base: usize,
+    target: usize,
+    mask: MaskGeometry,
+    range: Option<RangeMask>,
+    amount: f32,
+    inverted: bool,
+    reference_recipe: Option<EditRecipe>,
+    straighten_deg: f32,
+    lens_distortion: f32,
+}
+
 /// Messages from worker threads back to the UI. The large payloads are boxed so
 /// the channel message stays small (clippy::large_enum_variant).
 enum Msg {
-    Opened(Box<anyhow::Result<image::DynamicImage>>),
+    Opened(Box<anyhow::Result<Arc<image::DynamicImage>>>),
+    /// A synchronous GUI develop used to block egui's update loop. Preview work
+    /// now returns here from a single latest-wins worker.
+    Developed(Box<anyhow::Result<PreviewDone>>),
     Analyzed(Box<anyhow::Result<(EditRecipe, autoshop::advisor::Verdict)>>),
     Exported(anyhow::Result<String>),
     /// A folder scan finished: (folder, sorted source paths).
@@ -512,23 +547,19 @@ fn model_picker(ui: &mut egui::Ui, salt: &str, value: &mut String, options: &[St
 
 struct AutoshopApp {
     src_path: Option<PathBuf>,
-    // The ACTIVE variant's base pixels — what the sliders develop over. Equals
-    // `source_preview` for source-based variants (Original / Fitted), or a
-    // baked raster for a Generated / retouched variant. Every existing reader
-    // ("develop from here", "fit from here", mask sizing) uses this unchanged.
-    base_preview: Option<image::DynamicImage>,
+    // The ACTIVE variant's base pixels — shared with the preview worker by Arc,
+    // so dispatching a 4096px develop is O(1), not a 50+ MB UI-thread deep copy.
+    base_preview: Option<Arc<image::DynamicImage>>,
     // The pristine source neutral (RAW develop / loaded image), decoded once
-    // per open. It is the `None`-base for Original and Fitted variants and the
-    // base a reverse-fit maps FROM — kept separate so switching a source-based
-    // variant back never re-decodes and a reimagine can't overwrite it.
-    source_preview: Option<image::DynamicImage>,
+    // per open. Source-based variants share this same allocation.
+    source_preview: Option<Arc<image::DynamicImage>>,
     before_tex: Option<egui::TextureHandle>,
     after_tex: Option<egui::TextureHandle>,
     recipe: EditRecipe,
-    dirty: bool, // recipe changed → re-develop the after preview
-    // --- develop throttle (mid-drag coalescing; see the dirty check in update) ---
-    last_dev: Option<Instant>, // when the last develop ran
-    dev_cost: Duration,        // how long it took — sets the adaptive cadence
+    dirty: bool, // recipe changed → queue the latest preview state
+    // --- asynchronous develop scheduler (single in-flight, latest wins) ---
+    develop_inflight: bool,
+    develop_count: u64, // accepted frames; regression counter (latest-wins)
     status: String,
     busy: bool, // an analyze/export thread is running
     rx: Option<Receiver<Msg>>,
@@ -581,13 +612,15 @@ struct AutoshopApp {
     // --- diagnostic view layers (UX batch) ---
     show_mask_overlay: bool,               // translucent red coverage of the selected mask (O)
     mask_overlay_tex: Option<egui::TextureHandle>,
-    overlay_stale: bool,                   // rebuild the coverage texture next frame
+    overlay_stale: bool,                   // check/rebuild coverage next frame
+    overlay_key: Option<OverlayKey>,       // skips work when coverage is unchanged
     hover_mask: Option<usize>,             // mask row under the cursor — previews its coverage
     batch_progress: Option<(usize, usize)>, // (done, total) while a batch render runs
     // Cached masks-cleared develop the coverage's range weights are judged
     // on — reused while the global (non-mask) recipe is unchanged, so a
     // mask-slider drag rebuilds only the coverage map, not a second develop.
     overlay_ref: Option<(EditRecipe, image::DynamicImage)>,
+    overlay_build_count: u64,              // actual coverage rebuilds (tests/diagnostics)
     show_clipping: bool,                   // clipping warnings: red blown / blue crushed (J)
     clip_tex: Option<egui::TextureHandle>,
     // --- zoom / pan (per-photo, reset on open) ---
@@ -646,12 +679,10 @@ struct Variant {
     /// `AutoshopApp::recipe` (the live working copy the sliders edit); it is
     /// saved back here when you switch away.
     recipe: EditRecipe,
-    /// Base pixels this variant develops from. `None` ⇒ the shared source
-    /// neutral (`AutoshopApp::source_preview`): used by Original and by a
-    /// reverse-fit (Fitted re-develops the SAME negative — only the recipe
-    /// carries the look). `Some` ⇒ a raster the look is baked into (a
-    /// reimagine result, or a fill/heal/clone touch-up), developed on top.
-    base: Option<image::DynamicImage>,
+    /// Base pixels this variant develops from. Arc makes variant switches and
+    /// background preview dispatch O(1); pixels remain immutable.
+    /// `None` ⇒ the shared source neutral (`AutoshopApp::source_preview`).
+    base: Option<Arc<image::DynamicImage>>,
     /// The ./out artifact behind a raster variant (the reimagine PNG) — the
     /// reverse-fit target and the full-res export source. `None` for
     /// source-based variants.
@@ -737,8 +768,8 @@ impl Default for AutoshopApp {
             after_tex: None,
             recipe: EditRecipe::default(),
             dirty: false,
-            last_dev: None,
-            dev_cost: Duration::from_millis(16),
+            develop_inflight: false,
+            develop_count: 0,
             status: "Open a photo, or open a folder to browse your library.".into(),
             busy: false,
             rx: Some(rx),
@@ -813,7 +844,9 @@ impl Default for AutoshopApp {
             show_mask_overlay: true,
             mask_overlay_tex: None,
             overlay_stale: false,
+            overlay_key: None,
             overlay_ref: None,
+            overlay_build_count: 0,
             hover_mask: None,
             batch_progress: None,
             show_clipping: false,
@@ -911,11 +944,11 @@ impl AutoshopApp {
     }
 }
 
-/// 64-bin RGB+luma histogram of a preview, each channel normalised to its own
-/// peak bin (shape is what matters; absolute counts depend on preview size).
-fn compute_histogram(img: &image::DynamicImage) -> Vec<[f32; 4]> {
+/// 64-bin RGB+luma histogram of the already-packed preview. The old GUI path
+/// called `DynamicImage::to_rgb8()` independently for histogram, clipping and
+/// texture staging; one worker-side RGB8 buffer now feeds all three consumers.
+fn compute_histogram_rgb(rgb: &image::RgbImage) -> Vec<[f32; 4]> {
     const BINS: usize = 64;
-    let rgb = img.to_rgb8();
     let mut counts = vec![[0u32; 4]; BINS];
     for px in rgb.pixels() {
         let (r, g, b) = (px[0] as usize, px[1] as usize, px[2] as usize);
@@ -937,18 +970,18 @@ fn compute_histogram(img: &image::DynamicImage) -> Vec<[f32; 4]> {
         .collect()
 }
 
-/// `image::DynamicImage` → egui texture-ready colour image.
-fn to_color_image(img: &image::DynamicImage) -> egui::ColorImage {
-    let rgba = img.to_rgba8();
-    let (w, h) = img.dimensions();
-    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw())
+/// RGB8 → egui texture-ready colour image, without an intermediate RGBA image.
+fn rgb_to_color_image(rgb: &image::RgbImage) -> egui::ColorImage {
+    egui::ColorImage::from_rgb([rgb.width() as usize, rgb.height() as usize], rgb.as_raw())
 }
 
-/// Clipping-warning layer over the DEVELOPED preview (what the export would
-/// clip): red where any channel blows out (≥254), blue where all channels
-/// crush to black (≤1), transparent elsewhere. Lightroom's J toggle.
-fn clipping_overlay(img: &image::DynamicImage) -> egui::ColorImage {
-    let rgb = img.to_rgb8();
+/// `DynamicImage` compatibility helper for cold paths (open / variant switch).
+fn to_color_image(img: &image::DynamicImage) -> egui::ColorImage {
+    rgb_to_color_image(&img.to_rgb8())
+}
+
+/// Clipping-warning layer over the DEVELOPED RGB8 preview (what export clips).
+fn clipping_overlay_rgb(rgb: &image::RgbImage) -> egui::ColorImage {
     let (w, h) = (rgb.width() as usize, rgb.height() as usize);
     let mut rgba = vec![0u8; w * h * 4];
     for (i, p) in rgb.pixels().enumerate() {
@@ -960,6 +993,28 @@ fn clipping_overlay(img: &image::DynamicImage) -> egui::ColorImage {
         }
     }
     egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba)
+}
+
+/// Pure CPU preview build, safe to run off the egui thread. It deliberately
+/// excludes texture-manager calls: `TextureHandle::set` stays on the UI thread.
+fn build_preview(
+    base: Arc<image::DynamicImage>,
+    recipe: EditRecipe,
+    show_clipping: bool,
+) -> PreviewDone {
+    let mut after = autoshop::render::develop_preview(&base, &recipe);
+    if recipe.lens_distortion != 0.0 {
+        after = autoshop::render::apply_lens_distortion(&after, recipe.lens_distortion);
+    }
+    if recipe.straighten_deg != 0.0 {
+        after = autoshop::render::rotate_straighten(&after, recipe.straighten_deg);
+    }
+    let rgb = after.to_rgb8();
+    let histogram = compute_histogram_rgb(&rgb);
+    let clipping = show_clipping.then(|| clipping_overlay_rgb(&rgb));
+    let thumb_rgb = image::imageops::thumbnail(&rgb, 96, 96);
+    let thumb = rgb_to_color_image(&thumb_rgb);
+    PreviewDone { base, recipe, rgb, histogram, clipping, thumb }
 }
 
 /// Stamp a filled brush dot into the paint mask (painted = translucent red).
@@ -1010,13 +1065,15 @@ impl AutoshopApp {
                 // re-developing that double-processes it and amplifies its grain when
                 // you push tone/clarity. Baked images (PNG/TIFF/JPEG) are their own
                 // source. Demosaic is slow, so this runs off the UI thread.
-                let res = (|| -> anyhow::Result<image::DynamicImage> {
+                let res = (|| -> anyhow::Result<Arc<image::DynamicImage>> {
                     let full = if autoshop::decode::is_raw(&path) {
                         autoshop::render::render_to_image(&path, &EditRecipe::default(), None)?
                     } else {
                         autoshop::decode::load_image(&path)?
                     };
-                    Ok(full.thumbnail(edge, edge))
+                    // Arc once here so every downstream sharer (variants, the
+                    // preview worker) is an O(1) refcount bump, not a deep copy.
+                    Ok(Arc::new(full.thumbnail(edge, edge)))
                 })();
                 Msg::Opened(Box::new(res))
             },
@@ -1563,89 +1620,147 @@ impl AutoshopApp {
         );
     }
 
-    /// Re-develop the working preview through the current recipe, and refresh
-    /// the live histogram from the developed pixels (same buffer, one pass).
-    /// The geometric chain (distortion, then straighten) runs through the
-    /// engine's own apply_lens_distortion / rotate_straighten so the preview
-    /// shows exactly the geometry the export will produce.
-    fn redevelop(&mut self, ctx: &egui::Context) {
-        if let Some(base) = &self.base_preview {
-            let mut after = autoshop::render::develop_preview(base, &self.recipe);
-            if self.recipe.lens_distortion != 0.0 {
-                after = autoshop::render::apply_lens_distortion(&after, self.recipe.lens_distortion);
-            }
-            if self.recipe.straighten_deg != 0.0 {
-                after = autoshop::render::rotate_straighten(&after, self.recipe.straighten_deg);
-            }
-            self.histogram = Some(compute_histogram(&after));
-            // Clipping warnings read the same developed pixels the export
-            // will encode — rebuilt with every develop while enabled.
-            self.clip_tex = self.show_clipping.then(|| {
-                ctx.load_texture("clip", clipping_overlay(&after), egui::TextureOptions::NEAREST)
-            });
-            self.after_tex = Some(ctx.load_texture("after", to_color_image(&after), egui::TextureOptions::LINEAR));
-            // Keep the active variant's strip thumbnail in step with its
-            // develop (the other variants' thumbs were built when last active).
-            // Skipped MID-DRAG: the 96×96 rebuild is a full-image downscale on
-            // the hot path, and the guaranteed release develop (plus every
-            // programmatic edit — Analyze, Reset, undo) lands the final one.
-            if !ctx.input(|i| i.pointer.any_down()) {
-                let thumb = ctx.load_texture(
-                    "vthumb",
-                    to_color_image(&after.thumbnail(96, 96)),
-                    egui::TextureOptions::LINEAR,
-                );
-                if let Some(v) = self.variants.get_mut(self.active) {
-                    v.thumb = Some(thumb);
-                }
-            }
-        }
-        // Any recipe change can move the selected mask's coverage (geometry,
-        // range, amount, straighten, distortion) — refresh the overlay too.
-        self.overlay_stale = true;
-        self.dirty = false;
-    }
-
-    /// (Re)build the translucent red coverage layer for the selected mask —
-    /// Lightroom's mask overlay. The map is the ENGINE's own weight math
-    /// ([`autoshop::render::mask_coverage`]) evaluated on a masks-cleared
-    /// develop (the same reference the range sampler uses), then run through
-    /// the same geometric chain as the image so it lands on the same content
-    /// in the view. Cleared when the toggle is off or nothing is selected.
-    fn refresh_mask_overlay(&mut self, ctx: &egui::Context) {
-        self.mask_overlay_tex = None;
-        if !self.show_mask_overlay || self.base_preview.is_none() {
+    /// Queue the latest preview state on the single CPU worker. Dispatch is O(1):
+    /// base pixels are Arc-shared and the recipe is small. While a frame is in
+    /// flight, edits only set `dirty`; no parallel render storm is possible.
+    fn start_redevelop(&mut self) {
+        if self.develop_inflight {
             return;
         }
-        // A hovered mask-list row previews ITS coverage; otherwise the selection.
+        let Some(base) = self.base_preview.clone() else {
+            self.dirty = false;
+            return;
+        };
+        let recipe = self.recipe.clone();
+        let show_clipping = self.show_clipping;
+        self.develop_inflight = true;
+        self.dirty = false;
+        self.spawn_worker(
+            move || Msg::Developed(Box::new(Ok(build_preview(base, recipe, show_clipping)))),
+            |e| Msg::Developed(Box::new(Err(e))),
+        );
+    }
+
+    /// Accept one worker-built frame if it still describes the active base +
+    /// recipe. Old frames are dropped without touching textures; `dirty` remains
+    /// set by the newer edit and starts next. Texture handles are UPDATED in
+    /// place, avoiding a manager allocate/free cycle on every slider tick.
+    fn finish_redevelop(&mut self, ctx: &egui::Context, done: anyhow::Result<PreviewDone>) {
+        self.develop_inflight = false;
+        let frame = match done {
+            Ok(frame) => frame,
+            // Pure preview work has no ordinary error path; only a caught panic
+            // lands here. Keep the last good frame and surface the failure.
+            Err(e) => {
+                self.fail("preview develop failed", e);
+                return;
+            }
+        };
+        let current = self
+            .base_preview
+            .as_ref()
+            .is_some_and(|base| Arc::ptr_eq(base, &frame.base))
+            && self.recipe == frame.recipe;
+        if !current {
+            ctx.request_repaint();
+            return;
+        }
+        self.develop_count += 1;
+        self.histogram = Some(frame.histogram);
+
+        let after = rgb_to_color_image(&frame.rgb);
+        if let Some(tex) = &mut self.after_tex {
+            tex.set(after, egui::TextureOptions::LINEAR);
+        } else {
+            self.after_tex = Some(ctx.load_texture("after", after, egui::TextureOptions::LINEAR));
+        }
+        match frame.clipping {
+            Some(clip) => {
+                if let Some(tex) = &mut self.clip_tex {
+                    tex.set(clip, egui::TextureOptions::NEAREST);
+                } else {
+                    self.clip_tex =
+                        Some(ctx.load_texture("clip", clip, egui::TextureOptions::NEAREST));
+                }
+            }
+            None => self.clip_tex = None,
+        }
+        if let Some(v) = self.variants.get_mut(self.active) {
+            if let Some(tex) = &mut v.thumb {
+                tex.set(frame.thumb, egui::TextureOptions::LINEAR);
+            } else {
+                v.thumb = Some(ctx.load_texture("vthumb", frame.thumb, egui::TextureOptions::LINEAR));
+            }
+        }
+        // A global change can alter a Range Mask's coverage reference. The
+        // coverage-aware key makes this a cheap no-op for ordinary local effect
+        // sliders, whose coverage is independent of their pixel adjustment.
+        self.overlay_stale = true;
+        ctx.request_repaint();
+    }
+
+    /// (Re)build the translucent red coverage layer for the active mask. A
+    /// coverage key prevents local effect sliders from rebuilding this full-
+    /// frame raster: Exposure/Temp/Saturation change WHAT happens inside the
+    /// mask, not WHERE it applies. Range masks include their masks-cleared
+    /// reference recipe because their coverage genuinely depends on pixels.
+    fn refresh_mask_overlay(&mut self, ctx: &egui::Context) {
+        if !self.show_mask_overlay {
+            self.mask_overlay_tex = None;
+            self.overlay_key = None;
+            return;
+        }
+        let Some(base) = self.base_preview.as_ref() else {
+            self.mask_overlay_tex = None;
+            self.overlay_key = None;
+            return;
+        };
+        // A hovered row previews its coverage; otherwise use the selection.
         let target = self
             .hover_mask
             .filter(|&i| i < self.recipe.masks.len())
             .or_else(|| self.sel_mask.filter(|&i| i < self.recipe.masks.len()));
-        let Some(i) = target else { return };
+        let Some(i) = target else {
+            self.mask_overlay_tex = None;
+            self.overlay_key = None;
+            return;
+        };
+        let mask = self.recipe.masks[i].clone();
         let mut pre = self.recipe.clone();
         pre.masks.clear();
-        // develop_preview never reads the geometry fields (straighten /
-        // distortion / crop are applied by its CALLERS) — neutralise them in
-        // the cache key so dragging those sliders doesn't rebuild the
-        // reference for nothing. lens_vignette stays: it IS a develop stage.
+        // Geometry runs after develop, so it is not part of a Range Mask's
+        // masks-cleared pixel reference. Keep it separately in OverlayKey.
         pre.straighten_deg = 0.0;
         pre.lens_distortion = 0.0;
         pre.crop = None;
-        // Reuse the cached masks-cleared develop while the global recipe is
-        // unchanged — a mask-slider drag then rebuilds only the coverage map.
-        if !matches!(&self.overlay_ref, Some((r, _)) if *r == pre) {
-            let img = {
-                let Some(base) = &self.base_preview else { return };
-                autoshop::render::develop_preview(base, &pre)
-            };
-            self.overlay_ref = Some((pre, img));
+        let key = OverlayKey {
+            base: Arc::as_ptr(base) as usize,
+            target: i,
+            mask: mask.mask.clone(),
+            range: mask.range,
+            amount: mask.amount,
+            inverted: mask.inverted,
+            reference_recipe: mask.range.is_some().then(|| pre.clone()),
+            straighten_deg: self.recipe.straighten_deg,
+            lens_distortion: self.recipe.lens_distortion,
+        };
+        if self.overlay_key.as_ref() == Some(&key) && self.mask_overlay_tex.is_some() {
+            return;
         }
-        let reference = &self.overlay_ref.as_ref().expect("cache filled above").1;
-        let mut cov = image::DynamicImage::ImageLuma8(autoshop::render::mask_coverage(
-            &self.recipe.masks[i],
-            reference,
-        ));
+
+        // A geometry-only mask never reads reference pixels. Avoid the old
+        // second develop entirely; only Range Masks need the masks-cleared
+        // developed reference and its recipe-keyed cache.
+        let reference: &image::DynamicImage = if mask.range.is_some() {
+            if !matches!(&self.overlay_ref, Some((r, _)) if *r == pre) {
+                let img = autoshop::render::develop_preview(base, &pre);
+                self.overlay_ref = Some((pre, img));
+            }
+            &self.overlay_ref.as_ref().expect("range reference cached").1
+        } else {
+            base.as_ref()
+        };
+        let mut cov = image::DynamicImage::ImageLuma8(autoshop::render::mask_coverage(&mask, reference));
         if self.recipe.lens_distortion != 0.0 {
             cov = autoshop::render::apply_lens_distortion(&cov, self.recipe.lens_distortion);
         }
@@ -1656,15 +1771,18 @@ impl AutoshopApp {
         let (w, h) = (g.width() as usize, g.height() as usize);
         let mut rgba = vec![0u8; w * h * 4];
         for (i, p) in g.pixels().enumerate() {
-            // LR-style red wash, alpha ∝ engine weight (max ≈ 55% opacity).
             rgba[i * 4..i * 4 + 4]
                 .copy_from_slice(&[255, 40, 40, (p[0] as u16 * 140 / 255) as u8]);
         }
-        self.mask_overlay_tex = Some(ctx.load_texture(
-            "mask_overlay",
-            egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba),
-            egui::TextureOptions::LINEAR,
-        ));
+        let colour = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+        if let Some(tex) = &mut self.mask_overlay_tex {
+            tex.set(colour, egui::TextureOptions::LINEAR);
+        } else {
+            self.mask_overlay_tex =
+                Some(ctx.load_texture("mask_overlay", colour, egui::TextureOptions::LINEAR));
+        }
+        self.overlay_key = Some(key);
+        self.overlay_build_count += 1;
     }
 
     /// The geometric mapping context every interaction boundary needs:
@@ -2385,6 +2503,7 @@ impl AutoshopApp {
                         }
                     }
                 }},
+                Msg::Developed(boxed) => self.finish_redevelop(ctx, *boxed),
                 Msg::Analyzed(boxed) => match *boxed {
                     Ok((recipe, verdict)) => {
                         self.recipe = recipe;
@@ -2476,7 +2595,7 @@ impl AutoshopApp {
                                     Variant {
                                         kind: VariantKind::Generated,
                                         recipe: EditRecipe::default(),
-                                        base: Some(img),
+                                        base: Some(Arc::new(img)),
                                         origin: Some(saved),
                                         thumb: None,
                                     },
@@ -2491,6 +2610,7 @@ impl AutoshopApp {
                                 // full-res artifact, so export / reverse-fit / a
                                 // further retouch all follow the retouched pixels
                                 // rather than the pre-retouch source (WYSIWYG).
+                                let img = Arc::new(img);
                                 let (mw, mh) = img.dimensions();
                                 if let Some(v) = self.variants.get_mut(self.active) {
                                     v.base = Some(img.clone());
@@ -3187,8 +3307,14 @@ impl AutoshopApp {
                         self.overlay_stale = true;
                         changed = true;
                     }
-                    let m = &mut self.recipe.masks[i];
-                    ui.checkbox(&mut m.inverted, "反转");
+                    // Inversion flips the mask's coverage — its Response.changed()
+                    // must drive the develop + overlay like every other mask
+                    // control (was silently discarded: the toggle mutated the
+                    // recipe but never re-rendered until an unrelated edit).
+                    if ui.checkbox(&mut self.recipe.masks[i].inverted, "反转").changed() {
+                        self.overlay_stale = true;
+                        changed = true;
+                    }
                 });
                 // --- Range Mask（LR 范围蒙版）: refines WHERE the geometry applies —
                 // final weight = geometry × range, live in preview + export + XMP.
@@ -5132,32 +5258,19 @@ impl eframe::App for AutoshopApp {
         });
 
         // Re-develop AFTER the controls are read (so this frame reflects edits).
-        // Mid-drag the develop is COALESCED: egui repaints every frame during a
-        // slider drag, and a synchronous full-image develop per frame freezes
-        // the UI at 2560/4096 preview (100-300 ms/tick measured — the loop runs
-        // at develop speed). Cadence adapts to the measured develop cost — a
-        // fast 1280 preview stays effectively unthrottled (~1.5 frames), a slow
-        // one develops at ~40% duty cycle so the pointer keeps tracking.
-        // `dirty` persists until a develop runs, and the release frame is
-        // !dragging → develops immediately, BEFORE commit_if_settled — the
-        // final state is never stale.
-        if self.dirty {
-            let dragging = ctx.input(|i| i.pointer.any_down());
-            let interval = (self.dev_cost.mul_f32(1.5))
-                .clamp(Duration::from_millis(33), Duration::from_millis(500));
-            let due = self.last_dev.is_none_or(|t| t.elapsed() >= interval);
-            if !dragging || due {
-                let t0 = Instant::now();
-                self.redevelop(ctx); // clears self.dirty
-                self.dev_cost = t0.elapsed().max(Duration::from_millis(1));
-                self.last_dev = Some(t0);
-            } else {
-                // The pointer may be held still — without a scheduled repaint
-                // the due develop would wait for the next input event.
-                ctx.request_repaint_after(
-                    interval.saturating_sub(self.last_dev.map_or(Duration::ZERO, |t| t.elapsed())),
-                );
-            }
+        // The preview build runs on a SINGLE background worker (latest wins), so
+        // egui's update loop never blocks on it — the old synchronous path froze
+        // the UI for the whole develop (100-300 ms at 2560/4096, and 0.6-1.2 s
+        // once a v0.8 zoned colour mask was present). While a frame is in flight,
+        // further edits only set `dirty`; the completion handler discards a stale
+        // frame and this block re-dispatches the newest recipe next tick, so
+        // fast drags coalesce to the worker's throughput without a render storm.
+        // A held-still pointer still needs a repaint to receive the result.
+        if self.dirty && !self.develop_inflight {
+            self.start_redevelop();
+        }
+        if self.develop_inflight {
+            ctx.request_repaint();
         }
         // The mask coverage overlay follows develop / selection / toggle /
         // hover (a changed hover target includes "left the list entirely").
@@ -5564,6 +5677,108 @@ mod tests {
         for ch in 0..4 {
             assert_eq!(curve_points(&r, ch).len(), if ch == 0 { 3 } else { 0 });
         }
+    }
+
+    /// A tiny synthetic base + a bitmap mask on disk, for the async-develop and
+    /// overlay regression tests. Returns (app, mask_path) — caller cleans up.
+    fn app_with_masked_photo(tag: &str) -> (AutoshopApp, std::path::PathBuf) {
+        let (w, h) = (24u32, 16u32);
+        let base = Arc::new(image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+            w,
+            h,
+            |x, y| image::Rgb([(x * 8 % 256) as u8, (y * 12 % 256) as u8, 120]),
+        )));
+        std::fs::create_dir_all("out").ok();
+        let mask_path = std::path::PathBuf::from(format!("out/_gui_perf_{tag}.png"));
+        image::GrayImage::from_fn(w, h, |x, _| image::Luma([if x < w / 2 { 255 } else { 0 }]))
+            .save(&mask_path)
+            .unwrap();
+        let recipe = EditRecipe {
+            masks: vec![autoshop::recipe::LocalAdjustment {
+                mask: MaskGeometry::Bitmap { path: mask_path.to_string_lossy().into_owned() },
+                exposure_ev: 0.4,
+                color_gains: Some([1.2, 0.95, 0.7]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let app = AutoshopApp {
+            source_preview: Some(base.clone()),
+            base_preview: Some(base),
+            variants: vec![Variant {
+                kind: VariantKind::Original,
+                recipe: EditRecipe::default(),
+                base: None,
+                origin: None,
+                thumb: None,
+            }],
+            recipe,
+            sel_mask: Some(0),
+            ..AutoshopApp::default()
+        };
+        (app, mask_path)
+    }
+
+    #[test]
+    fn async_develop_discards_stale_frames_latest_wins() {
+        // The whole point of the async scheduler: a frame built for an OLD
+        // recipe must be dropped when the live recipe has moved on, and an
+        // in-flight guard must prevent a second dispatch. Drives the pure
+        // pieces (build_preview + finish_redevelop) with a headless egui ctx —
+        // never run_native.
+        let (mut app, mask_path) = app_with_masked_photo("latest");
+        let ctx = egui::Context::default();
+        let base = app.base_preview.clone().unwrap();
+
+        // A matching frame is accepted and bumps the counter + sets the texture.
+        let good = build_preview(base.clone(), app.recipe.clone(), false);
+        app.finish_redevelop(&ctx, Ok(good));
+        assert_eq!(app.develop_count, 1, "matching frame accepted");
+        assert!(app.after_tex.is_some(), "after texture set");
+        assert!(!app.develop_inflight, "inflight cleared on completion");
+
+        // Build a frame for the CURRENT recipe, then move the recipe on before
+        // it "arrives": the stale frame must be discarded (counter unchanged).
+        let stale = build_preview(base, app.recipe.clone(), false);
+        app.recipe.masks[0].exposure_ev = 1.9; // user kept dragging
+        app.finish_redevelop(&ctx, Ok(stale));
+        assert_eq!(app.develop_count, 1, "stale frame (recipe moved) discarded");
+
+        std::fs::remove_file(&mask_path).ok();
+    }
+
+    #[test]
+    fn overlay_skips_rebuild_for_local_effect_sliders() {
+        // The coverage-aware key: dragging a mask's Exposure/Temp/color_gains
+        // changes WHAT it does, not WHERE — so the full-frame coverage raster
+        // must NOT rebuild. Geometry / amount / inversion MUST rebuild.
+        let (mut app, mask_path) = app_with_masked_photo("overlay");
+        let ctx = egui::Context::default();
+
+        app.refresh_mask_overlay(&ctx);
+        assert_eq!(app.overlay_build_count, 1, "first coverage build");
+        assert!(app.mask_overlay_tex.is_some());
+
+        // Local effect sliders: no rebuild.
+        app.recipe.masks[0].exposure_ev = -2.0;
+        app.refresh_mask_overlay(&ctx);
+        app.recipe.masks[0].temperature = 55.0;
+        app.refresh_mask_overlay(&ctx);
+        app.recipe.masks[0].color_gains = Some([1.6, 0.8, 0.5]);
+        app.refresh_mask_overlay(&ctx);
+        assert_eq!(app.overlay_build_count, 1, "local effect sliders must not rebuild coverage");
+
+        // Amount is coverage-relevant: rebuild.
+        app.recipe.masks[0].amount = 0.5;
+        app.refresh_mask_overlay(&ctx);
+        assert_eq!(app.overlay_build_count, 2, "amount change rebuilds coverage");
+
+        // Inversion is coverage-relevant: rebuild.
+        app.recipe.masks[0].inverted = true;
+        app.refresh_mask_overlay(&ctx);
+        assert_eq!(app.overlay_build_count, 3, "inversion rebuilds coverage");
+
+        std::fs::remove_file(&mask_path).ok();
     }
 
     #[test]
