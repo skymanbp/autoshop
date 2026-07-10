@@ -3,14 +3,37 @@
 > 交接文档：每项都附实现要点与 `file:line` 锚点，供新会话不重读全库即可
 > 开工。更新于 2026-07-10（**v0.8.0 已发布**：tag `v0.8.0` → `1c1ea36`，
 > "Autoshop v0.8.0 — zoned reverse-fit (sky/land) + engine local WB"，双 exe
-> 资产字节核对 gui 33304506 / cli 25937114，标记 Latest；origin == local，
-> 内容 = 反馈批次 #2-A `7471d35` + #2-B 全套 6 提交
-> `d58ca60`/`9c55e24`/`a5173b2`/`b78daeb`/`09172f2`/`6ab3808`；真机对 v4
-> 已目视+数值验收，待用户 GUI 复测；反馈驱动阶段——用户试用 → 报障/提需
-> → 修复/打磨 → 发布）。
+> 资产字节核对 gui 33304506 / cli 25937114，标记 Latest；其后**性能批次
+> #2-C 本地 2 提交未推送** `759c9ca`/`c1e8b8d`；反馈驱动阶段——用户试用 →
+> 报障/提需 → 修复/打磨 → 发布）。
 
 ## 当前状态（已完成，勿重做）
 
+- **性能批次 #2-C：预览卡顿根治（2026-07-10，本地 2 提交未推送）**——用户报
+  "处理图片时会有些卡"。多代理只读剖析 + 无头基准定位两层根因，各根修：
+  1. **色偏增益 LUT 化（`759c9ca`，render.rs）**：v0.8 分区蒙版的
+     `color_gains` 在 apply_wb / apply_masks 里逐像素逐通道跑两次
+     sRGB↔线性 `powf`——1280×853 生产型基准实测单天空蒙版 613ms/帧、
+     天空+地景对 1208ms（同蒙版去掉色偏仅 53/92ms，证明幂运算占 ~90%）。
+     根修：把精确线性光增益编成每通道 4096 项 LUT（复用色调阶段同款采样器），
+     单蒙版降到 81ms、对降到 149ms，且 8-bit 预览**逐字节不变**（基准校验和
+     不变；LUT 插值误差 <1.5e-5 < 1/255 量化，`colour_gain_lut_matches_the_
+     exact_linear_light_formula` 钉死）。附 `preview_mask_perf_probe`
+     (#[ignore] release-only 机器相对基准，带校验和防"跳步取胜")。
+  2. **预览异步 latest-wins（`c1e8b8d`，gui.rs）**：display 原来同步跑在
+     egui `update()` 里，整帧构建把 UI 冻住（2560/4096 100-300ms，带 v0.8
+     色偏蒙版 0.6-1.2s）。改单后台 worker：`build_preview` 引擎显影+几何+
+     单次 rgb8 转换（喂直方图/削波/缩略图）离开 UI 线程；完成回调丢弃
+     (base,recipe) 已变的陈旧帧，快拖自动合并到 worker 吞吐、指针 60fps 不卡。
+     Arc 共享 base 像素（派发 O(1) 非 50MB 深拷贝）、纹理 `TextureHandle::set`
+     原地更新（不再每 tick 新建纹理管理项）、蒙版 overlay coverage-aware key
+     （局部效果滑杆改"做什么"不改"作用范围"→不重建整帧覆盖栅格；纯几何蒙版
+     不再跑第二次 masks-cleared 显影，仅范围蒙版保留）。顺带修复：蒙版"反转"
+     复选框 `Response.changed()` 被丢弃（切换只改配方不重渲染）。无头测试
+     `async_develop_discards_stale_frames_latest_wins` +
+     `overlay_skips_rebuild_for_local_effect_sliders`（egui::Context::default，
+     不 run_native）。基线 **97 lib + 7 gui**，clippy(gui) 零警告，双 exe 重建。
+     待用户 GUI 真机复测手感（尤其 2560/4096 拖滑杆、带天空/地景双蒙版反推）。
 - **反馈批次 #2-B：语义分区反推（2026-07-09/10 夜，随 v0.8.0 发布）**
   ——跨"区域性观感 vs 全局滑杆"表达力鸿沟的正路，全程 fail-first +
   真机对（_DSC9621 × reimagine-5）驱动迭代 4 轮渲染目视：
