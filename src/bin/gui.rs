@@ -20,8 +20,17 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui::load::SizedTexture;
 
+// NOTE: `MaskRole` is addressed only by method here (`m.role.en_name()` in the
+// mask row), never named as a type, so it is intentionally NOT imported — the
+// enum lives in recipe.rs and is set by the engine, not constructed in the GUI.
 use autoshop::recipe::{ColorGrade, CurvePoint, EditRecipe, Hsl, MaskGeometry, RangeMask};
 use image::GenericImageView;
+
+// Native-GUI i18n: English is the skeleton/key, Chinese is a single overlay
+// table with English fallback. `tr`/`trf` are called with the English literal;
+// see i18n.rs. (Private submodule — enabled by `autobins = false` in Cargo.toml.)
+mod i18n;
+use i18n::{tr, trf, Lang};
 
 /// How the preview area is laid out. `AfterOnly` gives the edit the whole
 /// canvas (hold **B** to flash the source in place — the Lightroom gesture);
@@ -74,6 +83,7 @@ struct Prefs {
     exp_space: u8,
     preview_edge: u32,
     show_clipping: bool,
+    lang: Lang,
 }
 
 impl Default for Prefs {
@@ -95,6 +105,7 @@ impl Default for Prefs {
             exp_space: 0,
             preview_edge: PREVIEW_EDGE,
             show_clipping: false,
+            lang: Lang::En, // English is the default / skeleton language
         }
     }
 }
@@ -269,7 +280,7 @@ fn photo_file_dialog() -> Option<PathBuf> {
 /// Visualise a mask geometry on the image: linear = the zero→full vector with
 /// end bars (solid = full-effect side); radial = the ellipse outline. Clipped
 /// to the image rect by the painter.
-fn draw_mask_overlay(ui: &egui::Ui, xf: ViewXform, geom: &MaskGeometry) {
+fn draw_mask_overlay(ui: &egui::Ui, xf: ViewXform, geom: &MaskGeometry, lang: Lang) {
     let p = ui.painter_at(xf.rect);
     let stroke = egui::Stroke::new(2.0, ACCENT);
     match geom {
@@ -299,7 +310,7 @@ fn draw_mask_overlay(ui: &egui::Ui, xf: ViewXform, geom: &MaskGeometry) {
             p.text(
                 xf.rect.left_top() + egui::vec2(10.0, 10.0),
                 egui::Align2::LEFT_TOP,
-                "▨ 位图蒙版",
+                tr(lang, "▨ Bitmap mask"),
                 egui::FontId::proportional(14.0),
                 ACCENT,
             );
@@ -357,11 +368,13 @@ fn section_title(base: &str, active: bool) -> String {
 
 /// Curve-editor channels: label + draw colour, indexed by `curve_channel`
 /// (0 = master, then R/G/B — the recipe's tone/red/green/blue_curve fields).
+// Tone-curve channel picker labels — skeleton keys, localized with `tr` at the
+// render site (curve_editor). Colours are the on-curve accent, not localized.
 const CURVE_CHANNELS: [(&str, egui::Color32); 4] = [
-    ("主", egui::Color32::from_gray(225)),
-    ("红", egui::Color32::from_rgb(235, 90, 90)),
-    ("绿", egui::Color32::from_rgb(90, 205, 90)),
-    ("蓝", egui::Color32::from_rgb(90, 130, 240)),
+    ("Master", egui::Color32::from_gray(225)),
+    ("Red", egui::Color32::from_rgb(235, 90, 90)),
+    ("Green", egui::Color32::from_rgb(90, 205, 90)),
+    ("Blue", egui::Color32::from_rgb(90, 130, 240)),
 ];
 
 /// The recipe field behind a curve-editor channel index.
@@ -528,8 +541,8 @@ fn same_base(a: &str, b: &str) -> bool {
 
 /// A model picker: a dropdown of `options` that writes the chosen id into `value`,
 /// next to a text field so any custom id can still be typed. Both edit `value`.
-fn model_picker(ui: &mut egui::Ui, salt: &str, value: &mut String, options: &[String]) {
-    let sel = if value.trim().is_empty() { "选择… / pick".to_owned() } else { value.clone() };
+fn model_picker(ui: &mut egui::Ui, salt: &str, value: &mut String, options: &[String], lang: Lang) {
+    let sel = if value.trim().is_empty() { tr(lang, "Select…").to_owned() } else { value.clone() };
     egui::ComboBox::from_id_salt(salt)
         .selected_text(sel)
         .width(200.0)
@@ -582,6 +595,7 @@ struct AutoshopApp {
     show_settings: bool,    // the Settings window is open
     show_shortcuts: bool,   // the keyboard cheat-sheet window is open (F1 / ? / ⌨)
     settings: SettingsForm, // editable buffers for that window
+    lang: Lang,             // UI language: English skeleton / Chinese overlay (i18n.rs)
     // --- library / gallery ---
     gallery: Vec<PathBuf>,          // sources in the working folder (sorted)
     gallery_dir: Option<PathBuf>,   // the working folder
@@ -700,12 +714,12 @@ enum VariantKind {
 }
 
 impl VariantKind {
-    /// Strip label (icon + name).
+    /// Strip label (icon + English key; localised via `tr` at the render site).
     fn label(self) -> &'static str {
         match self {
-            VariantKind::Original => "▣ 原片",
-            VariantKind::Generated => "✨ AI 生成",
-            VariantKind::Fitted => "◭ 反推",
+            VariantKind::Original => "▣ Original",
+            VariantKind::Generated => "✨ AI generated",
+            VariantKind::Fitted => "◭ Reverse-fit",
         }
     }
 }
@@ -719,9 +733,12 @@ enum MaskKind {
 
 /// Crop aspect presets. `None` = free; `Some(r)` = width/height in PIXELS
 /// (0.0 is the "original" sentinel, resolved against the photo at drag time).
+// Display names are English skeleton keys (localised via `tr` at the render
+// site); the ratio values are language-neutral. "1:1"…"9:16" have no ZH entry
+// and fall back to themselves in both languages.
 const CROP_ASPECTS: [(&str, Option<f32>); 7] = [
-    ("自由", None),
-    ("原始", Some(0.0)),
+    ("Free", None),
+    ("Original", Some(0.0)),
     ("1:1", Some(1.0)),
     ("3:2", Some(1.5)),
     ("2:3", Some(2.0 / 3.0)),
@@ -790,6 +807,9 @@ impl Default for AutoshopApp {
             show_settings: false,
             show_shortcuts: false,
             settings: SettingsForm::default(),
+            // English is the default / skeleton language; a persisted pref
+            // (restored in `new`) overrides this on launch.
+            lang: Lang::En,
             gallery: Vec::new(),
             gallery_dir: None,
             gallery_gen: 0,
@@ -873,6 +893,9 @@ impl AutoshopApp {
             app.exp_sharpen = prefs.exp_sharpen.clamp(0.0, 100.0);
             app.exp_quality = prefs.exp_quality.clamp(1.0, 100.0);
             app.show_clipping = prefs.show_clipping;
+            // Restore the UI language (an older save without this key decoded to
+            // `Lang::En` via `#[serde(default)]`, so this is always valid).
+            app.lang = prefs.lang;
             // Only known color spaces — an out-of-range pref falls back to sRGB.
             if prefs.exp_space <= 2 {
                 app.exp_space = prefs.exp_space;
@@ -1051,9 +1074,10 @@ impl AutoshopApp {
         if self.busy {
             return;
         }
+        let lang = self.lang;
         self.busy = true;
         self.src_path = Some(path.clone());
-        self.status = format!("decoding {} …", path.display());
+        self.status = trf(lang, "decoding {path} …", &[("path", &path.display().to_string())]);
         // Working-preview size is a user choice now (gap batch E): 1280 keeps
         // sliders fluid; 2560/4096 trade tick latency for real 1:1 detail when
         // checking focus / noise.
@@ -1177,9 +1201,12 @@ impl AutoshopApp {
         }
         self.active = idx;
         self.load_active(ctx);
-        self.status = format!(
-            "已切到「{}」变体 — 各版本独立，切换无损",
-            self.variants[self.active].kind.label()
+        let lang = self.lang;
+        let name = tr(lang, self.variants[self.active].kind.label());
+        self.status = trf(
+            lang,
+            "Switched to variant「{name}」 — variants are independent, switching is lossless",
+            &[("name", name)],
         );
     }
 
@@ -1248,19 +1275,25 @@ impl AutoshopApp {
 
     /// Save the CURRENT develop as the next numbered version snapshot.
     fn save_version(&mut self) {
+        let lang = self.lang;
         let Some(src) = self.src_path.clone() else { return };
         let n = self.versions.last().map_or(1, |m| m + 1);
         match autoshop::pipeline::write_recipe(&src, &self.recipe, Some(Self::version_path(&src, n))) {
             Ok(p) => {
                 self.refresh_versions();
-                self.status = format!("版本 v{n} 已存 → {}", p.display());
+                self.status = trf(
+                    lang,
+                    "Version v{n} saved → {path}",
+                    &[("n", &n.to_string()), ("path", &p.display().to_string())],
+                );
             }
-            Err(e) => self.status = format!("存版本失败: {e}"),
+            Err(e) => self.status = trf(lang, "Save version failed: {err}", &[("err", &e.to_string())]),
         }
     }
 
     /// Load version `n` as the working recipe (one undo step, like AI Analyze).
     fn load_version(&mut self, n: u32) {
+        let lang = self.lang;
         let Some(src) = self.src_path.clone() else { return };
         let p = Self::version_path(&src, n);
         match std::fs::read_to_string(&p)
@@ -1272,9 +1305,9 @@ impl AutoshopApp {
                 self.recipe = r;
                 self.rationale = self.recipe.rationale.clone();
                 self.dirty = true;
-                self.status = format!("已载入版本 v{n} — Ctrl+Z 可回到载入前");
+                self.status = trf(lang, "Loaded version v{n} — Ctrl+Z returns to before the load", &[("n", &n.to_string())]);
             }
-            Err(e) => self.status = format!("载入 v{n} 失败: {e}"),
+            Err(e) => self.status = trf(lang, "Load v{n} failed: {err}", &[("n", &n.to_string()), ("err", &e.to_string())]),
         }
     }
 
@@ -1294,8 +1327,9 @@ impl AutoshopApp {
         if self.busy {
             return;
         }
+        let lang = self.lang;
         self.busy = true;
-        self.status = format!("scanning {} …", dir.display());
+        self.status = trf(lang, "scanning {path} …", &[("path", &dir.display().to_string())]);
         self.spawn_worker(
             move || {
                 let res = autoshop::pipeline::find_sources(&dir).map(|list| (dir, list));
@@ -1400,10 +1434,14 @@ impl AutoshopApp {
                 self.settings.image_api_key.clear();
                 self.settings.analysis_key_present = cur.analysis_api_key.is_some();
                 self.settings.image_key_present = cur.image_api_key.is_some();
-                self.settings.status = format!("saved → {}", p.display());
-                self.status = "settings saved — applies to the next Analyze".into();
+                self.settings.status =
+                    trf(self.lang, "saved → {path}", &[("path", &p.display().to_string())]);
+                self.status = tr(self.lang, "settings saved — applies to the next Analyze").into();
             }
-            Err(e) => self.settings.status = format!("save failed: {e}"),
+            Err(e) => {
+                self.settings.status =
+                    trf(self.lang, "save failed: {err}", &[("err", &e.to_string())])
+            }
         }
     }
 
@@ -1441,31 +1479,45 @@ impl AutoshopApp {
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
         let mut do_save = false;
         let mut do_fetch = false;
+        // `lang` is a Copy snapshot so `tr`/`trf` never borrow `self` — the
+        // `let f = &mut self.settings` block below holds a partial borrow of self.
+        let lang = self.lang;
         ui.label(
-            egui::RichText::new(
+            egui::RichText::new(tr(
+                lang,
                 "Saved to autoshop.local.json (gitignored, stays on this machine). Applies to the next Analyze.",
-            )
+            ))
             .weak()
             .small(),
         );
         ui.separator();
-        ui.heading("反推 / Reverse-fit");
-        ui.checkbox(&mut self.zoned_fit, "分区反推：天空 / Zoned fit (sky)").on_hover_text(
-            "反推时自动分割两侧天空，天空↔天空单独校色（曝光/重着色增益/饱和，位图蒙版）。\
-             蒙版由本机引擎渲染；LR sidecar 只携带全局部分。需要 python 分割依赖\
-             （transformers + torch）；不可用时自动退回纯全局反推并在理由里说明。",
-        );
+        ui.heading(tr(lang, "Language"));
+        // English is the skeleton; Chinese is an overlay. Switching takes effect
+        // next frame (every label re-reads `self.lang`), no restart/save needed.
+        // `from_id_salt` is egui 0.29's name for the old `from_id_source`.
+        egui::ComboBox::from_id_salt("lang_picker")
+            .selected_text(self.lang.label())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.lang, Lang::En, Lang::En.label());
+                ui.selectable_value(&mut self.lang, Lang::Zh, Lang::Zh.label());
+            });
+        ui.separator();
+        ui.heading(tr(lang, "Reverse-fit"));
+        ui.checkbox(&mut self.zoned_fit, tr(lang, "Zoned fit (sky)")).on_hover_text(tr(
+            lang,
+            "On reverse-fit, auto-split the sky on both sides and colour-correct sky↔sky separately (exposure / recolour gains / saturation, bitmap mask). Masks are rendered by the local engine; the LR sidecar carries only the global part. Needs the python segmentation deps (transformers + torch); falls back to pure global reverse-fit when unavailable, noting it in the rationale.",
+        ));
         {
             let f = &mut self.settings;
             ui.separator();
-            ui.heading("Analysis — the verifier");
+            ui.heading(tr(lang, "Analysis — the verifier"));
             ui.horizontal(|ui| {
-                ui.label("Provider");
+                ui.label(tr(lang, "Provider"));
                 ui.radio_value(&mut f.analysis_provider_api, false, "OAuth (Claude CLI)");
                 ui.radio_value(&mut f.analysis_provider_api, true, "API (OpenAI-compatible)");
             });
             ui.horizontal(|ui| {
-                ui.label("Model");
+                ui.label(tr(lang, "Model"));
                 // OAuth uses Claude CLI aliases; API uses the fetched OpenAI chat ids,
                 // but only when the analysis endpoint matches the one we fetched from
                 // (the image key/base) — otherwise those ids may not exist there.
@@ -1479,25 +1531,25 @@ impl AutoshopApp {
                 } else {
                     model_opts(&[], &["opus", "sonnet", "haiku"], &f.analysis_model)
                 };
-                model_picker(ui, "set_analysis_model", &mut f.analysis_model, &opts);
+                model_picker(ui, "set_analysis_model", &mut f.analysis_model, &opts, lang);
             });
             if f.analysis_provider_api {
                 ui.horizontal(|ui| {
-                    ui.label("Base URL");
+                    ui.label(tr(lang, "Base URL"));
                     ui.text_edit_singleline(&mut f.analysis_base_url);
                 });
                 ui.horizontal(|ui| {
-                    ui.label("API Key");
-                    let hint = if f.analysis_key_present { "key set — blank keeps it" } else { "no key set" };
+                    ui.label(tr(lang, "API Key"));
+                    let hint = if f.analysis_key_present { tr(lang, "key set — blank keeps it") } else { tr(lang, "no key set") };
                     ui.add(egui::TextEdit::singleline(&mut f.analysis_api_key).password(true).hint_text(hint));
                 });
             }
             ui.separator();
-            ui.heading("Image — the vision proposer + generative edits");
+            ui.heading(tr(lang, "Image — the vision proposer + generative edits"));
             ui.horizontal(|ui| {
-                ui.label("Provider");
+                ui.label(tr(lang, "Provider"));
                 ui.radio_value(&mut f.image_provider_oauth, false, "API (OpenAI-compatible)");
-                ui.radio_value(&mut f.image_provider_oauth, true, "OAuth (Codex 桥 / ChatGPT 订阅)");
+                ui.radio_value(&mut f.image_provider_oauth, true, tr(lang, "OAuth (Codex bridge / ChatGPT sub)"));
             });
             // Flipping into OAuth while the endpoint is still empty or the stock
             // OpenAI host means the field is wrong for a subscription bridge —
@@ -1510,41 +1562,38 @@ impl AutoshopApp {
                 }
             }
             ui.horizontal(|ui| {
-                let label = if f.fetching_models { "拉取中… / fetching…" } else { "🔄 拉取可用模型 / Fetch models" };
+                let label = if f.fetching_models { tr(lang, "fetching…") } else { tr(lang, "🔄 Fetch models") };
                 let clicked = ui
                     .add_enabled(!f.fetching_models, egui::Button::new(label))
-                    .on_hover_text(
-                        "List the models this endpoint serves (GET /models) so you can pick instead of \
-                         guess — and a live reachability check for the bridge/API. Uses the key/token \
-                         typed below, or the saved one if blank.",
-                    )
+                    .on_hover_text(tr(
+                        lang,
+                        "List the models this endpoint serves (GET /models) so you can pick instead of guess — and a live reachability check for the bridge/API. Uses the key/token typed below, or the saved one if blank.",
+                    ))
                     .clicked();
                 if clicked {
                     do_fetch = true;
                 }
                 if !f.chat_choices.is_empty() || !f.image_gen_choices.is_empty() {
+                    let cn = f.chat_choices.len().to_string();
+                    let im = f.image_gen_choices.len().to_string();
                     ui.label(
-                        egui::RichText::new(format!(
-                            "{} chat · {} image",
-                            f.chat_choices.len(),
-                            f.image_gen_choices.len()
-                        ))
-                        .weak()
-                        .small(),
+                        egui::RichText::new(trf(lang, "{chat} chat · {image} image", &[("chat", &cn), ("image", &im)]))
+                            .weak()
+                            .small(),
                     );
                 }
             });
             ui.horizontal(|ui| {
-                ui.label(if f.image_provider_oauth { "Bridge URL" } else { "Base URL" });
+                ui.label(if f.image_provider_oauth { tr(lang, "Bridge URL") } else { tr(lang, "Base URL") });
                 ui.text_edit_singleline(&mut f.image_base_url);
             });
             ui.horizontal(|ui| {
-                ui.label("Vision model");
+                ui.label(tr(lang, "Vision model"));
                 let opts = model_opts(&f.chat_choices, &["gpt-5.5", "gpt-4o"], &f.image_model);
-                model_picker(ui, "set_vision_model", &mut f.image_model, &opts);
+                model_picker(ui, "set_vision_model", &mut f.image_model, &opts, lang);
             });
             ui.horizontal(|ui| {
-                ui.label("Image-gen model");
+                ui.label(tr(lang, "Image-gen model"));
                 // OAuth (subscription) exposes gpt-image-2 first; API keys often
                 // still prefer gpt-image-1.5 for its input_fidelity lock.
                 let fallbacks: &[&str] = if f.image_provider_oauth {
@@ -1553,32 +1602,28 @@ impl AutoshopApp {
                     &["gpt-image-1.5", "gpt-image-2", "gpt-image-1", "gpt-image-1-mini", "chatgpt-image-latest"]
                 };
                 let opts = model_opts(&f.image_gen_choices, fallbacks, &f.image_gen_model);
-                model_picker(ui, "set_imagegen_model", &mut f.image_gen_model, &opts);
+                model_picker(ui, "set_imagegen_model", &mut f.image_gen_model, &opts, lang);
             });
             ui.horizontal(|ui| {
-                ui.label(if f.image_provider_oauth { "Gate token" } else { "API Key" });
+                ui.label(if f.image_provider_oauth { tr(lang, "Gate token") } else { tr(lang, "API Key") });
                 let hint = if f.image_key_present {
-                    "set — blank keeps it"
+                    tr(lang, "set — blank keeps it")
                 } else if f.image_provider_oauth {
-                    "the bridge's own api-keys token (loopback, not a cloud key)"
+                    tr(lang, "the bridge's own api-keys token (loopback, not a cloud key)")
                 } else {
-                    "no key set"
+                    tr(lang, "no key set")
                 };
                 ui.add(egui::TextEdit::singleline(&mut f.image_api_key).password(true).hint_text(hint));
             });
             let note = if f.image_provider_oauth {
-                "OAuth rides your ChatGPT subscription via the local Codex bridge — no OpenAI key. \
-                 Start the bridge first (else edits fail to connect). Generative output is capped at \
-                 ~1.5 MP by the subscription image tier; for full-resolution edits switch to API mode \
-                 with a real key."
+                tr(lang, "OAuth rides your ChatGPT subscription via the local Codex bridge — no OpenAI key. Start the bridge first (else edits fail to connect). Generative output is capped at ~1.5 MP by the subscription image tier; for full-resolution edits switch to API mode with a real key.")
             } else {
-                "Tip: gpt-image-1.5 keeps the photo most faithful (input_fidelity); newer models \
-                 like gpt-image-2 ignore that lock and edit more freely."
+                tr(lang, "Tip: gpt-image-1.5 keeps the photo most faithful (input_fidelity); newer models like gpt-image-2 ignore that lock and edit more freely.")
             };
             ui.label(egui::RichText::new(note).weak().small());
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("Save settings").clicked() {
+                if ui.button(tr(lang, "Save settings")).clicked() {
                     do_save = true;
                 }
                 if !f.status.is_empty() {
@@ -1652,7 +1697,7 @@ impl AutoshopApp {
             // Pure preview work has no ordinary error path; only a caught panic
             // lands here. Keep the last good frame and surface the failure.
             Err(e) => {
-                self.fail("preview develop failed", e);
+                self.fail(tr(self.lang, "preview develop failed"), e);
                 return;
             }
         };
@@ -1805,6 +1850,7 @@ impl AutoshopApp {
     /// The corner triangles are LR's clipping indicators: lit when the extreme
     /// bin holds pixels; clicking either toggles the on-image J overlay.
     fn histogram_ui(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
         let Some(hist) = &self.histogram else { return };
         let h = 72.0;
         let (rect, _) = ui.allocate_exact_size(
@@ -1873,16 +1919,24 @@ impl AutoshopApp {
         };
         let mut toggle = false;
         for (right, bins, what) in [
-            (false, &hist[0], "阴影死黑"),
-            (true, &hist[hist.len() - 1], "高光溢出"),
+            (false, &hist[0], "shadow crush"),
+            (true, &hist[hist.len() - 1], "highlight clip"),
         ] {
             let s = 10.0;
             let x0 = if right { rect.max.x - s - 4.0 } else { rect.min.x + 4.0 };
             let tri = egui::Rect::from_min_size(egui::pos2(x0, rect.min.y + 4.0), egui::vec2(s, s));
             let lit = tri_color(bins);
             let tip = match lit {
-                Some(_) => format!("{}：{} 通道 — 点击切换削波警告 (J)", what, chan_names(bins)),
-                None => format!("{}指示（干净）— 点击切换削波警告 (J)", what),
+                Some(_) => trf(
+                    lang,
+                    "{what}: {chan} channel(s) — click to toggle clipping warning (J)",
+                    &[("what", tr(lang, what)), ("chan", &chan_names(bins))],
+                ),
+                None => trf(
+                    lang,
+                    "{what} indicator (clean) — click to toggle clipping warning (J)",
+                    &[("what", tr(lang, what))],
+                ),
             };
             let resp = ui
                 .interact(tri, ui.id().with(("clip_tri", right)), egui::Sense::click())
@@ -1919,13 +1973,14 @@ impl AutoshopApp {
     /// increasing), dragging well outside the box deletes it — the Lightroom
     /// gestures. Returns true when the recipe changed this frame.
     fn curve_editor(&mut self, ui: &mut egui::Ui) -> bool {
+        let lang = self.lang;
         let mut changed = false;
         ui.horizontal(|ui| {
             for (i, (name, color)) in CURVE_CHANNELS.iter().enumerate() {
                 if ui
                     .selectable_label(
                         self.curve_channel == i,
-                        egui::RichText::new(*name).color(*color).small(),
+                        egui::RichText::new(tr(lang, name)).color(*color).small(),
                     )
                     .clicked()
                 {
@@ -1933,7 +1988,7 @@ impl AutoshopApp {
                     self.curve_drag = None;
                 }
             }
-            if ui.small_button("↺").on_hover_text("清空当前通道曲线").clicked() {
+            if ui.small_button("↺").on_hover_text(tr(lang, "Clear the current channel's curve")).clicked() {
                 let pts = curve_points_mut(&mut self.recipe, self.curve_channel);
                 if !pts.is_empty() {
                     pts.clear();
@@ -2068,9 +2123,12 @@ impl AutoshopApp {
         }
 
         ui.label(
-            egui::RichText::new("点击加点 · 拖动移点 · 拖出框外删点 — 预览/导出/XMP 同源生效")
-                .weak()
-                .small(),
+            egui::RichText::new(tr(
+                self.lang,
+                "Click to add a point · drag to move · drag outside the box to delete — preview / export / XMP all match",
+            ))
+            .weak()
+            .small(),
         );
         changed
     }
@@ -2080,11 +2138,12 @@ impl AutoshopApp {
         if self.busy {
             return;
         }
+        let lang = self.lang;
         self.busy = true;
         self.status = if self.refine {
-            "refining your current edit with AI…".into()
+            tr(lang, "refining your current edit with AI…").into()
         } else {
-            "analyzing with AI (GPT + Claude)…".into()
+            tr(lang, "analyzing with AI (GPT + Claude)…").into()
         };
         let style = self.style_strength;
         // Free-text direction ("warmer, moodier") steers the proposal; when
@@ -2148,11 +2207,16 @@ impl AutoshopApp {
         if self.busy {
             return;
         }
+        let lang = self.lang;
         self.busy = true;
         self.status = if self.save_denoise {
-            format!("rendering + AI denoise → {} … (GPU sidecar, can take minutes)", out.display())
+            trf(
+                lang,
+                "rendering + AI denoise → {path} … (GPU sidecar, can take minutes)",
+                &[("path", &out.display().to_string())],
+            )
         } else {
-            format!("rendering full-resolution → {} …", out.display())
+            trf(lang, "rendering full-resolution → {path} …", &[("path", &out.display().to_string())])
         };
         let recipe = self.recipe.clone();
         let denoise = self.save_denoise;
@@ -2183,10 +2247,19 @@ impl AutoshopApp {
         if self.busy {
             return;
         }
+        let lang = self.lang;
+        // Localise the display name ONCE here (self.lang is only reachable on the
+        // UI thread); the worker returns this string so the mask row / status show
+        // it directly without re-translating.
+        let disp = tr(lang, label).to_string();
         let Some(base) = self.base_preview.clone() else { return };
         let Some(src) = self.src_path.clone() else { return };
         self.busy = true;
-        self.status = format!("AI {label}分割中…（首次运行会自动下载模型，看控制台日志）");
+        self.status = trf(
+            lang,
+            "AI segmenting {what}… (first run auto-downloads the model — watch the console log)",
+            &[("what", &disp)],
+        );
         self.spawn_worker(
             move || {
                 let res = (|| -> anyhow::Result<(String, PathBuf)> {
@@ -2206,7 +2279,7 @@ impl AutoshopApp {
                     let run = autoshop::segment::segment_file(&opts, &tmp, &mask);
                     let _ = std::fs::remove_file(&tmp);
                     run?;
-                    Ok((label.to_string(), mask))
+                    Ok((disp, mask))
                 })();
                 Msg::Segmented(res)
             },
@@ -2250,8 +2323,13 @@ impl AutoshopApp {
         }
         let ext = if self.save_jpeg { "jpg" } else { "tif" };
         let export = self.export_opts();
+        let lang = self.lang; // localise the UI status AND the worker's result strings
         self.busy = true;
-        self.status = format!("批量渲染 {} 张 → ./out …", targets.len());
+        self.status = trf(
+            lang,
+            "Batch-rendering {n} photos → ./out …",
+            &[("n", &targets.len().to_string())],
+        );
         self.batch_progress = Some((0, targets.len())); // the top-bar progress bar
         // Interim BatchProgress ticks flow through this extra clone; the
         // TERMINAL Msg::Exported is owned by spawn_worker (panic-safe).
@@ -2282,9 +2360,20 @@ impl AutoshopApp {
                         let _ = tx.send(Msg::BatchProgress { done: okn + errs.len(), total });
                     }
                     if errs.is_empty() {
-                        Ok(format!("./out — 批量 {okn} 张完成"))
+                        Ok(trf(lang, "./out — batch {n} done", &[("n", &okn.to_string())]))
                     } else {
-                        anyhow::bail!("批量：{okn} 成功、{} 失败：{}", errs.len(), errs.join("; "))
+                        anyhow::bail!(
+                            "{}",
+                            trf(
+                                lang,
+                                "Batch: {ok} succeeded, {fail} failed: {detail}",
+                                &[
+                                    ("ok", &okn.to_string()),
+                                    ("fail", &errs.len().to_string()),
+                                    ("detail", &errs.join("; ")),
+                                ],
+                            )
+                        )
                     }
                 })();
                 Msg::Exported(res)
@@ -2304,18 +2393,25 @@ impl AutoshopApp {
     /// write — steer the user to 反推 (which produces a Fitted variant whose XMP
     /// IS the look). Always keyed to the original RAW `src_path`.
     fn save_xmp(&mut self) {
+        let lang = self.lang;
         if self.active_is_generated() {
-            self.status = "生成变体的观感在像素里，没有参数配方可导；先「反推配方」得到可导出的 XMP".into();
+            self.status = tr(
+                lang,
+                "A generated variant's look lives in its pixels — there's no parametric recipe to export; run 「Reverse-fit」 first to get an exportable XMP",
+            )
+            .into();
             return;
         }
         let Some(path) = self.src_path.clone() else { return };
         if !autoshop::decode::is_raw(&path) {
-            self.status = "XMP applies to RAW files only".into();
+            self.status = tr(lang, "XMP applies to RAW files only").into();
             return;
         }
         match autoshop::pipeline::write_xmp(&path, &self.recipe) {
-            Ok(p) => self.status = format!("XMP saved → {}", p.display()),
-            Err(e) => self.status = format!("XMP save failed: {e}"),
+            Ok(p) => {
+                self.status = trf(lang, "XMP saved → {path}", &[("path", &p.display().to_string())])
+            }
+            Err(e) => self.status = trf(lang, "XMP save failed: {err}", &[("err", &e.to_string())]),
         }
     }
 
@@ -2351,8 +2447,13 @@ impl AutoshopApp {
             self.recipe = recipe.clone();
             self.dirty = true;
         }
+        let lang = self.lang; // localise the UI status AND the worker's result strings
         self.busy = true;
-        self.status = format!("粘贴配方到 {} 张…", targets.len());
+        self.status = trf(
+            lang,
+            "Pasting recipe to {n} photos…",
+            &[("n", &targets.len().to_string())],
+        );
         self.spawn_worker(
             move || {
                 let res = (|| -> anyhow::Result<String> {
@@ -2378,9 +2479,24 @@ impl AutoshopApp {
                     // Any failure surfaces as an error toast WITH the success count —
                     // a partial failure must never read as a clean success.
                     if errs.is_empty() {
-                        Ok(format!("配方已粘贴到 {okn} 张（{xmpn} 个 XMP）→ ./out"))
+                        Ok(trf(
+                            lang,
+                            "Recipe pasted to {ok} photos ({xmp} XMP) → ./out",
+                            &[("ok", &okn.to_string()), ("xmp", &xmpn.to_string())],
+                        ))
                     } else {
-                        anyhow::bail!("{okn} 成功、{} 失败：{}", errs.len(), errs.join(" · "))
+                        anyhow::bail!(
+                            "{}",
+                            trf(
+                                lang,
+                                "{ok} succeeded, {fail} failed: {detail}",
+                                &[
+                                    ("ok", &okn.to_string()),
+                                    ("fail", &errs.len().to_string()),
+                                    ("detail", &errs.join(" · ")),
+                                ],
+                            )
+                        )
                     }
                 })();
                 Msg::Pasted(res)
@@ -2390,6 +2506,10 @@ impl AutoshopApp {
     }
 
     fn poll_workers(&mut self, ctx: &egui::Context) {
+        // UI-thread language for status/toast strings built here. Worker RESULT
+        // strings (msg / note / s / label) were already localised inside their
+        // spawn closures before the thread started, so they arrive ready to show.
+        let lang = self.lang;
         // Drain a bounded batch each frame so a burst of thumbnails doesn't take
         // one-per-frame to land (try_recv borrow is released before we mutate).
         for _ in 0..64 {
@@ -2429,7 +2549,11 @@ impl AutoshopApp {
                                 self.base_preview = Some(base);
                             }
                             self.dirty = true;
-                            self.status = format!("预览分辨率 {}px — 已重解码", self.preview_edge);
+                            self.status = trf(
+                                lang,
+                                "Preview resolution {px}px — re-decoded",
+                                &[("px", &self.preview_edge.to_string())],
+                            );
                         } else {
                             // Fresh open: a single Original variant, neutral
                             // recipe, all per-photo state reset.
@@ -2478,11 +2602,11 @@ impl AutoshopApp {
                             self.rationale.clear();
                             self.refresh_versions(); // version snapshots are per-photo
                             self.dirty = true; // render the (neutral) after
-                            self.status = "ready — adjust sliders or run AI Analyze".into();
+                            self.status = tr(lang, "ready — adjust sliders or run AI Analyze").into();
                         }
                     }
                     Err(e) => {
-                        self.fail("could not open", e);
+                        self.fail(tr(lang, "could not open"), e);
                         if !keep {
                             // A FRESH open failed: open_path already re-pointed
                             // src_path to the file that wouldn't decode, but the
@@ -2511,23 +2635,27 @@ impl AutoshopApp {
                         self.rationale = self.recipe.rationale.clone();
                         self.dirty = true;
                         self.busy = false;
-                        self.status = "AI develop applied".into();
+                        self.status = tr(lang, "AI develop applied").into();
                     }
                     Err(e) => {
-                        self.fail("analyze failed", e);
+                        self.fail(tr(lang, "analyze failed"), e);
                     }
                 },
                 Msg::Exported(Ok(p)) => {
                     self.batch_progress = None; // the bar belongs to ONE batch run
-                    self.done(format!("exported → {p}"));
+                    self.done(trf(lang, "exported → {path}", &[("path", p.as_str())]));
                 }
                 Msg::Exported(Err(e)) => {
                     self.batch_progress = None;
-                    self.fail("export failed", e);
+                    self.fail(tr(lang, "export failed"), e);
                 }
                 Msg::BatchProgress { done, total } => {
                     self.batch_progress = Some((done, total));
-                    self.status = format!("批量渲染 {done}/{total} → ./out …");
+                    self.status = trf(
+                        lang,
+                        "Batch-rendering {done}/{total} → ./out …",
+                        &[("done", &done.to_string()), ("total", &total.to_string())],
+                    );
                 }
                 Msg::Segmented(res) => match res {
                     Ok((label, path)) => {
@@ -2541,11 +2669,14 @@ impl AutoshopApp {
                         self.sel_mask = Some(self.recipe.masks.len() - 1);
                         self.dirty = true; // committed-snapshot makes this one undo step
                         self.busy = false;
-                        self.status =
-                            format!("AI「{label}」蒙版已加入 — 调它的滑杆（曝光/对比/饱和…）即刻生效");
+                        self.status = trf(
+                            lang,
+                            "AI「{what}」mask added — adjust its sliders (exposure / contrast / saturation…) to take effect",
+                            &[("what", &label)],
+                        );
                     }
                     Err(e) => {
-                        self.fail("AI 分割失败", e);
+                        self.fail(tr(lang, "AI segmentation failed"), e);
                     }
                 },
                 Msg::Folder(boxed) => match *boxed {
@@ -2560,10 +2691,14 @@ impl AutoshopApp {
                         self.selected = None;
                         self.multi_sel.clear(); // indices belong to the old folder
                         self.busy = false;
-                        self.status = format!("{n} photo{} — click a thumbnail to open", if n == 1 { "" } else { "s" });
+                        self.status = if n == 1 {
+                            tr(lang, "1 photo — click a thumbnail to open").to_string()
+                        } else {
+                            trf(lang, "{n} photos — click a thumbnail to open", &[("n", &n.to_string())])
+                        };
                     }
                     Err(e) => {
-                        self.fail("scan failed", e);
+                        self.fail(tr(lang, "scan failed"), e);
                     }
                 },
                 Msg::Thumb { generation, idx, img } => {
@@ -2634,7 +2769,7 @@ impl AutoshopApp {
                         self.done(msg);
                     }
                     Err(e) => {
-                        self.fail("retouch failed", e);
+                        self.fail(tr(lang, "retouch failed"), e);
                     }
                 },
                 Msg::Fitted(boxed) => match *boxed {
@@ -2657,22 +2792,22 @@ impl AutoshopApp {
                         self.done(note);
                     }
                     Err(e) => {
-                        self.fail("反推失败", e);
+                        self.fail(tr(lang, "Reverse-fit failed"), e);
                     }
                 },
                 Msg::Styled(boxed) => match *boxed {
                     Ok(prompt) => {
                         // Into the Direction box: ready to restyle OTHER photos.
                         self.guidance = prompt;
-                        self.done("风格提示词已提取 → 已填入 Direction（同时存 ./out/<stem>.style.txt）");
+                        self.done(tr(lang, "Style prompt extracted → filled into Direction (also saved ./out/<stem>.style.txt)"));
                     }
                     Err(e) => {
-                        self.fail("风格提取失败", e);
+                        self.fail(tr(lang, "Style extraction failed"), e);
                     }
                 },
                 Msg::Pasted(res) => match res {
                     Ok(s) => self.done(s),
-                    Err(e) => self.fail("批量粘贴", e),
+                    Err(e) => self.fail(tr(lang, "batch paste"), e),
                 },
                 Msg::Models(res) => match res {
                     Ok(ids) => {
@@ -2706,9 +2841,11 @@ impl AutoshopApp {
     }
 
     /// One labelled slider; double-click resets to `default` (the Lightroom
-    /// gesture). Returns true if the value changed this frame.
+    /// gesture). Returns true if the value changed this frame. Callers pass an
+    /// already-translated `label`; `lang` is only needed for the reset hover.
     fn slider(
         ui: &mut egui::Ui,
+        lang: Lang,
         label: &str,
         value: &mut f32,
         min: f32,
@@ -2717,7 +2854,7 @@ impl AutoshopApp {
     ) -> bool {
         let resp = ui
             .add(egui::Slider::new(value, min..=max).text(label))
-            .on_hover_text("双击归零 / double-click resets");
+            .on_hover_text(tr(lang, "double-click resets"));
         if resp.double_clicked() && *value != default {
             *value = default;
             return true;
@@ -2728,17 +2865,20 @@ impl AutoshopApp {
     /// Left-most panel: the working-folder thumbnail gallery. Only visible rows
     /// are laid out (show_rows) and only their thumbnails are queued to decode.
     fn gallery_panel(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
         ui.horizontal(|ui| {
-            ui.heading("图库 · Library");
-            if ui.button("Open folder…").clicked()
+            ui.heading(tr(lang, "Library"));
+            if ui.button(tr(lang, "Open folder…")).clicked()
                 && let Some(dir) = rfd::FileDialog::new().pick_folder()
             {
                 self.open_folder(dir);
             }
         });
         if let Some(d) = &self.gallery_dir {
+            let dir = d.display().to_string();
+            let cnt = self.gallery.len().to_string();
             ui.label(
-                egui::RichText::new(format!("{} · {} photos", d.display(), self.gallery.len()))
+                egui::RichText::new(trf(lang, "{dir} · {count} photos", &[("dir", &dir), ("count", &cnt)]))
                     .weak()
                     .small(),
             );
@@ -2748,47 +2888,49 @@ impl AutoshopApp {
         ui.horizontal(|ui| {
             ui.add_enabled_ui(self.src_path.is_some(), |ui| {
                 if ui
-                    .small_button("⎘ 复制配方")
-                    .on_hover_text("复制当前照片的全部 develop 参数")
+                    .small_button(tr(lang, "⎘ Copy recipe"))
+                    .on_hover_text(tr(lang, "Copy every develop setting from the current photo"))
                     .clicked()
                 {
                     self.copied = Some(self.recipe.clone());
-                    self.status = "配方已复制 — Ctrl+点击选多张，再「粘贴到选中」".into();
+                    self.status = tr(lang, "Recipe copied — Ctrl+click to pick several, then “Paste to selected”").to_string();
                 }
             });
             let n = self.multi_sel.len();
             ui.add_enabled_ui(self.copied.is_some() && n > 0 && !self.busy, |ui| {
+                let n_s = n.to_string();
                 if ui
-                    .small_button(format!("⇩ 粘贴到选中({n})"))
-                    .on_hover_text("对每张写 ./out 配方 JSON；RAW 同时写 XMP 边车。不动库文件、不渲染成品")
+                    .small_button(trf(lang, "⇩ Paste to selected ({n})", &[("n", &n_s)]))
+                    .on_hover_text(tr(lang, "Writes a ./out recipe JSON for each; RAW also gets an XMP sidecar. Leaves library files untouched, renders nothing."))
                     .clicked()
                 {
                     self.start_paste();
                 }
             });
             ui.add_enabled_ui(n > 0 && !self.busy, |ui| {
+                let n_s = n.to_string();
                 if ui
-                    .small_button(format!("🖼 渲染选中({n})"))
-                    .on_hover_text(
-                        "每张按它自己的 ./out 配方出图（没有配方则中性显影）→ \
-./out/<名>.developed.*，用当前格式/长边/锐化/质量；AI Denoise 不参与批量",
-                    )
+                    .small_button(trf(lang, "🖼 Render selected ({n})", &[("n", &n_s)]))
+                    .on_hover_text(tr(
+                        lang,
+                        "Each renders by its own ./out recipe (neutral develop if none) → ./out/<name>.developed.*, using the current format / long-edge / sharpening / quality; AI Denoise sits out the batch.",
+                    ))
                     .clicked()
                 {
                     self.start_batch_render();
                 }
             });
-            if n > 0 && ui.small_button("✕").on_hover_text("清除多选").clicked() {
+            if n > 0 && ui.small_button("✕").on_hover_text(tr(lang, "Clear selection")).clicked() {
                 self.multi_sel.clear();
             }
         });
         if self.copied.is_some() {
-            ui.checkbox(&mut self.paste_geometry, "粘贴时含裁剪/拉直")
-                .on_hover_text("默认不带几何 — 构图在照片间通常不可复用");
+            ui.checkbox(&mut self.paste_geometry, tr(lang, "Include crop / straighten when pasting"))
+                .on_hover_text(tr(lang, "Off by default — composition rarely transfers between photos"));
         }
         ui.separator();
         if self.gallery.is_empty() {
-            ui.label(egui::RichText::new("Open a folder to browse your photos here.").weak());
+            ui.label(egui::RichText::new(tr(lang, "Open a folder to browse your photos here.")).weak());
             return;
         }
 
@@ -2850,13 +2992,13 @@ impl AutoshopApp {
                                     let baked = !autoshop::decode::is_raw(path);
                                     ui.horizontal(|ui| {
                                         if is_multi {
-                                            ui.label(egui::RichText::new("✓ 选中").color(PILL).small());
+                                            ui.label(egui::RichText::new(tr(lang, "✓ selected")).color(PILL).small());
                                         }
                                         if baked {
                                             ui.label(egui::RichText::new("PNG/TIFF").color(PILL).small());
                                         }
                                         if edited {
-                                            ui.label(egui::RichText::new("● edited").color(PILL).small());
+                                            ui.label(egui::RichText::new(tr(lang, "● edited")).color(PILL).small());
                                         }
                                     });
                                 });
@@ -2892,8 +3034,9 @@ impl AutoshopApp {
     }
 
     fn develop_panel(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang; // Copy — never borrows self, safe inside egui closures.
         let mut changed = false;
-        ui.heading("显影 · Develop");
+        ui.heading(tr(lang, "Develop"));
         self.histogram_ui(ui);
         ui.add_space(4.0);
 
@@ -2916,22 +3059,22 @@ impl AutoshopApp {
             )
         };
 
-        egui::CollapsingHeader::new("色调 · Tone & WB")
+        egui::CollapsingHeader::new(tr(lang, "Tone & WB"))
             .id_salt("sec_tone")
             .default_open(true)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let mut custom_wb = self.recipe.temperature_k.is_some();
-                    if ui.checkbox(&mut custom_wb, "Custom white balance (off = as-shot)").changed() {
+                    if ui.checkbox(&mut custom_wb, tr(lang, "Custom white balance (off = as-shot)")).changed() {
                         self.recipe.temperature_k = if custom_wb { Some(5500.0) } else { None };
                         changed = true;
                     }
-                    let label = if self.wb_picking { "💧 点击图中…" } else { "💧 吸管" };
+                    let label = if self.wb_picking { tr(lang, "💧 Click in image…") } else { tr(lang, "💧 Eyedropper") };
                     if ui
                         .small_button(label)
-                        .on_hover_text(
-                            "点击图上应为中性灰/白的位置，自动反解 Temp/Tint（与引擎同一正向模型）。再点一次取消",
-                        )
+                        .on_hover_text(tr(lang,
+                            "Click a spot in the image that should be neutral grey/white to auto-solve Temp/Tint (same forward model as the engine). Click again to cancel.",
+                        ))
                         .clicked()
                     {
                         self.wb_picking = !self.wb_picking;
@@ -2942,94 +3085,94 @@ impl AutoshopApp {
                             self.placing_mask = None;
                             self.range_picking = None;
                             self.clone_mode = false;
-                            self.status = "WB 吸管：点击图中应为中性灰/白的位置".into();
+                            self.status = tr(lang, "WB eyedropper: click a spot that should be neutral grey/white").into();
                         }
                     }
                 });
                 if let Some(mut k) = self.recipe.temperature_k
-                    && Self::slider(ui, "Temp (K)", &mut k, 2000.0, 40000.0, 5500.0)
+                    && Self::slider(ui, lang, tr(lang, "Temp (K)"), &mut k, 2000.0, 40000.0, 5500.0)
                 {
                     self.recipe.temperature_k = Some(k);
                     changed = true;
                 }
                 let r = &mut self.recipe;
-                changed |= Self::slider(ui, "Tint", &mut r.tint, -100.0, 100.0, 0.0);
-                changed |= Self::slider(ui, "Exposure", &mut r.exposure_ev, -5.0, 5.0, 0.0);
-                changed |= Self::slider(ui, "Contrast", &mut r.contrast, -100.0, 100.0, 0.0);
-                changed |= Self::slider(ui, "Highlights", &mut r.highlights, -100.0, 100.0, 0.0);
-                changed |= Self::slider(ui, "Shadows", &mut r.shadows, -100.0, 100.0, 0.0);
-                changed |= Self::slider(ui, "Whites", &mut r.whites, -100.0, 100.0, 0.0);
-                changed |= Self::slider(ui, "Blacks", &mut r.blacks, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Tint"), &mut r.tint, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Exposure"), &mut r.exposure_ev, -5.0, 5.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Contrast"), &mut r.contrast, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Highlights"), &mut r.highlights, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Shadows"), &mut r.shadows, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Whites"), &mut r.whites, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Blacks"), &mut r.blacks, -100.0, 100.0, 0.0);
             });
 
         // --- 曲线: master + RGB tone curves (engine + XMP already apply them,
         // this is purely the editing surface — Lightroom's panel order) --------
-        egui::CollapsingHeader::new(section_title("曲线 · Curves", curves_active))
+        egui::CollapsingHeader::new(section_title(tr(lang, "Curves"), curves_active))
             .id_salt("sec_curves")
             .default_open(false)
             .show(ui, |ui| {
                 changed |= self.curve_editor(ui);
             });
 
-        egui::CollapsingHeader::new(section_title("质感 · Presence", presence_active))
+        egui::CollapsingHeader::new(section_title(tr(lang, "Presence"), presence_active))
             .id_salt("sec_presence")
             .default_open(true)
             .show(ui, |ui| {
                 let r = &mut self.recipe;
-                changed |= Self::slider(ui, "Clarity", &mut r.clarity, -100.0, 100.0, 0.0);
-                changed |= Self::slider(ui, "Dehaze", &mut r.dehaze, -100.0, 100.0, 0.0);
-                changed |= Self::slider(ui, "Vibrance", &mut r.vibrance, -100.0, 100.0, 0.0);
-                changed |= Self::slider(ui, "Saturation", &mut r.saturation, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Clarity"), &mut r.clarity, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Dehaze"), &mut r.dehaze, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Vibrance"), &mut r.vibrance, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Saturation"), &mut r.saturation, -100.0, 100.0, 0.0);
             });
 
-        egui::CollapsingHeader::new(section_title("细节 · Detail", detail_active))
+        egui::CollapsingHeader::new(section_title(tr(lang, "Detail"), detail_active))
             .id_salt("sec_detail")
             .default_open(false)
             .show(ui, |ui| {
                 let r = &mut self.recipe;
-                changed |= Self::slider(ui, "Sharpening", &mut r.sharpening, 0.0, 150.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Sharpening"), &mut r.sharpening, 0.0, 150.0, 0.0);
                 changed |=
-                    Self::slider(ui, "Noise Reduction", &mut r.noise_reduction, 0.0, 100.0, 0.0);
+                    Self::slider(ui, lang, tr(lang, "Noise Reduction"), &mut r.noise_reduction, 0.0, 100.0, 0.0);
             });
 
-        egui::CollapsingHeader::new(section_title("混色器 · Color Mixer (HSL)", hsl_active))
+        egui::CollapsingHeader::new(section_title(tr(lang, "Color Mixer (HSL)"), hsl_active))
             .id_salt("sec_hsl")
             .default_open(false)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     egui::ComboBox::from_id_salt("hsl_band")
-                        .selected_text(HSL_BANDS[self.hsl_band])
+                        .selected_text(tr(lang, HSL_BANDS[self.hsl_band]))
                         .show_ui(ui, |ui| {
                             for (i, name) in HSL_BANDS.iter().enumerate() {
-                                ui.selectable_value(&mut self.hsl_band, i, *name);
+                                ui.selectable_value(&mut self.hsl_band, i, tr(lang, name));
                             }
                         });
-                    if ui.small_button("↺ reset all").clicked() {
+                    if ui.small_button(tr(lang, "↺ reset all")).clicked() {
                         self.recipe.hsl = Hsl::default();
                         changed = true;
                     }
                 });
                 let b = self.hsl_band;
-                changed |= Self::slider(ui, "Hue", &mut self.recipe.hsl.hue[b], -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Hue"), &mut self.recipe.hsl.hue[b], -100.0, 100.0, 0.0);
                 changed |=
-                    Self::slider(ui, "Saturation", &mut self.recipe.hsl.saturation[b], -100.0, 100.0, 0.0);
+                    Self::slider(ui, lang, tr(lang, "Saturation"), &mut self.recipe.hsl.saturation[b], -100.0, 100.0, 0.0);
                 changed |=
-                    Self::slider(ui, "Luminance", &mut self.recipe.hsl.luminance[b], -100.0, 100.0, 0.0);
+                    Self::slider(ui, lang, tr(lang, "Luminance"), &mut self.recipe.hsl.luminance[b], -100.0, 100.0, 0.0);
             });
 
-        egui::CollapsingHeader::new(section_title("调色 · Color Grading", grade_active))
+        egui::CollapsingHeader::new(section_title(tr(lang, "Color Grading"), grade_active))
             .id_salt("sec_grade")
             .default_open(false)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     egui::ComboBox::from_id_salt("grade_region")
-                        .selected_text(GRADE_REGIONS[self.grade_region])
+                        .selected_text(tr(lang, GRADE_REGIONS[self.grade_region]))
                         .show_ui(ui, |ui| {
                             for (i, name) in GRADE_REGIONS.iter().enumerate() {
-                                ui.selectable_value(&mut self.grade_region, i, *name);
+                                ui.selectable_value(&mut self.grade_region, i, tr(lang, name));
                             }
                         });
-                    if ui.small_button("↺ reset all").clicked() {
+                    if ui.small_button(tr(lang, "↺ reset all")).clicked() {
                         self.recipe.color_grade = ColorGrade::default();
                         changed = true;
                     }
@@ -3042,9 +3185,9 @@ impl AutoshopApp {
                     _ => (cg.global_hue, cg.global_sat, cg.global_lum),
                 };
                 let mut wheel_changed = false;
-                wheel_changed |= Self::slider(ui, "Hue", &mut hue, 0.0, 360.0, 0.0);
-                wheel_changed |= Self::slider(ui, "Saturation", &mut sat, 0.0, 100.0, 0.0);
-                wheel_changed |= Self::slider(ui, "Luminance", &mut lum, -100.0, 100.0, 0.0);
+                wheel_changed |= Self::slider(ui, lang, tr(lang, "Hue"), &mut hue, 0.0, 360.0, 0.0);
+                wheel_changed |= Self::slider(ui, lang, tr(lang, "Saturation"), &mut sat, 0.0, 100.0, 0.0);
+                wheel_changed |= Self::slider(ui, lang, tr(lang, "Luminance"), &mut lum, -100.0, 100.0, 0.0);
                 if wheel_changed {
                     match self.grade_region {
                         0 => { cg.shadow_hue = hue; cg.shadow_sat = sat; cg.shadow_lum = lum; }
@@ -3054,18 +3197,18 @@ impl AutoshopApp {
                     }
                     changed = true;
                 }
-                changed |= Self::slider(ui, "Blending", &mut cg.blending, 0.0, 100.0, 50.0);
-                changed |= Self::slider(ui, "Balance", &mut cg.balance, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Blending"), &mut cg.blending, 0.0, 100.0, 50.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Balance"), &mut cg.balance, -100.0, 100.0, 0.0);
             });
 
         // --- 裁剪 + 拉直: recipe.crop / straighten_deg (export + XMP paths) ---
         let crop_active = self.recipe.crop.is_some() || self.recipe.straighten_deg != 0.0;
-        egui::CollapsingHeader::new(section_title("裁剪 · Crop", crop_active))
+        egui::CollapsingHeader::new(section_title(tr(lang, "Crop"), crop_active))
             .id_salt("sec_crop")
             .default_open(false)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let label = if self.crop_mode { "✅ 完成" } else { "⛶ 进入裁剪" };
+                    let label = if self.crop_mode { tr(lang, "✅ Done") } else { tr(lang, "⛶ Enter crop") };
                     if ui.button(label).clicked() {
                         self.crop_mode = !self.crop_mode;
                         if self.crop_mode {
@@ -3078,14 +3221,14 @@ impl AutoshopApp {
                         }
                     }
                     egui::ComboBox::from_id_salt("crop_aspect")
-                        .selected_text(CROP_ASPECTS[self.crop_aspect].0)
+                        .selected_text(tr(lang, CROP_ASPECTS[self.crop_aspect].0))
                         .width(70.0)
                         .show_ui(ui, |ui| {
                             for (i, (name, _)) in CROP_ASPECTS.iter().enumerate() {
-                                ui.selectable_value(&mut self.crop_aspect, i, *name);
+                                ui.selectable_value(&mut self.crop_aspect, i, tr(lang, name));
                             }
                         });
-                    if ui.button("清除").clicked() {
+                    if ui.button(tr(lang, "Clear")).clicked() {
                         self.recipe.crop = None;
                     }
                 });
@@ -3093,16 +3236,17 @@ impl AutoshopApp {
                 // the preview shows exactly the export geometry.
                 changed |= Self::slider(
                     ui,
-                    "拉直 Straighten (°)",
+                    lang,
+                    tr(lang, "Straighten (°)"),
                     &mut self.recipe.straighten_deg,
                     -45.0,
                     45.0,
                     0.0,
                 );
                 ui.label(
-                    egui::RichText::new(
-                        "进入后在图上拖角柄/移动裁剪框；预览、导出与 XMP 一致生效。拉直自动裁掉黑角。",
-                    )
+                    egui::RichText::new(tr(lang,
+                        "Once in, drag the corner handles / move the crop box on the image; preview, export and XMP all match. Straighten auto-crops the black corners.",
+                    ))
                     .weak()
                     .small(),
                 );
@@ -3110,17 +3254,17 @@ impl AutoshopApp {
 
         // --- 镜头校正: manual lens corrections (gap batch C) ------------------
         let lens_active = self.recipe.lens_vignette != 0.0 || self.recipe.lens_distortion != 0.0;
-        egui::CollapsingHeader::new(section_title("镜头校正 · Lens", lens_active))
+        egui::CollapsingHeader::new(section_title(tr(lang, "Lens"), lens_active))
             .id_salt("sec_lens")
             .default_open(false)
             .show(ui, |ui| {
-                changed |= Self::slider(ui, "暗角补偿 Vignette", &mut self.recipe.lens_vignette, -100.0, 100.0, 0.0);
-                changed |= Self::slider(ui, "中点 Midpoint", &mut self.recipe.lens_vignette_mid, 0.0, 100.0, 50.0);
-                changed |= Self::slider(ui, "畸变校正 Distortion", &mut self.recipe.lens_distortion, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Vignette"), &mut self.recipe.lens_vignette, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Midpoint"), &mut self.recipe.lens_vignette_mid, 0.0, 100.0, 50.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Distortion"), &mut self.recipe.lens_distortion, -100.0, 100.0, 0.0);
                 ui.label(
-                    egui::RichText::new(
-                        "暗角：正值提亮四角（补偿失光），负值压暗；线性光域径向增益。畸变：正值修桶形（广角外凸），负值修枕形（长焦内凹）；自动缩放填满画面，蒙版/画笔在校正后的画面上照常定位。预览/导出/XMP 一致。去紫边后续批次。",
-                    )
+                    egui::RichText::new(tr(lang,
+                        "Vignette: positive brightens the corners (compensates falloff), negative darkens; a radial gain in linear light. Distortion: positive fixes barrel (wide-angle bulge), negative fixes pincushion (tele pinch); auto-scales to fill the frame, and masks / brush still position on the corrected image. Preview / export / XMP match. De-fringe in a later batch.",
+                    ))
                     .weak()
                     .small(),
                 );
@@ -3128,55 +3272,54 @@ impl AutoshopApp {
 
         // --- 局部调整: manual masks — the SAME recipe.masks the AI writes -----
         let n_masks = self.recipe.masks.len();
+        let n_masks_s = n_masks.to_string();
         egui::CollapsingHeader::new(section_title(
-            &format!("局部调整 · Local Masks ({n_masks})"),
+            &trf(lang, "Local Masks ({n})", &[("n", &n_masks_s)]),
             n_masks > 0,
         ))
         .id_salt("sec_local")
         .default_open(false)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("＋ 线性渐变").on_hover_text("在图上拖拽：起点=不受影响侧，终点=完全生效侧").clicked() {
+                if ui.button(tr(lang, "＋ Linear gradient")).on_hover_text(tr(lang, "Drag on the image: start = unaffected side, end = fully-applied side")).clicked() {
                     self.placing_mask = Some((MaskKind::Linear, None));
                     self.paint_mode = false;
                     self.crop_mode = false;
                     self.wb_picking = false;
                     self.range_picking = None;
                     self.clone_mode = false;
-                    self.status = "在图上拖拽画出线性渐变（起点不受影响 → 终点完全生效）".into();
+                    self.status = tr(lang, "Drag on the image to draw a linear gradient (start unaffected → end fully applied)").into();
                 }
-                if ui.button("＋ 径向").on_hover_text("在图上拖拽画出椭圆范围").clicked() {
+                if ui.button(tr(lang, "＋ Radial")).on_hover_text(tr(lang, "Drag on the image to draw an elliptical area")).clicked() {
                     self.placing_mask = Some((MaskKind::Radial, None));
                     self.paint_mode = false;
                     self.crop_mode = false;
                     self.wb_picking = false;
                     self.range_picking = None;
                     self.clone_mode = false;
-                    self.status = "在图上拖拽画出径向（椭圆）范围".into();
+                    self.status = tr(lang, "Drag on the image to draw a radial (elliptical) area").into();
                 }
             });
             // --- AI segmentation → bitmap masks (gap batch A②) ---------------
             ui.horizontal(|ui| {
                 let can_seg = !self.busy && self.base_preview.is_some();
                 if ui
-                    .add_enabled(can_seg, egui::Button::new("🤖 AI 选主体"))
-                    .on_hover_text(
-                        "U²-Net 显著主体分割 → 位图蒙版（python sidecar：pip install rembg，\
-                         首次运行自动下载模型到 ~/.u2net）",
-                    )
+                    .add_enabled(can_seg, egui::Button::new(tr(lang, "🤖 AI select subject")))
+                    .on_hover_text(tr(lang,
+                        "U²-Net salient-subject segmentation → bitmap mask (python sidecar: pip install rembg; first run auto-downloads the model to ~/.u2net)",
+                    ))
                     .clicked()
                 {
-                    self.start_segment("subject", "主体");
+                    self.start_segment("subject", "Subject");
                 }
                 if ui
-                    .add_enabled(can_seg, egui::Button::new("☁ AI 选天空"))
-                    .on_hover_text(
-                        "SegFormer-ADE20K 天空分割 → 位图蒙版（python sidecar：pip install \
-                         transformers，首次运行自动下载 ~14MB 模型）",
-                    )
+                    .add_enabled(can_seg, egui::Button::new(tr(lang, "☁ AI select sky")))
+                    .on_hover_text(tr(lang,
+                        "SegFormer-ADE20K sky segmentation → bitmap mask (python sidecar: pip install transformers; first run auto-downloads a ~14MB model)",
+                    ))
                     .clicked()
                 {
-                    self.start_segment("sky", "天空");
+                    self.start_segment("sky", "Sky");
                 }
             });
             // Mask list: click to select (shows overlay + sliders), 🗑 deletes;
@@ -3196,11 +3339,20 @@ impl AutoshopApp {
                 ui.horizontal(|ui| {
                     let m = &self.recipe.masks[i];
                     let kind = match m.mask {
-                        MaskGeometry::Linear { .. } => "线性",
-                        MaskGeometry::Radial { .. } => "径向",
-                        MaskGeometry::Bitmap { .. } => "位图",
+                        MaskGeometry::Linear { .. } => tr(self.lang, "Linear"),
+                        MaskGeometry::Radial { .. } => tr(self.lang, "Radial"),
+                        MaskGeometry::Bitmap { .. } => tr(self.lang, "Bitmap"),
                     };
-                    let label = format!("{} · {}", if m.name.is_empty() { "mask" } else { &m.name }, kind);
+                    // A user-given name wins; else a reverse-fit zone shows its
+                    // localised role label; else the generic placeholder.
+                    let base: &str = if !m.name.is_empty() {
+                        m.name.as_str()
+                    } else if let Some(en) = m.role.en_name() {
+                        tr(self.lang, en)
+                    } else {
+                        tr(self.lang, "mask")
+                    };
+                    let label = format!("{base} · {kind}");
                     let egui::InnerResponse { inner: row, response: drag } = ui
                         .dnd_drag_source(ui.id().with(("mask_row", i)), i, |ui| {
                             ui.selectable_label(self.sel_mask == Some(i), label)
@@ -3260,7 +3412,7 @@ impl AutoshopApp {
                 ui.separator();
                 ui.horizontal(|ui| {
                     let m = &mut self.recipe.masks[i];
-                    ui.add(egui::TextEdit::singleline(&mut m.name).desired_width(110.0).hint_text("名称"));
+                    ui.add(egui::TextEdit::singleline(&mut m.name).desired_width(110.0).hint_text(tr(lang, "Name")));
                     // Raster masks have no drag-to-place geometry — no 重画.
                     let kind = match m.mask {
                         MaskGeometry::Linear { .. } => Some(MaskKind::Linear),
@@ -3268,7 +3420,7 @@ impl AutoshopApp {
                         MaskGeometry::Bitmap { .. } => None,
                     };
                     if let Some(kind) = kind
-                        && ui.small_button("↻ 重画").on_hover_text("在图上重新拖拽这个 mask 的范围").clicked()
+                        && ui.small_button(tr(lang, "↻ Redraw")).on_hover_text(tr(lang, "Re-drag this mask's area on the image")).clicked()
                     {
                         self.placing_mask = Some((kind, Some(i)));
                         self.paint_mode = false;
@@ -3278,8 +3430,8 @@ impl AutoshopApp {
                         self.clone_mode = false;
                     }
                     if ui
-                        .checkbox(&mut self.show_mask_overlay, "叠加")
-                        .on_hover_text("红色半透明显示这个蒙版的实际作用范围（几何×范围×强度，快捷键 O）")
+                        .checkbox(&mut self.show_mask_overlay, tr(lang, "Overlay"))
+                        .on_hover_text(tr(lang, "Show this mask's actual coverage as a red semi-transparent overlay (geometry × range × strength, shortcut O)"))
                         .changed()
                     {
                         self.overlay_stale = true;
@@ -3289,7 +3441,7 @@ impl AutoshopApp {
                     // list order is editable, not just cosmetic.
                     if ui
                         .add_enabled(i > 0, egui::Button::new("⬆").small())
-                        .on_hover_text("上移（更早渲染）")
+                        .on_hover_text(tr(lang, "Move up (renders earlier)"))
                         .clicked()
                     {
                         self.recipe.masks.swap(i, i - 1);
@@ -3299,7 +3451,7 @@ impl AutoshopApp {
                     }
                     if ui
                         .add_enabled(i + 1 < self.recipe.masks.len(), egui::Button::new("⬇").small())
-                        .on_hover_text("下移（更晚渲染）")
+                        .on_hover_text(tr(lang, "Move down (renders later)"))
                         .clicked()
                     {
                         self.recipe.masks.swap(i, i + 1);
@@ -3311,7 +3463,7 @@ impl AutoshopApp {
                     // must drive the develop + overlay like every other mask
                     // control (was silently discarded: the toggle mutated the
                     // recipe but never re-rendered until an unrelated edit).
-                    if ui.checkbox(&mut self.recipe.masks[i].inverted, "反转").changed() {
+                    if ui.checkbox(&mut self.recipe.masks[i].inverted, tr(lang, "Invert")).changed() {
                         self.overlay_stale = true;
                         changed = true;
                     }
@@ -3326,14 +3478,14 @@ impl AutoshopApp {
                     };
                     let mut sel = cur;
                     ui.horizontal(|ui| {
-                        ui.label("范围蒙版");
+                        ui.label(tr(lang, "Range mask"));
                         egui::ComboBox::from_id_salt("range_kind")
-                            .selected_text(["无", "亮度", "颜色"][sel])
+                            .selected_text([tr(lang, "None"), tr(lang, "Luminance"), tr(lang, "Color")][sel])
                             .width(70.0)
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut sel, 0, "无");
-                                ui.selectable_value(&mut sel, 1, "亮度");
-                                ui.selectable_value(&mut sel, 2, "颜色");
+                                ui.selectable_value(&mut sel, 0, tr(lang, "None"));
+                                ui.selectable_value(&mut sel, 1, tr(lang, "Luminance"));
+                                ui.selectable_value(&mut sel, 2, tr(lang, "Color"));
                             });
                     });
                     if sel != cur {
@@ -3352,7 +3504,7 @@ impl AutoshopApp {
                             self.placing_mask = None;
                             self.wb_picking = false;
                             self.clone_mode = false;
-                            self.status = "颜色范围：点击图中要选取的颜色".into();
+                            self.status = tr(lang, "Colour range: click the colour to pick in the image").into();
                         }
                         changed = true;
                     }
@@ -3365,9 +3517,9 @@ impl AutoshopApp {
                             // their averaged feather until a slider is touched).
                             let mut f = ((*lo - *lo_outer) + (*hi_outer - *hi)) * 0.5;
                             let mut ch = false;
-                            ch |= Self::slider(ui, "亮度下限 Lo", lo, 0.0, 1.0, 0.0);
-                            ch |= Self::slider(ui, "亮度上限 Hi", hi, 0.0, 1.0, 1.0);
-                            ch |= Self::slider(ui, "羽化 Feather", &mut f, 0.0, 0.5, 0.1);
+                            ch |= Self::slider(ui, lang, tr(lang, "Lum. low"), lo, 0.0, 1.0, 0.0);
+                            ch |= Self::slider(ui, lang, tr(lang, "Lum. high"), hi, 0.0, 1.0, 1.0);
+                            ch |= Self::slider(ui, lang, tr(lang, "Feather"), &mut f, 0.0, 0.5, 0.1);
                             if ch {
                                 if *lo > *hi {
                                     std::mem::swap(lo, hi);
@@ -3384,12 +3536,12 @@ impl AutoshopApp {
                                     [*r, *g, *b] = [c[0], c[1], c[2]];
                                     changed = true;
                                 }
-                                let label = if picking_this { "🎯 点击图中…" } else { "🎯 取样" };
-                                if ui.small_button(label).on_hover_text("在图上点击要选取的颜色（亮暗不同的同色也会被选中）").clicked() {
+                                let label = if picking_this { tr(lang, "🎯 Click in image…") } else { tr(lang, "🎯 Sample") };
+                                if ui.small_button(label).on_hover_text(tr(lang, "Click the colour to pick in the image (the same colour at other brightnesses is also selected)")).clicked() {
                                     want_pick = true;
                                 }
                             });
-                            changed |= Self::slider(ui, "容差 Tolerance", amount, 0.0, 1.0, 0.5);
+                            changed |= Self::slider(ui, lang, tr(lang, "Tolerance"), amount, 0.0, 1.0, 0.5);
                         }
                         None => {}
                     }
@@ -3401,39 +3553,39 @@ impl AutoshopApp {
                             self.placing_mask = None;
                             self.wb_picking = false;
                             self.clone_mode = false;
-                            self.status = "颜色范围：点击图中要选取的颜色".into();
+                            self.status = tr(lang, "Colour range: click the colour to pick in the image").into();
                         }
                     }
                 }
                 let m = &mut self.recipe.masks[i];
-                changed |= Self::slider(ui, "Amount", &mut m.amount, 0.0, 1.0, 1.0);
-                changed |= Self::slider(ui, "Exposure", &mut m.exposure_ev, -5.0, 5.0, 0.0);
-                changed |= Self::slider(ui, "Contrast", &mut m.contrast, -100.0, 100.0, 0.0);
-                changed |= Self::slider(ui, "Highlights", &mut m.highlights, -100.0, 100.0, 0.0);
-                changed |= Self::slider(ui, "Shadows", &mut m.shadows, -100.0, 100.0, 0.0);
-                changed |= Self::slider(ui, "Whites", &mut m.whites, -100.0, 100.0, 0.0);
-                changed |= Self::slider(ui, "Blacks", &mut m.blacks, -100.0, 100.0, 0.0);
-                changed |= Self::slider(ui, "Saturation", &mut m.saturation, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Amount"), &mut m.amount, 0.0, 1.0, 1.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Exposure"), &mut m.exposure_ev, -5.0, 5.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Contrast"), &mut m.contrast, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Highlights"), &mut m.highlights, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Shadows"), &mut m.shadows, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Whites"), &mut m.whites, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Blacks"), &mut m.blacks, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Saturation"), &mut m.saturation, -100.0, 100.0, 0.0);
                 // Engine-rendered since batch #2-B (render.rs apply_masks
                 // mirrors the global WB model inside the mask) — live in the
                 // preview like the tone sliders above.
-                changed |= Self::slider(ui, "Temp", &mut m.temperature, -100.0, 100.0, 0.0);
-                changed |= Self::slider(ui, "Tint", &mut m.tint, -100.0, 100.0, 0.0);
-                changed |= Self::slider(ui, "Noise Red.", &mut m.noise_reduction, 0.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Temp"), &mut m.temperature, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Tint"), &mut m.tint, -100.0, 100.0, 0.0);
+                changed |= Self::slider(ui, lang, tr(lang, "Noise Red."), &mut m.noise_reduction, 0.0, 100.0, 0.0);
                 // These serialise to the XMP but the in-app preview doesn't
                 // render them yet (documented engine scope) — honest label.
-                egui::CollapsingHeader::new("更多 · More（仅 XMP/Lightroom 生效）")
+                egui::CollapsingHeader::new(tr(lang, "More (XMP/Lightroom only)"))
                     .id_salt("sec_local_xmp")
                     .default_open(false)
                     .show(ui, |ui| {
                         let m = &mut self.recipe.masks[i];
-                        changed |= Self::slider(ui, "Clarity", &mut m.clarity, -100.0, 100.0, 0.0);
-                        changed |= Self::slider(ui, "Dehaze", &mut m.dehaze, -100.0, 100.0, 0.0);
-                        changed |= Self::slider(ui, "Texture", &mut m.texture, -100.0, 100.0, 0.0);
+                        changed |= Self::slider(ui, lang, tr(lang, "Clarity"), &mut m.clarity, -100.0, 100.0, 0.0);
+                        changed |= Self::slider(ui, lang, tr(lang, "Dehaze"), &mut m.dehaze, -100.0, 100.0, 0.0);
+                        changed |= Self::slider(ui, lang, tr(lang, "Texture"), &mut m.texture, -100.0, 100.0, 0.0);
                     });
             } else if n_masks == 0 {
                 ui.label(
-                    egui::RichText::new("像 Lightroom 的局部调整：加一个渐变压暗天空、径向提亮主体。AI Analyze 也会写到同一列表。")
+                    egui::RichText::new(tr(lang, "Lightroom-style local adjustments: add a gradient to darken the sky, a radial to brighten the subject. AI Analyze also writes to this list."))
                         .weak()
                         .small(),
                 );
@@ -3442,13 +3594,14 @@ impl AutoshopApp {
 
         // --- 版本: recipe snapshots ≈ LR virtual copies (gap batch G) --------
         let n_ver = self.versions.len();
-        egui::CollapsingHeader::new(section_title(&format!("版本 · Versions ({n_ver})"), n_ver > 0))
+        let n_ver_s = n_ver.to_string();
+        egui::CollapsingHeader::new(section_title(&trf(lang, "Versions ({n})", &[("n", &n_ver_s)]), n_ver > 0))
             .id_salt("sec_versions")
             .default_open(false)
             .show(ui, |ui| {
                 if ui
-                    .button("＋ 存为版本")
-                    .on_hover_text("把当前全部 develop 参数存为一个编号快照（./out/<名>.v<N>.recipe.json），随时可回")
+                    .button(tr(lang, "＋ Save as version"))
+                    .on_hover_text(tr(lang, "Save all current develop parameters as a numbered snapshot (./out/<name>.v<N>.recipe.json), reloadable anytime"))
                     .clicked()
                 {
                     self.save_version();
@@ -3457,7 +3610,7 @@ impl AutoshopApp {
                 for &n in &self.versions {
                     ui.horizontal(|ui| {
                         ui.label(format!("v{n}"));
-                        if ui.small_button("载入").on_hover_text("替换当前参数（一步 Ctrl+Z 可撤销）").clicked() {
+                        if ui.small_button(tr(lang, "Load")).on_hover_text(tr(lang, "Replace current parameters (one Ctrl+Z to undo)")).clicked() {
                             load = Some(n);
                         }
                     });
@@ -3467,7 +3620,7 @@ impl AutoshopApp {
                 }
                 if n_ver == 0 {
                     ui.label(
-                        egui::RichText::new("像 LR 虚拟副本：一张照片存多套参数（黑白版/裁剪版…），互不覆盖。")
+                        egui::RichText::new(tr(lang, "Like LR virtual copies: store multiple parameter sets for one photo (B&W, cropped…) without overwriting."))
                             .weak()
                             .small(),
                     );
@@ -3514,6 +3667,7 @@ impl AutoshopApp {
     /// `comparing` (B held). Scroll zooms to the cursor; middle-drag or
     /// Space+drag pans; all image-space handlers map through [`ViewXform`].
     fn after_view(&mut self, ui: &mut egui::Ui, max_w: f32, avail_y: f32, comparing: bool) {
+        let lang = self.lang;
         let tex = if comparing { self.before_tex.as_ref() } else { self.after_tex.as_ref() };
         let Some((id, tex_size)) = tex.map(|t| (t.id(), t.size_vec2())) else {
             ui.label(egui::RichText::new("…").weak());
@@ -3528,35 +3682,35 @@ impl AutoshopApp {
 
         // Caption row: mode hint left, zoom readout + Fit / 1:1 right.
         let hint = if comparing {
-            "Before (source) — 松开 B 回到编辑"
+            tr(lang, "Before (source) — release B to return to editing")
         } else if self.crop_mode {
-            "裁剪 — 拖角柄调整，框内拖动移动"
+            tr(lang, "Crop — drag the handles to adjust, drag inside to move")
         } else if self.placing_mask.is_some() {
-            "局部调整 — 在图上拖拽画出渐变范围"
+            tr(lang, "Local adjustment — drag on the image to draw the gradient area")
         } else if self.wb_picking {
-            "WB 吸管 — 点击应为中性灰/白的位置"
+            tr(lang, "WB eyedropper — click a spot that should be neutral grey/white")
         } else if self.range_picking.is_some() {
-            "颜色范围 — 点击图中要选取的颜色"
+            tr(lang, "Colour range — click the colour to pick in the image")
         } else if self.clone_mode {
-            "图章 — Alt+点击取源点 · 拖动涂要覆盖的区域"
+            tr(lang, "Stamp — Alt+click to set the source · drag to brush the area to cover")
         } else if self.paint_mode {
-            "After — paint over the area to fill / heal"
+            tr(lang, "After — paint over the area to fill / heal")
         } else {
-            "After — 拖框=局部AI · 滚轮缩放 · 空格/中键平移 · 按住B对比"
+            tr(lang, "After — drag a box = local AI · scroll to zoom · space/middle-drag to pan · hold B to compare")
         };
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(hint).weak().small());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("1:1").on_hover_text("预览像素 1:1（双击图片可切换）").clicked() {
+                if ui.small_button("1:1").on_hover_text(tr(lang, "Preview pixels 1:1 (double-click the image to toggle)")).clicked() {
                     self.zoom = (vis_px.x * self.zoom / disp.x).max(1.0);
                 }
-                if ui.small_button("Fit").on_hover_text("整图适配画布（双击图片可切换）").clicked() {
+                if ui.small_button("Fit").on_hover_text(tr(lang, "Fit the whole image to the canvas (double-click the image to toggle)")).clicked() {
                     self.zoom = 1.0;
                     self.pan = egui::vec2(0.5, 0.5);
                 }
                 if ui
                     .selectable_label(self.show_clipping, "▲")
-                    .on_hover_text("削波警告 (J)：红 = 高光溢出，蓝 = 阴影死黑（按导出像素判定）")
+                    .on_hover_text(tr(lang, "Clipping warning (J): red = highlight clip, blue = shadow crush (judged on export pixels)"))
                     .clicked()
                 {
                     self.show_clipping = !self.show_clipping;
@@ -3572,12 +3726,12 @@ impl AutoshopApp {
                         .selected_text(format!("{}px", self.preview_edge))
                         .width(64.0)
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.preview_edge, 1280, "1280px 流畅");
+                            ui.selectable_value(&mut self.preview_edge, 1280, tr(lang, "1280px · fluid"));
                             ui.selectable_value(&mut self.preview_edge, 2560, "2560px");
-                            ui.selectable_value(&mut self.preview_edge, 4096, "4096px 检查");
+                            ui.selectable_value(&mut self.preview_edge, 4096, tr(lang, "4096px · inspect"));
                         })
                         .response
-                        .on_hover_text("工作预览分辨率：1280 滑杆最流畅；2560/4096 供 1:1 查合焦/噪点（每次调整更慢）");
+                        .on_hover_text(tr(lang, "Working preview resolution: 1280 is smoothest on the sliders; 2560/4096 for 1:1 focus/noise checks (slower on every adjustment)"));
                 });
                 if self.preview_edge != before
                     && let Some(p) = self.src_path.clone()
@@ -3727,7 +3881,7 @@ impl AutoshopApp {
         {
             let (dims, deg, dist) = self.geom_ctx();
             let vg = geom_to_view(&m.mask, dims, deg, dist);
-            draw_mask_overlay(ui, xf, &vg);
+            draw_mask_overlay(ui, xf, &vg, self.lang);
             let p = ui.painter_at(xf.rect);
             for (h, pos) in mask_handle_points(&vg, xf) {
                 let r = if h == 0 { 5.5 } else { 4.5 }; // centre knob reads bigger
@@ -3783,7 +3937,11 @@ impl AutoshopApp {
         self.recipe.tint = tint;
         self.wb_picking = false;
         self.dirty = true;
-        self.status = format!("WB 吸管：{k:.0} K · tint {tint:+.0} — 可在色调区微调");
+        self.status = trf(
+            self.lang,
+            "WB eyedropper: {k} K · tint {tint} — fine-tune in the Tone section",
+            &[("k", &format!("{k:.0}")), ("tint", &format!("{tint:+.0}"))],
+        );
     }
 
     /// Colour-range sample: click keys the pending mask's Color range to that
@@ -3842,7 +4000,11 @@ impl AutoshopApp {
             Some(RangeMask::Color { r: smp[0], g: smp[1], b: smp[2], amount, px: nx, py: ny });
         self.range_picking = None;
         self.dirty = true;
-        self.status = "颜色范围：已取样 — 「容差」滑杆调节选中宽度".into();
+        self.status = tr(
+            self.lang,
+            "Colour range: sampled — the 「Tolerance」 slider adjusts the selection width",
+        )
+        .into();
     }
 
     /// Box-select on the After image: drag a rectangle to target a local edit;
@@ -3960,10 +4122,13 @@ impl AutoshopApp {
                 let (t, b) = (sn.1.min(en.1), sn.1.max(en.1));
                 if r - l > 0.02 && b - t > 0.02 {
                     self.region = Some([l, t, r, b]);
-                    self.status = format!(
-                        "region {}×{}% — type a direction, then AI Analyze (click to clear)",
-                        ((r - l) * 100.0).round() as i32,
-                        ((b - t) * 100.0).round() as i32
+                    self.status = trf(
+                        self.lang,
+                        "region {w}×{h}% — type a direction, then AI Analyze (click to clear)",
+                        &[
+                            ("w", &(((r - l) * 100.0).round() as i32).to_string()),
+                            ("h", &(((b - t) * 100.0).round() as i32).to_string()),
+                        ],
                     );
                 } else {
                     self.region = None; // a tiny drag clears the selection
@@ -4197,15 +4362,16 @@ impl AutoshopApp {
                 flipped: false,
             },
         };
-        draw_mask_overlay(ui, xf, &geom_to_view(&geom, dims, deg, dist)); // live preview
+        draw_mask_overlay(ui, xf, &geom_to_view(&geom, dims, deg, dist), self.lang); // live preview
         if resp.drag_stopped() {
             match replace {
                 Some(i) if i < self.recipe.masks.len() => self.recipe.masks[i].mask = geom,
                 _ => {
                     let n = self.recipe.masks.len();
+                    let name = trf(self.lang, "Manual {n}", &[("n", &(n + 1).to_string())]);
                     self.recipe.masks.push(autoshop::recipe::LocalAdjustment {
                         mask: geom,
-                        name: format!("手动 {}", n + 1),
+                        name,
                         ..Default::default()
                     });
                     self.sel_mask = Some(n);
@@ -4214,7 +4380,8 @@ impl AutoshopApp {
             self.placing_mask = None;
             self.place_start = None;
             self.dirty = true;
-            self.status = "mask 已放置 — 在左侧「局部调整」里拉滑杆（当前全为 0，无可见效果）".into();
+            self.status =
+                tr(self.lang, "mask placed — pull its sliders in 「Local Masks」 at left (all 0 now, no visible effect yet)").into();
         }
     }
 
@@ -4309,7 +4476,11 @@ impl AutoshopApp {
                 let (dims, deg, dist) = self.geom_ctx();
                 let (nx, ny) = xf.to_norm(q);
                 self.clone_src = Some(view_norm_to_orig(nx, ny, dims, deg, dist));
-                self.status = "克隆源已取样 — 画笔涂要覆盖的区域，然后「⎘ 克隆已涂区域」".into();
+                self.status = tr(
+                    self.lang,
+                    "Clone source sampled — brush the area to cover, then 「⎘ Clone painted area」",
+                )
+                .into();
             }
         } else {
             self.handle_paint(resp, xf);
@@ -4341,20 +4512,21 @@ impl AutoshopApp {
         if self.busy {
             return;
         }
+        let lang = self.lang; // localise UI statuses AND the worker's result string
         let prompt = self.fill_prompt.trim().to_string();
         if prompt.is_empty() {
-            self.status = "write what should fill the painted area".into();
+            self.status = tr(lang, "write what should fill the painted area").into();
             return;
         }
         let Some(mask_png) = self.export_mask_png() else {
-            self.status = "paint the area to remove/fill first (tick Paint mask)".into();
+            self.status = tr(lang, "paint the area to remove/fill first (tick Paint mask)").into();
             return;
         };
         self.busy = true;
         self.status = if self.fill_fullres {
-            "generative fill (full-res render)… (slow, minutes)".into()
+            tr(lang, "generative fill (full-res render)… (slow, minutes)").into()
         } else {
-            "generative fill via gpt-image… (~15-40s)".into()
+            tr(lang, "generative fill via gpt-image… (~15-40s)").into()
         };
         let quality = ["high", "medium", "low"][self.fill_quality.min(2)].to_string();
         let full_res = self.fill_fullres;
@@ -4374,7 +4546,16 @@ impl AutoshopApp {
                     // InPlace: refine the current rendition — bake into the active
                     // variant's base AND repoint its origin at this saved artifact
                     // so export / reverse-fit / next retouch follow the fill.
-                    Ok((img, format!("filled → {} (更新当前变体)", out.display()), out, RetouchKind::InPlace))
+                    Ok((
+                        img,
+                        trf(
+                            lang,
+                            "filled → {path} (updated current variant)",
+                            &[("path", &out.display().to_string())],
+                        ),
+                        out,
+                        RetouchKind::InPlace,
+                    ))
                 })();
                 Msg::Retouched(Box::new(res))
             },
@@ -4390,11 +4571,13 @@ impl AutoshopApp {
         if self.busy {
             return;
         }
+        let lang = self.lang; // localise UI statuses AND the worker's result string
         let mask_png = if use_mask {
             match self.export_mask_png() {
                 Some(b) => Some(b),
                 None => {
-                    self.status = "tick Paint mask and paint the spots, then Heal painted area".into();
+                    self.status =
+                        tr(lang, "tick Paint mask and paint the spots, then Heal painted area").into();
                     return;
                 }
             }
@@ -4403,9 +4586,9 @@ impl AutoshopApp {
         };
         self.busy = true;
         self.status = if use_mask {
-            "healing painted area…".into()
+            tr(lang, "healing painted area…").into()
         } else {
-            "AI 去瑕疵中… (~10-30s)".into()
+            tr(lang, "AI healing… (~10-30s)").into()
         };
         let full_res = self.heal_fullres;
         let edge = self.preview_edge.clamp(640, 8192); // bake at the working res, not a fixed 1280
@@ -4430,7 +4613,16 @@ impl AutoshopApp {
                     let rep = rep?;
                     let img = autoshop::decode::load_image(&out)?.thumbnail(edge, edge);
                     // InPlace: bake into the active variant's base + repoint origin.
-                    Ok((img, format!("healed {} spot(s) → {}", rep.spots, out.display()), out, RetouchKind::InPlace))
+                    Ok((
+                        img,
+                        trf(
+                            lang,
+                            "healed {n} spot(s) → {path}",
+                            &[("n", &rep.spots.to_string()), ("path", &out.display().to_string())],
+                        ),
+                        out,
+                        RetouchKind::InPlace,
+                    ))
                 })();
                 Msg::Retouched(Box::new(res))
             },
@@ -4447,16 +4639,17 @@ impl AutoshopApp {
         if self.busy {
             return;
         }
+        let lang = self.lang; // localise UI statuses AND the worker's result string
         let Some(src_pt) = self.clone_src else {
-            self.status = "先 Alt+点击取克隆源点".into();
+            self.status = tr(lang, "Alt+click to set the clone source first").into();
             return;
         };
         let Some(mask_png) = self.export_mask_png() else {
-            self.status = "先用画笔涂要克隆覆盖的区域".into();
+            self.status = tr(lang, "Brush the area to clone over first").into();
             return;
         };
         self.busy = true;
-        self.status = "克隆中…（本地像素运算）".into();
+        self.status = tr(lang, "Cloning… (local pixel compute)").into();
         let full_res = self.clone_fullres;
         let edge = self.preview_edge.clamp(640, 8192); // bake at the working res, not a fixed 1280
         self.spawn_worker(
@@ -4472,7 +4665,16 @@ impl AutoshopApp {
                     let img = autoshop::decode::load_image(&out)?.thumbnail(edge, edge);
                     // InPlace: a pixel transplant of the current rendition — bake it
                     // into the active variant's base + repoint origin at the artifact.
-                    Ok((img, format!("克隆 {} 处 → {}", rep.spots, out.display()), out, RetouchKind::InPlace))
+                    Ok((
+                        img,
+                        trf(
+                            lang,
+                            "Cloned {n} spot(s) → {path}",
+                            &[("n", &rep.spots.to_string()), ("path", &out.display().to_string())],
+                        ),
+                        out,
+                        RetouchKind::InPlace,
+                    ))
                 })();
                 Msg::Retouched(Box::new(res))
             },
@@ -4522,7 +4724,9 @@ impl AutoshopApp {
             }
         };
         self.busy = true;
-        self.status = "AI 生成出片中… (gpt-image, ~15–60s; 高分辨率输入需先全幅显影)".into();
+        let lang = self.lang;
+        self.status =
+            tr(lang, "AI generating… (gpt-image, ~15–60s; hi-res input needs a full-frame develop first)").into();
         let edge = self.preview_edge.clamp(640, 8192);
         self.spawn_worker(
             move || {
@@ -4531,7 +4735,11 @@ impl AutoshopApp {
                     // fidelity "high" keeps it recognisably the same photo.
                     autoshop::generative::reimagine(&cfg, &path, &prompt, "high", &cfg.openai_image_quality, &out)?;
                     let img = autoshop::decode::load_image(&out)?.thumbnail(edge, edge);
-                    let msg = format!("已生成「AI 生成」变体 → {} · 可继续微调或「反推配方」", out.display());
+                    let msg = trf(
+                        lang,
+                        "「AI generated」variant created → {path} · keep tweaking or 「Reverse-fit」",
+                        &[("path", &out.display().to_string())],
+                    );
                     // NewGenerated: a whole-frame rendition → a new Generated variant.
                     Ok((img, msg, out, RetouchKind::NewGenerated))
                 })();
@@ -4559,11 +4767,12 @@ impl AutoshopApp {
         }
         let src_path = self.src_path.clone();
         let zoned = self.zoned_fit;
+        let lang = self.lang;
         self.busy = true;
         self.status = if zoned {
-            "反推配方中…（统计拟合 + 天空分割，首次分割会下载模型）".into()
+            tr(lang, "Reverse-fitting… (statistical fit + sky segmentation; first run downloads the model)").into()
         } else {
-            "反推配方中…（统计拟合，本地运算）".into()
+            tr(lang, "Reverse-fitting… (statistical fit, local compute)").into()
         };
         self.spawn_worker(
             move || {
@@ -4585,12 +4794,19 @@ impl AutoshopApp {
                         }
                         _ => autoshop::fit::fit_recipe(&base, &target),
                     };
-                    let mut note = format!(
-                        "反推完成：look 残差 {:.3}→{:.3} · 已建「反推」变体（可编辑/导 XMP/出全分辨率）",
-                        rep.err_before, rep.err_after
+                    let mut note = trf(
+                        lang,
+                        "Reverse-fit done: look residual {before}→{after} · created a「Reverse-fit」variant (editable / XMP / full-res)",
+                        &[
+                            ("before", &format!("{:.3}", rep.err_before)),
+                            ("after", &format!("{:.3}", rep.err_after)),
+                        ],
                     );
                     if !rep.recipe.masks.is_empty() {
-                        note.push_str(" · 含天空分区校正（蒙版面板可调；XMP 只带全局部分）");
+                        note.push_str(tr(
+                            lang,
+                            " · includes sky-zone correction (adjustable in the mask panel; XMP carries the global part only)",
+                        ));
                     }
                     if let Some(p) = src_path.filter(|p| autoshop::decode::is_raw(p)) {
                         let x = autoshop::pipeline::write_xmp(&p, &rep.recipe)?;
@@ -4617,7 +4833,7 @@ impl AutoshopApp {
         }
         let src_path = self.src_path.clone();
         self.busy = true;
-        self.status = "提取风格提示词中… (vision, ~5-20s)".into();
+        self.status = tr(self.lang, "Extracting style prompt… (vision, ~5-20s)").into();
         self.spawn_worker(
             move || {
                 let res = (|| -> anyhow::Result<String> {
@@ -4648,11 +4864,12 @@ impl AutoshopApp {
     /// each variant keeps its own base + recipe), × to drop one. This is the
     /// selector that makes an AI develop a first-class, non-reverting version.
     fn variant_strip(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
         let mut switch_to: Option<usize> = None;
         let mut delete: Option<usize> = None;
         ui.horizontal(|ui| {
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("版本").strong());
+            ui.label(egui::RichText::new(tr(lang, "Variants")).strong());
             ui.separator();
             egui::ScrollArea::horizontal().show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -4691,16 +4908,16 @@ impl AutoshopApp {
                             } else {
                                 ui.add_sized([64.0, 52.0], egui::Button::new("…"))
                             };
-                            if resp.on_hover_text("点击切到此版本（无损）").clicked() {
+                            if resp.on_hover_text(tr(lang, "Click to switch to this variant (lossless)")).clicked() {
                                 switch_to = Some(i);
                             }
                             ui.horizontal(|ui| {
-                                let label = egui::RichText::new(kind.label()).small();
+                                let label = egui::RichText::new(tr(lang, kind.label())).small();
                                 ui.label(if active { label.strong().color(PILL) } else { label });
                                 // Any variant except the sole Original can be dropped.
                                 if self.variants.len() > 1
                                     && kind != VariantKind::Original
-                                    && ui.small_button("×").on_hover_text("删除此版本").clicked()
+                                    && ui.small_button("×").on_hover_text(tr(lang, "Delete this variant")).clicked()
                                 {
                                     delete = Some(i);
                                 }
@@ -4719,8 +4936,9 @@ impl AutoshopApp {
     }
 
     fn retouch_panel(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang; // Copy — never borrows self, safe inside egui closures.
         ui.separator();
-        ui.heading("修饰 · Retouch");
+        ui.heading(tr(lang, "Retouch"));
 
         // Whole-image generative re-render: let gpt-image DIRECTLY produce the
         // picture (the optional "GPT makes the image" path). Distinct from
@@ -4730,18 +4948,19 @@ impl AutoshopApp {
         // in an editable recipe (full-res + XMP). No more "continue from
         // master" button — each result is its own selectable variant, so a
         // slider edit can never revert or double-cook it.
-        egui::CollapsingHeader::new("整图 AI 生成 · Reimagine")
+        egui::CollapsingHeader::new(tr(lang, "Reimagine (whole image)"))
             .id_salt("sec_reimagine")
             .default_open(true)
             .show(ui, |ui| {
                 ui.add_enabled_ui(!self.busy, |ui| {
                     if ui
-                        .button("✨ AI 生成出片")
-                        .on_hover_text(
-                            "用 gpt-image 直接重绘整张图（拿上方 Direction 文本当风格描述）。重绘像素=非保真；\
-                             生成后自动加入底部「AI 生成」变体并切过去，可继续微调不会变回去。\
-                             支持任意尺寸的模型（gpt-image-2）可达 ~8MP，其余 ~1.5K。需 OPENAI_API_KEY",
-                        )
+                        .button(tr(lang, "✨ Generate image"))
+                        .on_hover_text(tr(lang,
+                            "Repaint the whole image with gpt-image (uses the Direction text above as the style). \
+                             Repainted pixels = not faithful; the result is added as an 「AI generated」 variant \
+                             at the bottom and switched to, so you can keep tweaking without reverting. Models that \
+                             accept any size (gpt-image-2) reach ~8MP, others ~1.5K. Needs OPENAI_API_KEY.",
+                        ))
                         .clicked()
                     {
                         self.start_reimagine();
@@ -4753,7 +4972,8 @@ impl AutoshopApp {
                 let can_fit = self.fit_target().is_some() && self.source_preview.is_some();
                 if !can_fit {
                     ui.label(
-                        egui::RichText::new("先「AI 生成出片」并停在该变体上，才能反推它的配方。")
+                        egui::RichText::new(tr(lang,
+                            "Generate an image first and stay on that variant to reverse-fit its recipe."))
                             .weak()
                             .small(),
                     );
@@ -4761,21 +4981,23 @@ impl AutoshopApp {
                 ui.add_enabled_ui(!self.busy && can_fit, |ui| {
                     ui.horizontal(|ui| {
                         if ui
-                            .button("🎛 反推配方 → 滑杆/XMP")
-                            .on_hover_text(
-                                "统计拟合：把刚生成的观感反解成可编辑的 develop 参数（本地运算，无 API 费）。\
-                                 滑杆会更新（可 undo），RAW 同时写 ./out XMP；再点 Save 可出全分辨率成品",
-                            )
+                            .button(tr(lang, "🎛 Reverse-fit recipe → sliders/XMP"))
+                            .on_hover_text(tr(lang,
+                                "Statistical fit: reverse the freshly generated look into editable develop params \
+                                 (local, no API cost). Sliders update (undoable), and for RAW an XMP is written to \
+                                 ./out; hit Save to render the full-resolution result.",
+                            ))
                             .clicked()
                         {
                             self.start_fit();
                         }
                         if ui
-                            .button("📝 提取风格提示词")
-                            .on_hover_text(
-                                "对比 原图/生成图，让 vision 模型写一段可复用的风格 prompt：\
-                                 自动填入 Direction（可直接给别的照片 Reimagine 用）并存 ./out/<stem>.style.txt",
-                            )
+                            .button(tr(lang, "📝 Extract style prompt"))
+                            .on_hover_text(tr(lang,
+                                "Compare the original / generated images and have the vision model write a reusable \
+                                 style prompt: auto-fills Direction (ready to Reimagine other photos) and saves \
+                                 ./out/<stem>.style.txt.",
+                            ))
                             .clicked()
                         {
                             self.start_style_prompt();
@@ -4783,9 +5005,10 @@ impl AutoshopApp {
                     });
                 });
                 ui.label(
-                    egui::RichText::new(
-                        "拿上方 Direction 当风格描述。生成后可「反推配方」把观感变成滑杆+XMP（全分辨率的正道）。",
-                    )
+                    egui::RichText::new(tr(lang,
+                        "Uses the Direction above as the style. After generating, use 「Reverse-fit recipe」 to turn \
+                         the look into sliders + XMP (the full-resolution way).",
+                    ))
                     .weak()
                     .small(),
                 );
@@ -4794,26 +5017,26 @@ impl AutoshopApp {
         // Mask tools shared by Fill AND Heal — one brush, two consumers.
         ui.horizontal(|ui| {
             let r = ui
-                .checkbox(&mut self.paint_mode, "Paint mask")
-                .on_hover_text("Brush over the area; box-select is paused while on. Fill 与 Heal 共用");
+                .checkbox(&mut self.paint_mode, tr(lang, "Paint mask"))
+                .on_hover_text(tr(lang, "Brush over the area; box-select is paused while on. Shared by Fill and Heal."));
             if r.changed() && self.paint_mode {
                 self.clone_mode = false; // the stamp has its own paint dispatch
                 self.range_picking = None; // and painting cancels a pending colour sample
             }
-            if ui.button("Clear").clicked() {
+            if ui.button(tr(lang, "Clear")).clicked() {
                 self.clear_mask();
             }
         });
-        ui.add(egui::Slider::new(&mut self.brush, 4.0..=80.0).text("brush"));
+        ui.add(egui::Slider::new(&mut self.brush, 4.0..=80.0).text(tr(lang, "brush")));
 
-        egui::CollapsingHeader::new("生成填充 · Generative Fill")
+        egui::CollapsingHeader::new(tr(lang, "Generative Fill"))
             .id_salt("sec_fill")
             .default_open(false)
             .show(ui, |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.fill_prompt)
                         .desired_width(f32::INFINITY)
-                        .hint_text("what belongs there, e.g. remove the trash can, extend the sky"),
+                        .hint_text(tr(lang, "what belongs there, e.g. remove the trash can, extend the sky")),
                 );
                 ui.horizontal(|ui| {
                     egui::ComboBox::from_id_salt("fill_quality")
@@ -4823,53 +5046,53 @@ impl AutoshopApp {
                             ui.selectable_value(&mut self.fill_quality, 1, "medium");
                             ui.selectable_value(&mut self.fill_quality, 2, "low");
                         });
-                    ui.checkbox(&mut self.fill_fullres, "Full-res")
-                        .on_hover_text("Composite onto the full-sensor develop (slow, RAW only)");
+                    ui.checkbox(&mut self.fill_fullres, tr(lang, "Full-res"))
+                        .on_hover_text(tr(lang, "Composite onto the full-sensor develop (slow, RAW only)"));
                     ui.add_enabled_ui(!self.busy, |ui| {
-                        if ui.button("Remove / Fill").clicked() {
+                        if ui.button(tr(lang, "Remove / Fill")).clicked() {
                             self.start_fill();
                         }
                     });
                 });
                 ui.label(
-                    egui::RichText::new(
+                    egui::RichText::new(tr(lang,
                         "Paint the area, write what belongs there, then Remove/Fill. Needs OPENAI_API_KEY.",
-                    )
+                    ))
                     .weak()
                     .small(),
                 );
             });
 
-        egui::CollapsingHeader::new("去瑕疵 · Heal（像素）")
+        egui::CollapsingHeader::new(tr(lang, "Heal (pixel)"))
             .id_salt("sec_heal")
             .default_open(false)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.add_enabled_ui(!self.busy, |ui| {
-                        if ui.button("✦ AI 去瑕疵 (auto)").clicked() {
+                        if ui.button(tr(lang, "✦ AI heal (auto)")).clicked() {
                             self.start_heal(false);
                         }
-                        if ui.button("Heal painted area").clicked() {
+                        if ui.button(tr(lang, "Heal painted area")).clicked() {
                             self.start_heal(true);
                         }
                     });
-                    ui.checkbox(&mut self.heal_fullres, "Full-res");
+                    ui.checkbox(&mut self.heal_fullres, tr(lang, "Full-res"));
                 });
                 ui.label(
-                    egui::RichText::new(
+                    egui::RichText::new(tr(lang,
                         "AI auto-detects dust / blemishes, or paint a mask and Heal it. Pixel retouch from surrounding pixels; saved to ./out.",
-                    )
+                    ))
                     .weak()
                     .small(),
                 );
             });
 
-        egui::CollapsingHeader::new("仿制图章 · Clone Stamp")
+        egui::CollapsingHeader::new(tr(lang, "Clone Stamp"))
             .id_salt("sec_clone")
             .default_open(false)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let label = if self.clone_mode { "✅ 完成" } else { "🖊 进入图章" };
+                    let label = if self.clone_mode { tr(lang, "✅ Done") } else { tr(lang, "🖊 Enter stamp") };
                     if ui.button(label).clicked() {
                         self.clone_mode = !self.clone_mode;
                         if self.clone_mode {
@@ -4881,22 +5104,23 @@ impl AutoshopApp {
                             self.range_picking = None;
                             self.clear_mask();
                             self.status =
-                                "图章：Alt+点击取源点 → 画笔涂目标区 → 「⎘ 克隆已涂区域」".into();
+                                tr(lang, "Stamp: Alt+click to set the source → brush the target area → 「⎘ Clone painted area」").into();
                         }
                     }
-                    ui.checkbox(&mut self.clone_fullres, "Full-res")
-                        .on_hover_text("在全分辨率显影上克隆（慢，仅 RAW）");
+                    ui.checkbox(&mut self.clone_fullres, tr(lang, "Full-res"))
+                        .on_hover_text(tr(lang, "Clone on the full-resolution develop (slow, RAW only)"));
                     ui.add_enabled_ui(!self.busy && self.clone_mode, |ui| {
-                        if ui.button("⎘ 克隆已涂区域").clicked() {
+                        if ui.button(tr(lang, "⎘ Clone painted area")).clicked() {
                             self.start_clone();
                         }
                     });
                 });
                 ui.label(
-                    egui::RichText::new(
-                        "Photoshop 的仿制图章：Alt+点击取源（十字标记），画笔涂要覆盖的区域，\
-                         按源点原样搬运像素（羽化边缘、不做色调匹配）。本地运算，存 ./out 像素母版。",
-                    )
+                    egui::RichText::new(tr(lang,
+                        "Photoshop-style clone stamp: Alt+click to sample a source (cross marker), brush the area to \
+                         cover, and pixels are carried over as-is from the source (feathered edges, no tone matching). \
+                         Local compute, saves a ./out pixel master.",
+                    ))
                     .weak()
                     .small(),
                 );
@@ -4971,7 +5195,7 @@ impl eframe::App for AutoshopApp {
                     self.clone_mode = false;
                     self.paint_mode = false;
                     self.region_drag = None;
-                    self.status = "已退出当前工具（Esc）".into();
+                    self.status = tr(self.lang, "Exited the current tool (Esc)").into();
                 }
             }
             if do_overlay {
@@ -5009,14 +5233,20 @@ impl eframe::App for AutoshopApp {
         });
         if let Some(p) = dropped.into_iter().next() {
             if self.busy {
-                self.toast(ToastKind::Error, "busy — 等当前任务完成再打开");
+                self.toast(
+                    ToastKind::Error,
+                    tr(self.lang, "busy — wait for the current task to finish before opening"),
+                );
             } else if p.is_dir() {
                 self.open_folder(p);
             } else if is_photo_path(&p) {
                 self.selected = None;
                 self.open_path(p);
             } else {
-                self.toast(ToastKind::Error, format!("不支持的文件类型: {}", p.display()));
+                self.toast(
+                    ToastKind::Error,
+                    trf(self.lang, "unsupported file type: {path}", &[("path", &p.display().to_string())]),
+                );
             }
         }
 
@@ -5034,6 +5264,7 @@ impl eframe::App for AutoshopApp {
         }
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            let lang = self.lang;
             // BOTH toolbar rows wrap: a plain horizontal row CLIPS whatever
             // falls past the window edge (the "shrink the window and lose
             // the buttons" bug). horizontal_wrapped only wraps between
@@ -5049,11 +5280,12 @@ impl eframe::App for AutoshopApp {
                     ui.add(
                         egui::ProgressBar::new(done as f32 / total.max(1) as f32)
                             .desired_width(150.0)
-                            .text(format!("批量 {done}/{total}")),
+                            .text(trf(lang, "Batch {done}/{total}",
+                                &[("done", &done.to_string()), ("total", &total.to_string())])),
                     );
                     ui.separator();
                 }
-                if ui.button("Open photo…").on_hover_text("Ctrl+O · 或直接拖拽进窗口").clicked()
+                if ui.button(tr(lang, "Open photo…")).on_hover_text(tr(lang, "Ctrl+O · or drag a file into the window")).clicked()
                     && let Some(path) = photo_file_dialog()
                 {
                     self.selected = None; // a one-off file isn't a gallery selection
@@ -5061,17 +5293,17 @@ impl eframe::App for AutoshopApp {
                 }
                 let ready = self.src_path.is_some() && !self.busy;
                 if ui
-                    .add_enabled(ready, egui::Button::new("✨ AI Analyze"))
-                    .on_hover_text("AI 提配方（GPT 提议 + 验证），写进滑杆 — 可撤销")
+                    .add_enabled(ready, egui::Button::new(tr(lang, "✨ AI Analyze")))
+                    .on_hover_text(tr(lang, "AI proposes a recipe (GPT proposal + validation), written into the sliders — undoable"))
                     .clicked()
                 {
                     self.start_analyze();
                 }
-                ui.add_enabled(ready, egui::Checkbox::new(&mut self.refine, "Refine"))
-                    .on_hover_text("Adjust the CURRENT edit instead of proposing from scratch");
+                ui.add_enabled(ready, egui::Checkbox::new(&mut self.refine, tr(lang, "Refine")))
+                    .on_hover_text(tr(lang, "Adjust the CURRENT edit instead of proposing from scratch"));
                 if ui
-                    .add_enabled(ready, egui::Button::new("Reset"))
-                    .on_hover_text("清空全部滑杆回中性（一步撤销可回来）")
+                    .add_enabled(ready, egui::Button::new(tr(lang, "Reset")))
+                    .on_hover_text(tr(lang, "Clear every slider back to neutral (one undo brings it back)"))
                     .clicked()
                 {
                     self.recipe = EditRecipe::default();
@@ -5080,38 +5312,38 @@ impl eframe::App for AutoshopApp {
                 }
                 ui.separator();
                 if ui
-                    .add_enabled(ready && !self.undo_stack.is_empty(), egui::Button::new("↶ Undo"))
+                    .add_enabled(ready && !self.undo_stack.is_empty(), egui::Button::new(tr(lang, "↶ Undo")))
                     .on_hover_text("Ctrl+Z")
                     .clicked()
                 {
                     self.undo();
                 }
                 if ui
-                    .add_enabled(ready && !self.redo_stack.is_empty(), egui::Button::new("↷ Redo"))
+                    .add_enabled(ready && !self.redo_stack.is_empty(), egui::Button::new(tr(lang, "↷ Redo")))
                     .on_hover_text("Ctrl+Y")
                     .clicked()
                 {
                     self.redo();
                 }
                 ui.separator();
-                ui.label("Style").on_hover_text(
-                    "个人风格强度：AI 提案向你过往 XMP 编辑习惯靠拢的程度（0 = 不参考）",
+                ui.label(tr(lang, "Style")).on_hover_text(
+                    tr(lang, "Personal style strength: how far AI proposals lean toward your past XMP editing habits (0 = ignore)"),
                 );
                 ui.add(egui::Slider::new(&mut self.style_strength, 0.0..=1.0).show_value(false))
-                    .on_hover_text("个人风格强度：AI 提案向你过往编辑习惯靠拢的程度");
+                    .on_hover_text(tr(lang, "Personal style strength: how far AI proposals lean toward your past editing habits"));
                 ui.label(format!("{:.0}%", self.style_strength * 100.0));
                 ui.separator();
                 // View mode: side-by-side vs a full-width edit (hold B = compare).
-                ui.selectable_value(&mut self.view_mode, ViewMode::SideBySide, "⿲ 对比")
-                    .on_hover_text("Before/After side by side");
-                ui.selectable_value(&mut self.view_mode, ViewMode::AfterOnly, "⬛ 单图")
-                    .on_hover_text("编辑图占满画布；按住 B 快速对比原图");
+                ui.selectable_value(&mut self.view_mode, ViewMode::SideBySide, tr(lang, "⿲ Compare"))
+                    .on_hover_text(tr(lang, "Before/After side by side"));
+                ui.selectable_value(&mut self.view_mode, ViewMode::AfterOnly, tr(lang, "⬛ Single"))
+                    .on_hover_text(tr(lang, "The edit fills the canvas; hold B to quickly compare the original"));
                 ui.separator();
-                if ui.button("⚙ Settings").on_hover_text("AI provider / model / API key").clicked() {
+                if ui.button(tr(lang, "⚙ Settings")).on_hover_text(tr(lang, "AI provider / model / API key")).clicked() {
                     self.show_settings = true;
                     self.load_settings_form();
                 }
-                if ui.button("⌨").on_hover_text("快捷键速查（F1 / ?）").clicked() {
+                if ui.button("⌨").on_hover_text(tr(lang, "Keyboard shortcuts (F1 / ?)")).clicked() {
                     self.show_shortcuts = !self.show_shortcuts;
                 }
             });
@@ -5121,64 +5353,64 @@ impl eframe::App for AutoshopApp {
             // (Export / Download / Save XMP) gate on a ready photo. That also
             // keeps every widget an atomic allocation so the row can wrap.
             ui.horizontal_wrapped(|ui| {
-                ui.label("Direction:");
+                ui.label(tr(lang, "Direction:"));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.guidance)
                         .desired_width(340.0)
-                        .hint_text("e.g. warmer and moodier, lift the shadows"),
+                        .hint_text(tr(lang, "e.g. warmer and moodier, lift the shadows")),
                 );
                 let ready = self.src_path.is_some() && !self.busy;
                 ui.separator();
                 egui::ComboBox::from_id_salt("save_fmt")
-                    .selected_text(if self.save_jpeg { "JPEG" } else { "16-bit TIFF" })
+                    .selected_text(if self.save_jpeg { "JPEG" } else { tr(lang, "16-bit TIFF") })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.save_jpeg, false, "16-bit TIFF");
+                        ui.selectable_value(&mut self.save_jpeg, false, tr(lang, "16-bit TIFF"));
                         ui.selectable_value(&mut self.save_jpeg, true, "JPEG");
                     });
                 // --- delivery pipeline (gap batch F): resize → sharpen → quality ---
-                ui.label("长边");
+                ui.label(tr(lang, "Long edge"));
                 egui::ComboBox::from_id_salt("exp_long_edge")
                     .selected_text(if self.exp_long_edge == 0 {
-                        "原尺寸".to_string()
+                        tr(lang, "Original size").to_string()
                     } else {
                         format!("{} px", self.exp_long_edge)
                     })
                     .width(86.0)
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.exp_long_edge, 0, "原尺寸");
+                        ui.selectable_value(&mut self.exp_long_edge, 0, tr(lang, "Original size"));
                         for px in [1600u32, 2048, 2560, 3840, 5120] {
                             ui.selectable_value(&mut self.exp_long_edge, px, format!("{px} px"));
                         }
                     });
-                Self::slider(ui, "输出锐化", &mut self.exp_sharpen, 0.0, 100.0, 0.0);
+                Self::slider(ui, lang, tr(lang, "Output sharpening"), &mut self.exp_sharpen, 0.0, 100.0, 0.0);
                 if self.save_jpeg {
-                    Self::slider(ui, "JPEG 质量", &mut self.exp_quality, 60.0, 100.0, 95.0);
+                    Self::slider(ui, lang, tr(lang, "JPEG quality"), &mut self.exp_quality, 60.0, 100.0, 95.0);
                 }
                 // --- delivery color space (gap batch D2): a real gamut
                 // transform + matching embedded profile, not a tag swap.
-                ui.label("色彩空间");
-                const SPACES: [&str; 3] = ["sRGB（通用）", "Display P3（广色域屏）", "Adobe RGB（印刷）"];
+                ui.label(tr(lang, "Colour space"));
+                const SPACES: [&str; 3] = ["sRGB (universal)", "Display P3 (wide-gamut screens)", "Adobe RGB (print)"];
                 egui::ComboBox::from_id_salt("exp_space")
-                    .selected_text(SPACES[(self.exp_space as usize).min(2)])
+                    .selected_text(tr(lang, SPACES[(self.exp_space as usize).min(2)]))
                     .width(170.0)
                     .show_ui(ui, |ui| {
                         for (i, name) in SPACES.iter().enumerate() {
-                            ui.selectable_value(&mut self.exp_space, i as u8, *name);
+                            ui.selectable_value(&mut self.exp_space, i as u8, tr(lang, name));
                         }
                     });
-                ui.checkbox(&mut self.save_denoise, "AI Denoise").on_hover_text(
-                    "SCUNet AI denoise before developing — high-ISO / astro (slow, GPU; needs the python sidecar)",
+                ui.checkbox(&mut self.save_denoise, tr(lang, "AI Denoise")).on_hover_text(
+                    tr(lang, "SCUNet AI denoise before developing — high-ISO / astro (slow, GPU; needs the python sidecar)"),
                 );
                 if ui
-                    .add_enabled(ready, egui::Button::new("Export → ./out"))
-                    .on_hover_text("Ctrl+E · 全分辨率渲染到 ./out（跟随当前变体像素）")
+                    .add_enabled(ready, egui::Button::new(tr(lang, "Export → ./out")))
+                    .on_hover_text(tr(lang, "Ctrl+E · full-resolution render to ./out (follows the current variant's pixels)"))
                     .clicked()
                 {
                     self.start_export();
                 }
                 if ui
-                    .add_enabled(ready, egui::Button::new("Download…"))
-                    .on_hover_text("另存为…（选路径的全分辨率导出）")
+                    .add_enabled(ready, egui::Button::new(tr(lang, "Download…")))
+                    .on_hover_text(tr(lang, "Save as… (full-resolution export to a path you choose)"))
                     .clicked()
                 {
                     let ext = if self.save_jpeg { "jpg" } else { "tif" };
@@ -5201,8 +5433,8 @@ impl eframe::App for AutoshopApp {
                     }
                 }
                 if ui
-                    .add_enabled(ready, egui::Button::new("Save XMP"))
-                    .on_hover_text("Ctrl+S · 写 Lightroom/ACR sidecar 到 ./out（仅 RAW）")
+                    .add_enabled(ready, egui::Button::new(tr(lang, "Save XMP")))
+                    .on_hover_text(tr(lang, "Ctrl+S · write a Lightroom/ACR sidecar to ./out (RAW only)"))
                     .clicked()
                 {
                     self.save_xmp();
@@ -5287,18 +5519,18 @@ impl eframe::App for AutoshopApp {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() * 0.32);
                     ui.heading("Autoshop");
-                    ui.label(egui::RichText::new("AI 自动出片 · RAW develop").weak());
+                    ui.label(egui::RichText::new(tr(self.lang, "AI auto-develop · RAW develop")).weak());
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         // Center the button pair by padding half the leftover width.
                         let w = 300.0;
                         ui.add_space((ui.available_width() - w).max(0.0) * 0.5);
-                        if ui.button("📷 打开照片…  (Ctrl+O)").clicked()
+                        if ui.button(tr(self.lang, "📷 Open photo…  (Ctrl+O)")).clicked()
                             && let Some(p) = photo_file_dialog()
                         {
                             self.open_path(p);
                         }
-                        if ui.button("🗂 打开文件夹…").clicked()
+                        if ui.button(tr(self.lang, "🗂 Open folder…")).clicked()
                             && let Some(d) = rfd::FileDialog::new().pick_folder()
                         {
                             self.open_folder(d);
@@ -5306,7 +5538,7 @@ impl eframe::App for AutoshopApp {
                     });
                     ui.add_space(8.0);
                     ui.label(
-                        egui::RichText::new("或把 RAW / 图片直接拖进窗口 · drag & drop anywhere")
+                        egui::RichText::new(tr(self.lang, "or drag a RAW / image straight into the window · drag & drop anywhere"))
                             .weak()
                             .small(),
                     );
@@ -5375,35 +5607,39 @@ impl eframe::App for AutoshopApp {
         // O (mask overlay) had no visible control at all.
         if self.show_shortcuts {
             let mut open = true;
-            egui::Window::new("⌨ 快捷键 · Shortcuts")
+            let lang = self.lang;
+            egui::Window::new(tr(lang, "⌨ Shortcuts"))
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut open)
                 .show(ctx, |ui| {
-                    const ROWS: [(&str, &str); 18] = [
-                        ("Ctrl+O", "打开照片"),
-                        ("Ctrl+E", "导出 → ./out"),
-                        ("Ctrl+S", "保存 XMP sidecar"),
-                        ("Ctrl+Z / Ctrl+Y", "撤销 / 重做"),
-                        ("← / →", "图库走图"),
-                        ("B（按住）", "对比原图"),
-                        ("O", "蒙版覆盖层开关"),
-                        ("J", "削波警告开关"),
-                        ("Esc", "退出当前工具 / 关闭本窗"),
-                        ("F1 / ?", "本速查表"),
-                        ("滚轮", "缩放（指向光标）"),
-                        ("双击画布", "Fit ↔ 1:1"),
-                        ("空格+拖 / 中键拖", "平移"),
-                        ("放大后直接拖", "平移（Ctrl+拖 = 框选）"),
-                        ("Alt+点击", "克隆取源点"),
-                        ("滑杆双击", "归零"),
-                        ("曲线：点击/拖/拖出框", "加点 / 移点 / 删点"),
-                        ("蒙版手柄拖拽", "改形 / 移动选中蒙版"),
+                    // Runtime table (not `const`): the ZH column is resolved by
+                    // `tr` at draw time. ASCII key combos + "Fit ↔ 1:1" carry no
+                    // natural-language words, so they stay literal.
+                    let rows: [(&str, &str); 18] = [
+                        ("Ctrl+O", tr(lang, "Open photo")),
+                        ("Ctrl+E", tr(lang, "Export → ./out")),
+                        ("Ctrl+S", tr(lang, "Save XMP sidecar")),
+                        ("Ctrl+Z / Ctrl+Y", tr(lang, "Undo / Redo")),
+                        ("← / →", tr(lang, "Step through the library")),
+                        (tr(lang, "B (hold)"), tr(lang, "Compare original")),
+                        ("O", tr(lang, "Toggle mask overlay")),
+                        ("J", tr(lang, "Toggle clipping warning")),
+                        ("Esc", tr(lang, "Exit tool / close this window")),
+                        ("F1 / ?", tr(lang, "This cheat-sheet")),
+                        (tr(lang, "Scroll"), tr(lang, "Zoom (toward cursor)")),
+                        (tr(lang, "Double-click canvas"), "Fit ↔ 1:1"),
+                        (tr(lang, "Space+drag / middle-drag"), tr(lang, "Pan")),
+                        (tr(lang, "Drag when zoomed"), tr(lang, "Pan (Ctrl+drag = box-select)")),
+                        (tr(lang, "Alt+click"), tr(lang, "Sample clone source")),
+                        (tr(lang, "Slider double-click"), tr(lang, "Reset to zero")),
+                        (tr(lang, "Curve: click / drag / drag-out"), tr(lang, "Add / move / delete point")),
+                        (tr(lang, "Drag a mask handle"), tr(lang, "Reshape / move the selected mask")),
                     ];
                     egui::Grid::new("shortcut_grid").num_columns(2).striped(true).show(
                         ui,
                         |ui| {
-                            for (keys, what) in ROWS {
+                            for (keys, what) in rows {
                                 ui.label(egui::RichText::new(keys).monospace().color(PILL));
                                 ui.label(what);
                                 ui.end_row();
@@ -5428,7 +5664,7 @@ impl eframe::App for AutoshopApp {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "松开打开 · Drop to open",
+                tr(self.lang, "Drop to open"),
                 egui::FontId::proportional(28.0),
                 egui::Color32::WHITE,
             );
@@ -5491,6 +5727,7 @@ impl eframe::App for AutoshopApp {
                 exp_space: self.exp_space,
                 preview_edge: self.preview_edge,
                 show_clipping: self.show_clipping,
+                lang: self.lang,
             },
         );
     }

@@ -33,7 +33,7 @@ use anyhow::{Context, Result};
 use image::{DynamicImage, GrayImage};
 
 use crate::fit::{self, FitReport};
-use crate::recipe::{LocalAdjustment, MaskGeometry};
+use crate::recipe::{LocalAdjustment, MaskGeometry, MaskRole};
 use crate::render;
 use crate::segment::{segment_file, SegmentOpts};
 
@@ -332,9 +332,10 @@ fn attach_zones(
     }
     let swl: Vec<f32> = sw.iter().map(|w| 1.0 - w).collect();
     let twl: Vec<f32> = tw.iter().map(|w| 1.0 - w).collect();
-    let sky = attach_one_zone(&s_img, &tgt_px, report, &sw, &tw, mask_path, "sky", "反推·天空", false);
+    let sky =
+        attach_one_zone(&s_img, &tgt_px, report, &sw, &tw, mask_path, MaskRole::ZoneSky, false);
     let land =
-        attach_one_zone(&s_img, &tgt_px, report, &swl, &twl, mask_path, "land", "反推·地景", true);
+        attach_one_zone(&s_img, &tgt_px, report, &swl, &twl, mask_path, MaskRole::ZoneLand, true);
     if !sky && !land {
         std::fs::remove_file(mask_path).ok();
     }
@@ -354,10 +355,12 @@ fn attach_one_zone(
     sw: &[f32],
     tw: &[f32],
     mask_path: &Path,
-    label: &str,
-    name: &str,
+    role: MaskRole,
     inverted: bool,
 ) -> bool {
+    // `label` drives the rationale prose; it's the zone's stable ASCII tag, so
+    // the text stays English/identical regardless of the GUI's display language.
+    let label = role.tag();
     let cur_px = fit::pixels_of(&render::develop_preview(s_img, &report.recipe));
     let ms = zone_moments(&cur_px, sw);
     let mt = zone_moments(tgt_px, tw);
@@ -375,7 +378,9 @@ fn attach_one_zone(
     let round2 = |v: f32| (v * 100.0).round() / 100.0;
     report.recipe.masks.push(LocalAdjustment {
         mask: MaskGeometry::Bitmap { path: mask_path.to_string_lossy().into_owned() },
-        name: name.into(),
+        // Identity lives in `role`, not the (empty) display name — the GUI
+        // derives a localised label from the role. `name` stays default ("").
+        role,
         amount: 1.0,
         inverted,
         color_gains: Some(d.color_gains.map(round2)),
@@ -643,7 +648,7 @@ mod tests {
         let recipe = EditRecipe {
             masks: vec![LocalAdjustment {
                 mask: MaskGeometry::Bitmap { path: mask_path.into() },
-                name: "反推·天空".into(),
+                role: MaskRole::ZoneSky,
                 amount: 1.0,
                 exposure_ev: d.exposure_ev,
                 color_gains: Some(d.color_gains),
@@ -710,7 +715,7 @@ mod tests {
         let err_global = report.err_after;
         attach_zones(&src, &tgt, &mut report, &sky_mask, &sky_mask, mask_path);
         assert!(
-            report.recipe.masks.iter().any(|m| m.name == "反推·天空" && !m.inverted),
+            report.recipe.masks.iter().any(|m| m.role == MaskRole::ZoneSky && !m.inverted),
             "sky correction must attach: {}",
             report.recipe.rationale
         );
@@ -763,7 +768,7 @@ mod tests {
         let mut report = fit::fit_recipe(&src, &tgt);
         attach_zones(&src, &tgt, &mut report, &sky_mask, &sky_mask, mask_path);
         assert!(
-            report.recipe.masks.iter().any(|m| m.name == "反推·天空" && !m.inverted),
+            report.recipe.masks.iter().any(|m| m.role == MaskRole::ZoneSky && !m.inverted),
             "sky zone must attach: {}",
             report.recipe.rationale
         );
@@ -771,7 +776,7 @@ mod tests {
             .recipe
             .masks
             .iter()
-            .find(|m| m.name == "反推·地景")
+            .find(|m| m.role == MaskRole::ZoneLand)
             .unwrap_or_else(|| panic!("land zone must attach: {}", report.recipe.rationale));
         assert!(land.inverted, "the land zone rides the INVERTED sky raster");
         assert!(

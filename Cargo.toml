@@ -6,6 +6,11 @@ description = "AI-assisted automatic development of RAW photographs (EditRecipe 
 license = "MIT"
 repository = "https://github.com/skymanbp/autoshop"
 readme = "README.md"
+# Both binaries are declared explicitly below, so disable auto-discovery of
+# src/main.rs + src/bin/*.rs. This lets the GUI keep a private submodule at
+# src/bin/i18n.rs (`mod i18n;` in gui.rs) WITHOUT Cargo treating that file as a
+# separate binary target (it has no `main`, so autobins would fail to build it).
+autobins = false
 
 # Shared engine library — linked by both front-ends.
 [lib]

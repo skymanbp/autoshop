@@ -323,6 +323,14 @@ pub struct LocalAdjustment {
     /// XMP skips anyway (see [`MaskGeometry::Bitmap`]). Composes
     /// multiplicatively with the temperature/tint gains in the engine.
     pub color_gains: Option<[f32; 3]>,
+    /// Which semantic zone produced this mask, a STABLE identity independent of
+    /// the free-text `name` (which the GUI now translates, so it can no longer
+    /// be an equality key). `Custom` for every user/AI mask; the zoned
+    /// reverse-fit tags its two masks `ZoneSky`/`ZoneLand` (fit_zoned.rs). Like
+    /// `color_gains`, ENGINE-ONLY — the fit only sets it on Bitmap masks, which
+    /// the XMP writer skips, so it never reaches a sidecar (round-trips only in
+    /// the app-internal `recipe.json`).
+    pub role: MaskRole,
 }
 
 impl Default for LocalAdjustment {
@@ -347,6 +355,47 @@ impl Default for LocalAdjustment {
             tint: 0.0,
             noise_reduction: 0.0,
             color_gains: None,
+            role: MaskRole::Custom,
+        }
+    }
+}
+
+/// Which semantic zone a local adjustment came from — a STABLE mask identity
+/// that survives UI translation and user renaming (the display `name` is free
+/// text and, since i18n, no longer a reliable key). Set by the zoned
+/// reverse-fit (fit_zoned.rs); `Custom` for every user-placed or AI-segmented
+/// mask. Serialised in `recipe.json` as `"custom"` / `"zone_sky"` /
+/// `"zone_land"`; never written to XMP (see [`LocalAdjustment::role`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaskRole {
+    /// A user-placed or AI-segmented mask — identity carried by `name` only.
+    #[default]
+    Custom,
+    /// Sky zone from the zoned reverse-fit (rides the upright sky raster).
+    ZoneSky,
+    /// Land zone from the zoned reverse-fit (rides the INVERTED sky raster).
+    ZoneLand,
+}
+
+impl MaskRole {
+    /// ASCII tag for the fit's rationale text (`"custom"` / `"sky"` / `"land"`).
+    pub fn tag(self) -> &'static str {
+        match self {
+            MaskRole::Custom => "custom",
+            MaskRole::ZoneSky => "sky",
+            MaskRole::ZoneLand => "land",
+        }
+    }
+
+    /// Canonical English display name for a zone mask, or `None` for `Custom`
+    /// (whose label is the user's own `name`). The GUI runs this through i18n
+    /// so the mask row localises alongside the rest of the UI.
+    pub fn en_name(self) -> Option<&'static str> {
+        match self {
+            MaskRole::Custom => None,
+            MaskRole::ZoneSky => Some("Sky (reverse-fit)"),
+            MaskRole::ZoneLand => Some("Land (reverse-fit)"),
         }
     }
 }
