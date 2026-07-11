@@ -1,16 +1,43 @@
 # ROADMAP — “一定程度直接取代 Photoshop” 路线（v0.5.0 之后 · UX 阶段）
 
 > 交接文档：每项都附实现要点与 `file:line` 锚点，供新会话不重读全库即可
-> 开工。更新于 2026-07-10（**v0.8.1 已发布**：tag `v0.8.1` → `ce69f27`，
-> "v0.8.1 — preview lag root-fix (LUT colour gains + async latest-wins)"，
-> 双 exe 资产字节核对 gui 33344521 / cli 25945946，标记 Latest；性能批次
-> #2-C（`759c9ca`/`c1e8b8d`/`393c496` + bump `ce69f27`）随此 patch 版发布——
-> 渲染输出较 v0.8.0 逐字节不变，故 patch 而非 minor。前一版 v0.8.0 →
-> `1c1ea36`（zoned reverse-fit + engine local WB）。反馈驱动阶段——用户
-> 试用 → 报障/提需 → 修复/打磨 → 发布）。
+> 开工。更新于 2026-07-11（**v0.9.0 已发布**：tag `v0.9.0` → `ca6f73e`，
+> "v0.9.0 — GUI multi-language (English skeleton + Chinese overlay)"，
+> 双 exe 资产字节核对 gui 33451827 / cli 25974719，标记 Latest；GUI i18n
+> （`cad6c68` feat + bump `ca6f73e`）——新增用户可见功能故 minor 而非 patch。
+> 前一版 v0.8.1 → `ce69f27`（preview lag root-fix：LUT colour gains + async
+> latest-wins，双 exe gui 33344521 / cli 25945946）；再前 v0.8.0 → `1c1ea36`
+> （zoned reverse-fit + engine local WB）。反馈驱动阶段——用户试用 → 报障/
+> 提需 → 修复/打磨 → 发布）。
 
 ## 当前状态（已完成，勿重做）
 
+- **GUI 多语言 i18n：英文骨架 + 中文切换（2026-07-11，已随 v0.9.0 发布 → `ca6f73e`）**
+  ——把原生 GUI ~430 条中英混排硬编码文案统一到零依赖、英文即键的翻译层。
+  发布前 4 路对抗审计（密钥/范围/键覆盖/MaskRole）0 blocker，键覆盖审计报出
+  3 条工具提示缺中文（WB 吸管 hover / 裁剪提示 / 镜头提示）——已补全并逐字节
+  核对键在 gui.rs 调用点与 i18n.rs 目录两侧各出现一次（否则中文模式静默回退英文）。
+  1. **新模块 `src/bin/i18n.rs`（`cad6c68`，557 行）**：`Lang{En,Zh}`（Copy+serde，
+     默认 En）、`tr(lang,en)`（En 原样返回=骨架；Zh 查 `ZH_ENTRIES` 缺则回退 en）、
+     `trf(lang,en,&[(name,val)])`（运行时 `{name}` 替换——`format!` 要编译期字面量，
+     翻译串只能运行时插值）。`ZH_ENTRIES` = 唯一译文目录 = 语言版本控制单一来源。
+     键必须与调用点英文字面量逐字节一致，否则 Zh 静默 miss（编译不报、测试也过）。
+  2. **gui.rs 全量路由**：~430 条用户可见字面量过 `tr`/`trf`；每渲染函数顶
+     `let lang = self.lang;`（Lang: Copy，不借 self，避开 worker 闭包借用冲突）。
+     `Prefs.lang`（serde 容器级 default → 旧存档缺字段解码为 En，不重置其他偏好）、
+     `AutoshopApp.lang`、save/restore 已接；设置区 Language 下拉切换下一帧即生效。
+  3. **MaskRole 蒙版名解耦（recipe.rs/fit_zoned.rs）**：`enum MaskRole{#[default]
+     Custom,ZoneSky,ZoneLand}` 挂 `LocalAdjustment.role`（`#[serde(default)]`），把
+     分区蒙版身份从可翻译显示名剥离——名字可翻译而不破相等判断与 recipe.json 往返。
+     engine-only，**不进 XMP**（xmp.rs 零引用，Bitmap 蒙版被写入器整体跳过，已验）。
+     3 处 zoned 测试从 `m.name==` 迁到 `m.role==`。旧 recipe.json 缺 role 解码为
+     Custom；新写 recipe 被更旧 build 读会因 `deny_unknown_fields` 报错（前向不兼容，
+     app 内部数据、无 XMP 影响，可接受，同 color_gains 先例）。
+  4. **Cargo.toml `autobins=false`**：两 `[[bin]]` 均显式声明，使 `src/bin/i18n.rs`
+     （无 main）作 gui.rs 子模块而非独立二进制目标。
+  基线 **97 lib + 7 gui** 全绿、clippy(gui) 零警告、双 exe 重建（gui 33451827 /
+  cli 25974719）。范围仅原生 GUI——Web UI（index.html/serve.rs）、CLI（main.rs）未
+  动。待用户 GUI 真机复测手感（英文默认 → 设置切中文 → 全 UI 中文；缺译回退英文）。
 - **性能批次 #2-C：预览卡顿根治（2026-07-10，已随 v0.8.1 发布 → `ce69f27`）**——用户报
   "处理图片时会有些卡"。多代理只读剖析 + 无头基准定位两层根因，各根修：
   1. **色偏增益 LUT 化（`759c9ca`，render.rs）**：v0.8 分区蒙版的
