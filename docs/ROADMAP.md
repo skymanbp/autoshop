@@ -1,19 +1,55 @@
 # ROADMAP — “一定程度直接取代 Photoshop” 路线（v0.5.0 之后 · UX 阶段）
 
 > 交接文档：每项都附实现要点与 `file:line` 锚点，供新会话不重读全库即可
-> 开工。更新于 2026-07-12（**v0.10.0 已发布**：tag `v0.10.0` → `c312a9f`，
-> "v0.10.0 — restore saved edits on open (recipe.json/XMP import) +
-> responsiveness quick-wins"，双 exe 资产字节核对 gui 33510426 /
-> cli 25964746，标记 Latest；`6957897` lib XMP 读取器 + `3124596` gui
-> 打开即恢复/无损保存/性能快赢 + bump `c312a9f`——新增用户可见功能故
-> minor。前版 v0.9.0 → `ca6f73e`（GUI i18n 英文骨架+中文覆盖，gui
-> 33451827 / cli 25974719）；v0.8.1 → `ce69f27`（preview lag root-fix：
-> LUT colour gains + async latest-wins）；v0.8.0 → `1c1ea36`（zoned
+> 开工。更新于 2026-07-12（**v0.11.0 已发布**：tag `v0.11.0` → `e3a4096`，
+> "v0.11.0 — engine parallelism + LUT hot loops + caches (perf batch
+> #3-B complete)"，双 exe 资产字节核对 gui 34424518 / cli 26489314，
+> 标记 Latest；`b15996c` 引擎 + `e2b4b6b` GUI + `73b4f43` CLI/Web/Style
+> + bump `e3a4096`——29 项审计 backlog 全清，探针 81→44.7ms/149→34.5ms
+> 校验和不变。同日前版 v0.10.0 → `c312a9f`（打开即恢复边车 + XMP 导入 +
+> 快赢，gui 33510426 / cli 25964746）；v0.9.0 → `ca6f73e`（GUI i18n）；
+> v0.8.1 → `ce69f27`（preview lag root-fix）；v0.8.0 → `1c1ea36`（zoned
 > reverse-fit + engine local WB）。反馈驱动阶段——用户试用 → 报障/提需 →
 > 修复/打磨 → 发布）。
 
 ## 当前状态（已完成，勿重做）
 
+- **性能批次 #3-B：引擎并行化 + 全量 backlog 清零（2026-07-12，已随 v0.11.0 发布 → `e3a4096`）**
+  ——把 v0.10.0 记录的 29 项审计 backlog **全部**落地（`b15996c` 引擎 +
+  `e2b4b6b` GUI + `73b4f43` CLI/Web/Style，后者由两个 worktree 隔离子代理
+  实现、diff 回传合并）。release 基准探针（钉死校验和）**通过**且大幅加速：
+  单彩色蒙版 81→44.7 ms/帧、天空+地景对 149→34.5、无彩对 92→25.0
+  （相对 v0.8.1 同机基线）。
+  1. **引擎 rayon 并行（render.rs，`b15996c`）**：rawler demosaic 本就并行，
+     尾部全串行——现在 tone/RGB曲线/HSL/分级/饱和/dehaze/暗角/双蒙版通道/
+     unsharp/NR/u16·u8 打包/f32 转换/旋转·畸变重采样全部按行或按像素并行。
+     逐像素数学未动 → 逐位不变（模糊通道保持每列运算次序）。新依赖
+     rayon（本就在 Cargo.lock 里，rawler 用）+ bytemuck（零拷贝转换）。
+  2. **powf 热环 LUT 化**：dehaze/暗角每像素 6-7 次 powf → 共享 4096 项
+     传递曲线 LUT 对（同 v0.8.1 色偏增益已验证的亚量化误差包络）+ 暗角
+     径向增益 LUT；dehaze 的 airlight 直方图**保留精确 powf**（避免估计
+     跨 bin 漂移）。convert_export_color_space：u16 输入 → 65536 项**精确**
+     解码表（逐位不变）+ 按值传递（sRGB 恒等与 16 位路径改移动，省 ~366MB
+     克隆）+ 行并行。
+  3. **内存/访存**：box_blur_v 改行主序 + 每列 running-sum（原列主序在导出
+     尺寸平面上全程打到 DRAM 延迟；逐位不变）；orient_f32 bytemuck 零拷贝
+     （竖构图 61MP 原付三次 ~732MB 拷贝）；rotate/distort 借用已是 Rgb16 的
+     源不再克隆；打开时中性 tone-pass 短路（原对全传感器无条件跑恒等 LUT）。
+  4. **GUI（`e2b4b6b`）**：削波开关（J/▲/直方图三角）改用保留的上一帧像素
+     即时重建 overlay（原每次开关整幅重显影 100-300ms）；RGB→RGBA 纹理
+     转换移入 worker（PreviewDone.after，UI 线程只 tex.set）；**持久缩略图
+     磁盘缓存**（%LOCALAPPDATA%/autoshop/thumbs，键=路径+mtime+大小哈希，
+     二次会话 ~1ms 回显，>10k 文件按龄一次性后台修剪）；>24MP 烘焙图解码
+     单许可门（原 6 并发 60MP TIFF 峰值 ~2GB）；图库纹理超 1500 项按视口
+     窗逐出（原 1 万图钉 ~0.7GB）；蒙版覆盖栅格上限 1024px（display-only）。
+  5. **CLI/Web/Style（`73b4f43`）**：CLI batch 3 线程有界池（网络与渲染重叠，
+     --limit 语义/失败语义/汇总保持，stdout 行原子）；Web /api/develop 与
+     preview/thumb 共享 (path,mtime) 键解码缓存（每滑杆手势不再全幅解码）；
+     风格索引 4 线程池按槽位写回（exemplar 次序与串行完全一致）。
+  基线 **102 lib + 9 gui** 全绿、clippy 0、探针校验和不变。已知偏差（诚实
+  记录）：dehaze/暗角像素环走 LUT（8-bit 输出在量化内不变、16-bit 可 ±数
+  LSB，同 v0.8.1 色偏先例）；打开路径中性 tone-pass 跳过消除了旧恒等 LUT
+  的舍入噪声（更正确，非逐位同旧版）；覆盖 overlay 超 1024px 用降采样参考。
 - **边车恢复 + 响应性快赢（2026-07-12，已随 v0.10.0 发布 → `c312a9f`）**——用户报
   "图库显示 ● edited 但打开后不加载 XMP"。根因：徽标查 ./out 边车
   （recipe.json‖xmp，gui.rs `gallery_panel`），而打开路径从不读它们
@@ -49,35 +85,9 @@
   基线 **102 lib + 9 gui** 全绿（+5 xmp round-trip、+1 边车优先级、
   +1 LRU）、clippy(gui) 零警告。待用户真机验收：打开带 ● edited 的照片应
   直接回到保存的编辑；反推→关→重开应完整还原（含分区蒙版）。
-  **未做——引擎性能批次 #3-B backlog（审计确证、按影响排序，勿凭印象重推导）**：
-  - HIGH `render.rs:485` 整个 develop 管线单线程（rawler demosaic 内部已
-    rayon 并行，尾部全串行）——加 rayon `par_chunks_mut` 按行并行各逐像素
-    段（逐像素独立，逐字节不变；dehaze 直方图需每线程直方图合并）。
-  - HIGH `render.rs:637` apply_dehaze 每像素 6 次 powf（sRGB↔线性×3×2）
-    ——复用 v0.8.1 色偏增益同款 4096 项 LUT 机制（参数无关可 OnceLock）。
-  - HIGH `render.rs:570` apply_vignette 每像素 7 次 powf——增益 LUT(rn)
-    + 共享 sRGB↔线性 LUT 对。
-  - MEDIUM `render.rs:313` convert_export_color_space 每像素 6 powf
-    （P3/AdobeRGB 导出多秒纯数学）——u16 输入可用 65536 项精确解码表。
-  - MEDIUM `render.rs:1035` box_blur_v 列主序访存（clarity/NR 每显影至多
-    4 次调用）→ 行主序 + 每列 running-sum，结果逐位不变。
-  - MEDIUM `render.rs:1660` orient_f32 三次整幅拷贝（61MP 各 ~732MB）→
-    bytemuck cast_vec 零拷贝；LOW `render.rs:1703` rotate/distort/export
-    对已是 Rgb16 的 to_rgb16() 克隆 → as_rgb16 借用。
-  - MEDIUM gui 打开路径整幅显影后才缩略（`gui.rs open_path`：60MP 全解
-    喂 ≤1280 预览）——`render_to_image` 加 max_edge 于 orient 后先降采样
-    （预览像素轻微变化：线性光 vs 伽马域缩放，需目视验收）；或最小改
-    默认配方恒等 tone-pass 短路。
-  - MEDIUM `decode.rs:239` 烘焙图缩略图全幅解码（60MP TIFF ~360MB/张 ×6
-    并发）；`gui.rs` thumbs 纹理无上限（5k 图 ~350MB）+ 无磁盘缩略图缓存
-    （每次启动全量重解）→ %LOCALAPPDATA% JPEG 缓存 + LRU 逐出。
-  - MEDIUM `serve.rs:457` Web /api/develop 每请求重解全幅嵌入 JPEG →
-    (path,mtime) 键 Arc 缓存（同 load_mask_bitmap 先例 render.rs:815）。
-  - MEDIUM `main.rs:571` CLI 批量严格串行（网络等待与 CPU 渲染不重叠）→
-    2-4 线程有界池；`style.rs:148` 建风格索引串行全库解码 → scope 池 ~4。
-  - LOW `gui.rs:1964` 削波开关 J 触发整幅重显影 → 保留上帧 RgbImage 直接
-    重建 overlay；LOW `gui.rs:1716` finish_redevelop UI 线程 RGB→RGBA 扩展
-    → 移入 build_preview。
+  ~~引擎性能批次 #3-B backlog~~ → **已全部随 v0.11.0 落地**（见上一条；
+  唯一形态调整：打开路径的"降采样后显影"以更安全的等价方案落地——中性
+  tone-pass 短路 + 全管线并行化，预览像素不做线性/伽马域缩放置换）。
 - **GUI 多语言 i18n：英文骨架 + 中文切换（2026-07-11，已随 v0.9.0 发布 → `ca6f73e`）**
   ——把原生 GUI ~430 条中英混排硬编码文案统一到零依赖、英文即键的翻译层。
   发布前 4 路对抗审计（密钥/范围/键覆盖/MaskRole）0 blocker，键覆盖审计报出
