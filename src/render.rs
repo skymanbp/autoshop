@@ -24,10 +24,34 @@ use rawler::get_decoder;
 use rawler::imgop::develop::{Intermediate, RawDevelop};
 use rawler::rawsource::RawSource;
 use rawler::Orientation;
+use rayon::prelude::*;
 
 use crate::recipe::{EditRecipe, MaskGeometry, RangeMask};
 
 const LUT_N: usize = 4096;
+
+/// Shared, parameter-free transfer-curve LUTs: `[0]` = sRGB→linear, `[1]` =
+/// linear→sRGB. Built once per process (OnceLock). Dehaze and vignette used to
+/// evaluate both `powf` curves for every pixel — the identical 6-powf/px
+/// pattern the v0.8.1 colour-gain fix removed (measured there: 609 ms vs 53 ms
+/// per 1280×853 frame). 4096-entry linear interpolation keeps the error in the
+/// same sub-8-bit-quantisation envelope `colour_gain_luts` pinned with a test;
+/// dehaze's airlight HISTOGRAM keeps the exact powf (a 1e-5 shift across a bin
+/// edge could move the whole-frame airlight estimate — not worth the few ms).
+fn transfer_luts() -> &'static ([f32; LUT_N], [f32; LUT_N]) {
+    use std::sync::OnceLock;
+    static LUTS: OnceLock<([f32; LUT_N], [f32; LUT_N])> = OnceLock::new();
+    LUTS.get_or_init(|| {
+        let mut dec = [0.0f32; LUT_N];
+        let mut enc = [0.0f32; LUT_N];
+        for i in 0..LUT_N {
+            let x = i as f32 / (LUT_N - 1) as f32;
+            dec[i] = srgb_to_linear(x);
+            enc[i] = linear_to_srgb(x);
+        }
+        (dec, enc)
+    })
+}
 
 /// Develop `raw_path` and apply `recipe`, returning the finished image. When
 /// `denoise` is set, the demosaiced buffer is AI-denoised (via the Python
@@ -81,12 +105,12 @@ pub fn render_to_image(
     apply_develop(&mut data, w, h, recipe);
 
     // --- pack to 16-bit (highest precision; JPEG downconverts at encode) ------
-    let mut buf: Vec<u16> = Vec::with_capacity(w * h * 3);
-    for px in &data {
-        buf.push(to_u16(px[0]));
-        buf.push(to_u16(px[1]));
-        buf.push(to_u16(px[2]));
-    }
+    let mut buf: Vec<u16> = vec![0u16; w * h * 3];
+    buf.par_chunks_mut(3).zip(data.par_iter()).for_each(|(o, px)| {
+        o[0] = to_u16(px[0]);
+        o[1] = to_u16(px[1]);
+        o[2] = to_u16(px[2]);
+    });
     let img: ImageBuffer<Rgb<u16>, _> = ImageBuffer::from_raw(w as u32, h as u32, buf)
         .ok_or_else(|| anyhow!("pixel buffer size mismatch"))?;
     // Orientation was applied BEFORE develop (see orient_f32 above), so the
@@ -138,7 +162,8 @@ pub fn render_baked_to_image(
     let rgb = img.to_rgb16();
     let (w, h) = (rgb.width() as usize, rgb.height() as usize);
     let mut data: Vec<[f32; 3]> = rgb
-        .pixels()
+        .as_raw()
+        .par_chunks(3)
         .map(|p| [p[0] as f32 / 65535.0, p[1] as f32 / 65535.0, p[2] as f32 / 65535.0])
         .collect();
 
@@ -150,12 +175,12 @@ pub fn render_baked_to_image(
     apply_recipe_wb(&mut data, recipe);
     apply_develop(&mut data, w, h, recipe);
 
-    let mut buf: Vec<u16> = Vec::with_capacity(w * h * 3);
-    for px in &data {
-        buf.push(to_u16(px[0]));
-        buf.push(to_u16(px[1]));
-        buf.push(to_u16(px[2]));
-    }
+    let mut buf: Vec<u16> = vec![0u16; w * h * 3];
+    buf.par_chunks_mut(3).zip(data.par_iter()).for_each(|(o, px)| {
+        o[0] = to_u16(px[0]);
+        o[1] = to_u16(px[1]);
+        o[2] = to_u16(px[2]);
+    });
     let out: ImageBuffer<Rgb<u16>, _> = ImageBuffer::from_raw(w as u32, h as u32, buf)
         .ok_or_else(|| anyhow!("baked pixel buffer size mismatch"))?;
     let mut dynimg = DynamicImage::ImageRgb16(out);
@@ -304,18 +329,23 @@ fn srgb_to_space_matrix(space: ExportColorSpace) -> Option<[[f32; 3]; 3]> {
 /// Convert a rendered (sRGB-encoded) image into the requested delivery space:
 /// decode the sRGB TRC → change primaries in linear light → encode the
 /// target's TRC (P3 shares sRGB's curve; Adobe RGB is a pure 563/256 gamma).
-/// 16-bit throughout. Identity (clone) for sRGB.
-pub fn convert_export_color_space(img: &DynamicImage, space: ExportColorSpace) -> DynamicImage {
+/// 16-bit throughout; takes the image BY VALUE so the sRGB identity and the
+/// already-16-bit export path move instead of cloning a ~366 MB frame.
+/// The u16 input makes the decode a 65536-entry EXACT table (the same
+/// function precomputed per representable input — bit-identical, zero
+/// interpolation); the encode keeps its exact powf, and rows run in parallel.
+pub fn convert_export_color_space(img: DynamicImage, space: ExportColorSpace) -> DynamicImage {
     let Some(m) = srgb_to_space_matrix(space) else {
-        return img.clone();
+        return img;
     };
-    let mut rgb = img.to_rgb16();
-    for px in rgb.pixels_mut() {
-        let lin = [
-            srgb_to_linear(px[0] as f32 / 65535.0),
-            srgb_to_linear(px[1] as f32 / 65535.0),
-            srgb_to_linear(px[2] as f32 / 65535.0),
-        ];
+    let mut rgb = match img {
+        DynamicImage::ImageRgb16(b) => b,
+        other => other.to_rgb16(),
+    };
+    let dec: Vec<f32> = (0..=65535u32).map(|v| srgb_to_linear(v as f32 / 65535.0)).collect();
+    let buf: &mut [u16] = &mut rgb;
+    buf.par_chunks_mut(3).for_each(|px| {
+        let lin = [dec[px[0] as usize], dec[px[1] as usize], dec[px[2] as usize]];
         let t = mat_vec3(&m, &lin);
         let enc = |c: f32| -> u16 {
             let c = c.clamp(0.0, 1.0);
@@ -325,8 +355,10 @@ pub fn convert_export_color_space(img: &DynamicImage, space: ExportColorSpace) -
             };
             (e.clamp(0.0, 1.0) * 65535.0).round() as u16
         };
-        *px = Rgb([enc(t[0]), enc(t[1]), enc(t[2])]);
-    }
+        px[0] = enc(t[0]);
+        px[1] = enc(t[1]);
+        px[2] = enc(t[2]);
+    });
     DynamicImage::ImageRgb16(rgb)
 }
 
@@ -386,19 +418,24 @@ pub fn render_to_file(
     }
     if opts.sharpen > 0.0 {
         // Same luma-unsharp the develop uses, run on the delivery-size pixels.
-        let rgb = img.to_rgb16();
+        // The 16-bit export path MOVES its buffer here (no to_rgb16 clone).
+        let rgb = match img {
+            DynamicImage::ImageRgb16(b) => b,
+            other => other.to_rgb16(),
+        };
         let (w, h) = (rgb.width() as usize, rgb.height() as usize);
         let mut data: Vec<[f32; 3]> = rgb
-            .pixels()
+            .as_raw()
+            .par_chunks(3)
             .map(|p| [p[0] as f32 / 65535.0, p[1] as f32 / 65535.0, p[2] as f32 / 65535.0])
             .collect();
         unsharp_luma(&mut data, w, h, 1, (opts.sharpen / 100.0).clamp(0.0, 1.0), false);
-        let mut buf: Vec<u16> = Vec::with_capacity(w * h * 3);
-        for px in &data {
-            for c in px {
-                buf.push((c.clamp(0.0, 1.0) * 65535.0).round() as u16);
+        let mut buf: Vec<u16> = vec![0u16; w * h * 3];
+        buf.par_chunks_mut(3).zip(data.par_iter()).for_each(|(o, px)| {
+            for c in 0..3 {
+                o[c] = (px[c].clamp(0.0, 1.0) * 65535.0).round() as u16;
             }
-        }
+        });
         img = DynamicImage::ImageRgb16(
             ImageBuffer::from_raw(w as u32, h as u32, buf).expect("sharpen buffer size matches"),
         );
@@ -415,7 +452,7 @@ pub fn render_to_file(
     let taggable = matches!(ext.as_str(), "jpg" | "jpeg" | "tif" | "tiff" | "png");
     let space = if taggable { opts.color_space } else { ExportColorSpace::Srgb };
     if space != ExportColorSpace::Srgb {
-        img = convert_export_color_space(&img, space);
+        img = convert_export_color_space(img, space);
     }
     let create = |p: &Path| {
         std::fs::File::create(p)
@@ -464,17 +501,18 @@ pub fn develop_preview(preview: &DynamicImage, recipe: &EditRecipe) -> DynamicIm
     let rgb = preview.to_rgb8();
     let (w, h) = rgb.dimensions();
     let mut data: Vec<[f32; 3]> = rgb
-        .pixels()
+        .as_raw()
+        .par_chunks(3)
         .map(|p| [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0])
         .collect();
     apply_recipe_wb(&mut data, recipe);
     apply_develop(&mut data, w as usize, h as usize, recipe);
-    let mut buf = Vec::with_capacity((w * h * 3) as usize);
-    for px in &data {
-        buf.push(to_u8(px[0]));
-        buf.push(to_u8(px[1]));
-        buf.push(to_u8(px[2]));
-    }
+    let mut buf = vec![0u8; (w * h * 3) as usize];
+    buf.par_chunks_mut(3).zip(data.par_iter()).for_each(|(o, px)| {
+        o[0] = to_u8(px[0]);
+        o[1] = to_u8(px[1]);
+        o[2] = to_u8(px[2]);
+    });
     DynamicImage::ImageRgb8(RgbImage::from_raw(w, h, buf).expect("preview buffer size matches"))
 }
 
@@ -507,11 +545,23 @@ fn apply_develop(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
     //    saturated colour to grey. The LUT itself is monotone with a pinned white
     //    point (see build_tone_lut), so no per-channel greying and no flat/inverted
     //    midtones — the tone model is correct by construction, not patched.
-    let lut = build_tone_lut(r);
-    for px in data.iter_mut() {
-        let l_old = luma601(px);
-        let l_new = sample_lut(&lut, l_old);
-        scale_chroma(px, l_old, l_new);
+    //    A fully-neutral tone recipe skips the pass outright: sampling an
+    //    identity LUT is the identity map up to interpolation rounding, and this
+    //    pass used to run unconditionally over the full sensor on every open.
+    let tone_neutral = r.exposure_ev == 0.0
+        && r.contrast == 0.0
+        && r.highlights == 0.0
+        && r.shadows == 0.0
+        && r.whites == 0.0
+        && r.blacks == 0.0
+        && r.tone_curve.is_empty();
+    if !tone_neutral {
+        let lut = build_tone_lut(r);
+        data.par_iter_mut().for_each(|px| {
+            let l_old = luma601(px);
+            let l_new = sample_lut(&lut, l_old);
+            scale_chroma(px, l_old, l_new);
+        });
     }
     // 1b) per-channel RGB curves (red/green/blue), right after the master curve.
     apply_rgb_curves(data, r);
@@ -528,9 +578,9 @@ fn apply_develop(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
     // 3) saturation / vibrance.
     let (sat, vib) = (r.saturation / 100.0, r.vibrance / 100.0);
     if sat != 0.0 || vib != 0.0 {
-        for px in data.iter_mut() {
+        data.par_iter_mut().for_each(|px| {
             *px = apply_sat_vibrance(px[0], px[1], px[2], sat, vib);
-        }
+        });
     }
     // 4) noise reduction — BEFORE sharpening (the order that matters most).
     if r.noise_reduction > 0.0 {
@@ -562,21 +612,28 @@ fn apply_vignette(data: &mut [[f32; 3]], w: usize, h: usize, amount: f32, midpoi
     let rmax = (cx * cx + cy * cy).sqrt().max(1.0);
     let gamma = 0.6 + 2.4 * (midpoint.clamp(0.0, 100.0) / 100.0);
     let k = amount.clamp(-100.0, 100.0) / 100.0;
-    for y in 0..h {
-        for x in 0..w {
+    // This stage used to cost 7 powf per pixel (rn^gamma + two transfer curves
+    // × 3 channels) on every preview tick / export. Three LUTs replace them:
+    // the radial gain over rn ∈ [0,1], and the shared transfer pair. Rows are
+    // independent, so the pass is also row-parallel.
+    let gain_lut: Vec<f32> = (0..LUT_N)
+        .map(|i| 1.0 + k * (i as f32 / (LUT_N - 1) as f32).powf(gamma))
+        .collect();
+    let (dec, enc) = transfer_luts();
+    data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let dy = y as f32 - cy;
+        for (x, px) in row.iter_mut().enumerate() {
             let dx = x as f32 - cx;
-            let dy = y as f32 - cy;
             let rn = ((dx * dx + dy * dy).sqrt() / rmax).clamp(0.0, 1.0);
-            let gain = 1.0 + k * rn.powf(gamma);
+            let gain = sample_lut(&gain_lut, rn);
             if (gain - 1.0).abs() < 1e-6 {
                 continue;
             }
-            let px = &mut data[y * w + x];
             for c in px.iter_mut() {
-                *c = linear_to_srgb((srgb_to_linear(*c) * gain).clamp(0.0, 1.0));
+                *c = sample_lut(enc, (sample_lut(dec, *c) * gain).clamp(0.0, 1.0));
             }
         }
-    }
+    });
 }
 
 /// Dehaze: pointwise atmospheric-scattering inversion, `amount` -100..=100.
@@ -634,8 +691,12 @@ fn apply_dehaze(data: &mut [[f32; 3]], amount: f32) {
     }
     let a = (a_bin as f32 / 1023.0).clamp(0.10, 1.0);
 
-    for px in data.iter_mut() {
-        let lin = [srgb_to_linear(px[0]), srgb_to_linear(px[1]), srgb_to_linear(px[2])];
+    // Per-pixel loop: 6 powf/px replaced by the shared transfer LUTs (the
+    // airlight histogram above keeps the exact powf — see transfer_luts), and
+    // pixels are independent so the pass is parallel.
+    let (dec, enc) = transfer_luts();
+    data.par_iter_mut().for_each(|px| {
+        let lin = [sample_lut(dec, px[0]), sample_lut(dec, px[1]), sample_lut(dec, px[2])];
         let out = if s > 0.0 {
             let w = (lin[0].min(lin[1]).min(lin[2]) / a).clamp(0.0, 1.0);
             let t = (1.0 - K * s * w).max(T_MIN);
@@ -650,9 +711,9 @@ fn apply_dehaze(data: &mut [[f32; 3]], amount: f32) {
             ]
         };
         for (c, o) in px.iter_mut().zip(out) {
-            *c = linear_to_srgb(o.clamp(0.0, 1.0));
+            *c = sample_lut(enc, o.clamp(0.0, 1.0));
         }
-    }
+    });
 }
 
 /// Apply each local masked adjustment: blend the masked region toward a locally
@@ -701,15 +762,14 @@ fn apply_masks(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
             wgt * amount
         };
 
-        // --- tone + saturation pass ---
-        for y in 0..h {
-            for x in 0..w {
+        // --- tone + saturation pass (rows independent → parallel) ---
+        data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            for (x, out_px) in row.iter_mut().enumerate() {
                 let mut wgt = weight_at(x, y);
                 if wgt <= 0.001 {
                     continue;
                 }
-                let i = y * w + x;
-                let p = data[i];
+                let p = *out_px;
                 // Range Mask refinement: intersect the geometric weight with the
                 // per-pixel range weight, evaluated on the pixel as it stands when
                 // this mask runs (post-global develop, pre-this-mask — masks stack
@@ -736,34 +796,34 @@ fn apply_masks(data: &mut [[f32; 3]], w: usize, h: usize, r: &EditRecipe) {
                 scale_chroma(&mut t, l_old, l_new);
                 let t = apply_sat_vibrance(t[0], t[1], t[2], sat, 0.0);
                 for c in 0..3 {
-                    data[i][c] = p[c] * (1.0 - wgt) + t[c] * wgt;
+                    out_px[c] = p[c] * (1.0 - wgt) + t[c] * wgt;
                 }
             }
-        }
+        });
 
         // --- local noise reduction pass (only where the mask covers) ---
         let nr = (m.noise_reduction / 100.0).clamp(0.0, 1.0);
         if nr > 0.0 {
-            let luma: Vec<f32> = data.iter().map(luma601).collect();
+            let luma: Vec<f32> = data.par_iter().map(luma601).collect();
             let blur = blur_plane(&luma, w, h, 2);
-            for y in 0..h {
-                for x in 0..w {
+            data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+                for (x, px) in row.iter_mut().enumerate() {
                     let i = y * w + x;
                     let mut nw = weight_at(x, y) * nr;
                     if let Some(rm) = &m.range {
                         // Same intersection as the tone pass (pixel state here
                         // includes this mask's own tone move — acceptable drift,
                         // NR is the subtler effect).
-                        nw *= range_weight(rm, &data[i]);
+                        nw *= range_weight(rm, px);
                     }
                     if nw <= 0.001 {
                         continue;
                     }
                     let l = luma[i];
                     let new_l = l + (blur[i] - l) * nw;
-                    scale_chroma(&mut data[i], l, new_l);
+                    scale_chroma(px, l, new_l);
                 }
-            }
+            });
         }
     }
 }
@@ -962,31 +1022,31 @@ fn scale_chroma(px: &mut [f32; 3], l_old: f32, l_new: f32) {
 /// Unsharp mask on luminance (chroma-preserving). `amount` scales the detail;
 /// `midtone` weights the effect toward midtones (for clarity).
 fn unsharp_luma(data: &mut [[f32; 3]], w: usize, h: usize, radius: usize, amount: f32, midtone: bool) {
-    let luma: Vec<f32> = data.iter().map(luma601).collect();
+    let luma: Vec<f32> = data.par_iter().map(luma601).collect();
     let blurred = blur_plane(&luma, w, h, radius);
-    for (i, px) in data.iter_mut().enumerate() {
+    data.par_iter_mut().enumerate().for_each(|(i, px)| {
         let l = luma[i];
         let detail = l - blurred[i];
         let m = if midtone { 1.0 - (2.0 * l - 1.0).powi(2) } else { 1.0 };
         let new_l = (l + amount * detail * m).clamp(0.0, 1.0);
         scale_chroma(px, l, new_l);
-    }
+    });
 }
 
 /// Bilateral-lite luminance denoise: smooth flat areas, keep edges. `t` in 0..1.
 /// `denoised = l − t·w_edge·detail`, w_edge≈1 in flat regions, ≈0 at edges.
 fn noise_reduce_luma(data: &mut [[f32; 3]], w: usize, h: usize, t: f32) {
-    let luma: Vec<f32> = data.iter().map(luma601).collect();
+    let luma: Vec<f32> = data.par_iter().map(luma601).collect();
     let radius = (1.0 + 2.0 * t).round().max(1.0) as usize;
     let blurred = blur_plane(&luma, w, h, radius);
     let range = 0.05_f32;
-    for (i, px) in data.iter_mut().enumerate() {
+    data.par_iter_mut().enumerate().for_each(|(i, px)| {
         let l = luma[i];
         let detail = l - blurred[i];
         let w_edge = (-(detail / range) * (detail / range)).exp();
         let new_l = (l - t * w_edge * detail).clamp(0.0, 1.0);
         scale_chroma(px, l, new_l);
-    }
+    });
 }
 
 /// Approximate a Gaussian blur with 3 separable box-blur passes. Box blur uses a
@@ -1008,23 +1068,27 @@ fn blur_plane(src: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> {
 }
 
 fn box_blur_h(src: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> {
+    debug_assert_eq!(src.len(), w * h);
     let mut out = vec![0.0f32; src.len()];
     let r = radius as isize;
     let win = (2 * radius + 1) as f32;
-    for y in 0..h {
+    // Rows are independent → parallel (row count now comes from the chunking,
+    // not `h`); the per-row arithmetic order is exactly the serial version's,
+    // so the result is bit-identical.
+    out.par_chunks_mut(w).enumerate().for_each(|(y, orow)| {
         let base = y * w;
         let mut sum = 0.0f32;
         for k in -r..=r {
             sum += src[base + k.clamp(0, w as isize - 1) as usize];
         }
-        out[base] = sum / win;
-        for x in 1..w {
+        orow[0] = sum / win;
+        for (x, o) in orow.iter_mut().enumerate().skip(1) {
             let add = (x as isize + r).min(w as isize - 1) as usize;
             let sub = (x as isize - 1 - r).max(0) as usize;
             sum += src[base + add] - src[base + sub];
-            out[base + x] = sum / win;
+            *o = sum / win;
         }
-    }
+    });
     out
 }
 
@@ -1032,17 +1096,28 @@ fn box_blur_v(src: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; src.len()];
     let r = radius as isize;
     let win = (2 * radius + 1) as f32;
-    for x in 0..w {
-        let mut sum = 0.0f32;
-        for k in -r..=r {
-            sum += src[k.clamp(0, h as isize - 1) as usize * w + x];
+    // Row-major with one running sum PER COLUMN: the old column-major walk
+    // strode 4·w bytes on all three access streams, so export-sized planes
+    // fell out of cache into DRAM latency for most of the pass. Every access
+    // below is sequential, and each column's adds/subs happen in the exact
+    // order of the old per-column walk — the result is bit-identical.
+    let mut sums = vec![0.0f32; w];
+    for k in -r..=r {
+        let row = &src[k.clamp(0, h as isize - 1) as usize * w..][..w];
+        for (s, v) in sums.iter_mut().zip(row) {
+            *s += v;
         }
-        out[x] = sum / win;
-        for y in 1..h {
-            let add = (y as isize + r).min(h as isize - 1) as usize;
-            let sub = (y as isize - 1 - r).max(0) as usize;
-            sum += src[add * w + x] - src[sub * w + x];
-            out[y * w + x] = sum / win;
+    }
+    for (o, s) in out[..w].iter_mut().zip(&sums) {
+        *o = s / win;
+    }
+    for y in 1..h {
+        let add = &src[(y as isize + r).min(h as isize - 1) as usize * w..][..w];
+        let sub = &src[(y as isize - 1 - r).max(0) as usize * w..][..w];
+        let orow = &mut out[y * w..][..w];
+        for x in 0..w {
+            sums[x] += add[x] - sub[x];
+            orow[x] = sums[x] / win;
         }
     }
     out
@@ -1440,13 +1515,14 @@ fn apply_rgb_curves(data: &mut [[f32; 3]], r: &EditRecipe) {
     }
     let luts: [Vec<f32>; 3] =
         [curve_lut(curves[0]), curve_lut(curves[1]), curve_lut(curves[2])];
-    for px in data.iter_mut() {
+    let active = [!curves[0].is_empty(), !curves[1].is_empty(), !curves[2].is_empty()];
+    data.par_iter_mut().for_each(|px| {
         for ch in 0..3 {
-            if !curves[ch].is_empty() {
+            if active[ch] {
                 px[ch] = sample_lut(&luts[ch], px[ch]);
             }
         }
-    }
+    });
 }
 
 /// Saturation + vibrance around the pixel's luma. Vibrance boosts low-saturation
@@ -1473,7 +1549,7 @@ fn apply_hsl(data: &mut [[f32; 3]], hsl: &crate::recipe::Hsl) {
     if hsl.is_neutral() {
         return;
     }
-    for px in data.iter_mut() {
+    data.par_iter_mut().for_each(|px| {
         let (h, s, l) = rgb_to_hsl(px[0], px[1], px[2]);
         // Fade the WHOLE HSL effect out on low-CHROMA pixels. Gate on chroma
         // (max−min), NOT HSL saturation: HSL `s` is ill-conditioned near white and
@@ -1486,7 +1562,7 @@ fn apply_hsl(data: &mut [[f32; 3]], hsl: &crate::recipe::Hsl) {
         let chroma = px[0].max(px[1]).max(px[2]) - px[0].min(px[1]).min(px[2]);
         let satw = smoothstep(0.05, 0.22, chroma);
         if satw <= 0.0 {
-            continue;
+            return; // (per-pixel closure: this pixel is untouched)
         }
         let (b0, b1, w1) = bracket_bands(h * 360.0, &HSL_CENTERS);
         let w0 = 1.0 - w1;
@@ -1499,7 +1575,7 @@ fn apply_hsl(data: &mut [[f32; 3]], hsl: &crate::recipe::Hsl) {
         let new_l = (l * (1.0 + 0.5 * lum_adj / 100.0)).clamp(0.0, 1.0);
         let (r, g, b) = hsl_to_rgb(new_h, new_s, new_l);
         *px = [r, g, b];
-    }
+    });
 }
 
 /// ACR band centres in degrees (red..magenta), matching recipe::HSL_BANDS.
@@ -1580,7 +1656,7 @@ fn apply_color_grade(data: &mut [[f32; 3]], cg: &crate::recipe::ColorGrade) {
     let blend = (cg.blending / 100.0).clamp(0.0, 1.0);
     // balance shifts the shadow/highlight midpoint: positive leans toward highlights.
     let mid = (0.5 - 0.25 * (cg.balance / 100.0)).clamp(0.05, 0.95);
-    for px in data.iter_mut() {
+    data.par_iter_mut().for_each(|px| {
         let l = luma601(px);
         let w_hi = smoothstep(mid, 1.0, l);
         let w_sh = 1.0 - smoothstep(0.0, mid, l);
@@ -1589,7 +1665,7 @@ fn apply_color_grade(data: &mut [[f32; 3]], cg: &crate::recipe::ColorGrade) {
         apply_wheel(px, cg.midtone_hue, cg.midtone_sat, cg.midtone_lum, w_mid * blend);
         apply_wheel(px, cg.highlight_hue, cg.highlight_sat, cg.highlight_lum, w_hi * blend);
         apply_wheel(px, cg.global_hue, cg.global_sat, cg.global_lum, 1.0); // global: all tones
-    }
+    });
 }
 
 /// Apply one colour-grade wheel to a pixel: shift chroma toward the wheel's hue
@@ -1657,12 +1733,21 @@ fn orient_f32(
     if matches!(o, Orientation::Normal | Orientation::Unknown) {
         return (data, w, h);
     }
-    let flat: Vec<f32> = data.into_iter().flatten().collect();
+    // [f32;3] and 3×f32 share layout, so both casts are zero-copy — the old
+    // flatten/collect + to_rgb32f() + pixels().collect() chain made THREE full
+    // copies of a ~732 MB frame for every portrait RAW. try_cast_vec only
+    // falls back to a real copy when the vec's capacity isn't an exact
+    // multiple of the element ratio.
+    let flat: Vec<f32> = bytemuck::cast_vec(data);
     let img = ImageBuffer::<Rgb<f32>, Vec<f32>>::from_raw(w as u32, h as u32, flat)
         .expect("orient_f32: buffer size matches dims");
-    let out = oriented(DynamicImage::ImageRgb32F(img), o).to_rgb32f();
+    let out = match oriented(DynamicImage::ImageRgb32F(img), o) {
+        DynamicImage::ImageRgb32F(b) => b, // rotations/flips keep the variant
+        other => other.to_rgb32f(),
+    };
     let (ow, oh) = out.dimensions();
-    let data = out.pixels().map(|p| [p[0], p[1], p[2]]).collect();
+    let data: Vec<[f32; 3]> = bytemuck::try_cast_vec(out.into_raw())
+        .unwrap_or_else(|(_, v)| v.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect());
     (data, ow as usize, oh as usize)
 }
 
@@ -1700,7 +1785,16 @@ pub fn rotate_straighten(img: &DynamicImage, deg: f32) -> DynamicImage {
     if deg.abs() < 1e-3 {
         return img.clone();
     }
-    let src = img.to_rgb16();
+    // Borrow an already-16-bit source instead of cloning it (the export path
+    // arrives here as ImageRgb16 — to_rgb16() would copy ~366 MB at 61 MP).
+    let owned;
+    let src = match img.as_rgb16() {
+        Some(b) => b,
+        None => {
+            owned = img.to_rgb16();
+            &owned
+        }
+    };
     let (w, h) = (src.width() as f32, src.height() as f32);
     let (cw, ch) = inscribed_dims(w, h, deg);
     let (ow, oh) = ((cw.floor() as u32).max(1), (ch.floor() as u32).max(1));
@@ -1711,14 +1805,19 @@ pub fn rotate_straighten(img: &DynamicImage, deg: f32) -> DynamicImage {
     let (cx_src, cy_src) = ((w - 1.0) * 0.5, (h - 1.0) * 0.5);
     let (cx_dst, cy_dst) = ((ow as f32 - 1.0) * 0.5, (oh as f32 - 1.0) * 0.5);
     let mut out: ImageBuffer<Rgb<u16>, Vec<u16>> = ImageBuffer::new(ow, oh);
-    for (x, y, px) in out.enumerate_pixels_mut() {
-        let (dx, dy) = (x as f32 - cx_dst, y as f32 - cy_dst);
-        let sx = c * dx + s * dy + cx_src;
-        let sy = -s * dx + c * dy + cy_src;
-        // Bilinear sample, clamped to the frame (the inscribed crop keeps
-        // samples in-bounds up to float rounding at the very edge).
-        *px = sample_bilinear_rgb16(&src, sx, sy);
-    }
+    let obuf: &mut [u16] = &mut out;
+    // Output rows are independent → parallel; per-pixel math is unchanged.
+    obuf.par_chunks_mut(ow as usize * 3).enumerate().for_each(|(y, orow)| {
+        let dy = y as f32 - cy_dst;
+        for x in 0..ow as usize {
+            let dx = x as f32 - cx_dst;
+            let sx = c * dx + s * dy + cx_src;
+            let sy = -s * dx + c * dy + cy_src;
+            // Bilinear sample, clamped to the frame (the inscribed crop keeps
+            // samples in-bounds up to float rounding at the very edge).
+            orow[x * 3..x * 3 + 3].copy_from_slice(&sample_bilinear_rgb16(src, sx, sy).0);
+        }
+    });
     DynamicImage::ImageRgb16(out)
 }
 
@@ -1860,18 +1959,33 @@ pub fn apply_lens_distortion(img: &DynamicImage, amount: f32) -> DynamicImage {
     if amount.abs() < 1e-3 {
         return img.clone();
     }
-    let src = img.to_rgb16();
+    // Borrow an already-16-bit source (same policy as rotate_straighten).
+    let owned;
+    let src = match img.as_rgb16() {
+        Some(b) => b,
+        None => {
+            owned = img.to_rgb16();
+            &owned
+        }
+    };
     let (w, h) = (src.width() as f32, src.height() as f32);
     let (k, s) = distort_params(amount);
     let rr = (0.5 * (w * w + h * h).sqrt()).max(1e-6);
     let (cx, cy) = ((w - 1.0) * 0.5, (h - 1.0) * 0.5);
+    let ow = src.width() as usize;
     let mut out: ImageBuffer<Rgb<u16>, Vec<u16>> = ImageBuffer::new(src.width(), src.height());
-    for (x, y, px) in out.enumerate_pixels_mut() {
-        let (dx, dy) = (x as f32 - cx, y as f32 - cy);
-        let rn = (dx * dx + dy * dy).sqrt() / rr;
-        let f = s * (1.0 + k * (s * rn) * (s * rn));
-        *px = sample_bilinear_rgb16(&src, cx + dx * f, cy + dy * f);
-    }
+    let obuf: &mut [u16] = &mut out;
+    // Output rows are independent → parallel; per-pixel math is unchanged.
+    obuf.par_chunks_mut(ow * 3).enumerate().for_each(|(y, orow)| {
+        let dy = y as f32 - cy;
+        for x in 0..ow {
+            let dx = x as f32 - cx;
+            let rn = (dx * dx + dy * dy).sqrt() / rr;
+            let f = s * (1.0 + k * (s * rn) * (s * rn));
+            orow[x * 3..x * 3 + 3]
+                .copy_from_slice(&sample_bilinear_rgb16(src, cx + dx * f, cy + dy * f).0);
+        }
+    });
     DynamicImage::ImageRgb16(out)
 }
 
@@ -2264,11 +2378,11 @@ mod tests {
         // same grey darker — while staying exactly neutral. That difference is
         // the transform actually running (a tag swap would leave both equal).
         let grey = DynamicImage::ImageRgb16(ImageBuffer::from_pixel(2, 2, Rgb([32896u16, 32896, 32896])));
-        let p3 = convert_export_color_space(&grey, ExportColorSpace::DisplayP3).to_rgb16();
+        let p3 = convert_export_color_space(grey.clone(), ExportColorSpace::DisplayP3).to_rgb16();
         let (pr, pg, pb) = (p3.get_pixel(0, 0)[0], p3.get_pixel(0, 0)[1], p3.get_pixel(0, 0)[2]);
         assert!(pr == pg && pg == pb, "P3 grey must stay neutral: {pr},{pg},{pb}");
         assert!((pr as i32 - 32896).abs() <= 4, "P3 grey must keep its value: {pr}");
-        let ad = convert_export_color_space(&grey, ExportColorSpace::AdobeRgb).to_rgb16();
+        let ad = convert_export_color_space(grey.clone(), ExportColorSpace::AdobeRgb).to_rgb16();
         let (ar, ag, ab) = (ad.get_pixel(0, 0)[0], ad.get_pixel(0, 0)[1], ad.get_pixel(0, 0)[2]);
         assert!(ar == ag && ag == ab, "AdobeRGB grey must stay neutral: {ar},{ag},{ab}");
         assert!((ar as i32) < pr as i32 - 64, "AdobeRGB gamma must encode grey darker: {ar} vs {pr}");
@@ -2280,21 +2394,21 @@ mod tests {
         // share): g = b = 0 with red below full scale. Both derive from the
         // primaries table, so both directions pin the matrix.
         let red = DynamicImage::ImageRgb16(ImageBuffer::from_pixel(1, 1, Rgb([65535u16, 0, 0])));
-        let p3r = convert_export_color_space(&red, ExportColorSpace::DisplayP3).to_rgb16();
+        let p3r = convert_export_color_space(red.clone(), ExportColorSpace::DisplayP3).to_rgb16();
         let p = p3r.get_pixel(0, 0);
         assert!(
             p[0] > 55000 && p[1] > 0 && p[2] > 0 && p[1] < p[0] && p[2] < p[0],
             "DisplayP3: sRGB red must land inside the gamut, got {p:?}"
         );
-        let adr = convert_export_color_space(&red, ExportColorSpace::AdobeRgb).to_rgb16();
+        let adr = convert_export_color_space(red, ExportColorSpace::AdobeRgb).to_rgb16();
         let q = adr.get_pixel(0, 0);
         assert!(
             q[0] > 50000 && q[0] < 62000 && q[1] <= 300 && q[2] <= 300,
             "AdobeRGB: sRGB red must stay a rescaled pure red, got {q:?}"
         );
 
-        // (e) sRGB is the identity (exact clone).
-        let same = convert_export_color_space(&grey, ExportColorSpace::Srgb).to_rgb16();
+        // (e) sRGB is the identity (now a MOVE, not a clone).
+        let same = convert_export_color_space(grey, ExportColorSpace::Srgb).to_rgb16();
         assert_eq!(same.get_pixel(1, 1)[0], 32896);
     }
 

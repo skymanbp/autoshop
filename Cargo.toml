@@ -38,10 +38,17 @@ gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:ab_glyph", "eframe/persistence"
 [dependencies]
 anyhow = "1.0.103"
 base64 = "0.22"
+# Zero-copy Vec<[f32;3]> ↔ Vec<f32> casts in the orientation stage (a 61 MP
+# portrait RAW otherwise pays three ~732 MB full-frame copies — see orient_f32).
+bytemuck = "1"
 clap = { version = "4.6.1", features = ["derive"] }
 dotenvy = "0.15"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }
 rawler = "0.7.2"
+# The develop pipeline's per-pixel stages are row-parallel (rayon was already in
+# the tree — rawler's demosaic uses it; this lets OUR serial tail use the same
+# pool). Every conversion is per-pixel independent, so outputs stay bit-identical.
+rayon = "1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
