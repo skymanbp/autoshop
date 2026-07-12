@@ -604,6 +604,8 @@ struct AutoshopApp {
     thumbs: HashMap<usize, egui::TextureHandle>, // decoded thumbnails by index
     thumb_requested: HashSet<usize>,             // indices already queued/decoded
     thumb_inflight: usize,                       // live thumbnail-decode threads
+    edited_badge: HashMap<usize, bool>,          // cached "● edited" sidecar stat per index
+    base_cache: Vec<(BaseCacheKey, Arc<image::DynamicImage>)>, // decoded-base LRU (recent last)
     // --- region box-select (local-edit target on the After image) ---
     region: Option<[f32; 4]>,                      // normalized [left, top, right, bottom]
     region_drag: Option<(egui::Pos2, egui::Pos2)>, // transient drag (start, current) in screen px
@@ -817,6 +819,8 @@ impl Default for AutoshopApp {
             thumbs: HashMap::new(),
             thumb_requested: HashSet::new(),
             thumb_inflight: 0,
+            edited_badge: HashMap::new(),
+            base_cache: Vec::new(),
             region: None,
             region_drag: None,
             paint_mode: false,
@@ -1032,7 +1036,9 @@ fn build_preview(
     if recipe.straighten_deg != 0.0 {
         after = autoshop::render::rotate_straighten(&after, recipe.straighten_deg);
     }
-    let rgb = after.to_rgb8();
+    // into_rgb8 MOVES the buffer in the common no-geometry case (develop_preview
+    // returns ImageRgb8) — to_rgb8() deep-copied ~3.3 MB per tick at 1280.
+    let rgb = after.into_rgb8();
     let histogram = compute_histogram_rgb(&rgb);
     let clipping = show_clipping.then(|| clipping_overlay_rgb(&rgb));
     let thumb_rgb = image::imageops::thumbnail(&rgb, 96, 96);
@@ -1069,6 +1075,41 @@ fn stamp_line(m: &mut image::RgbaImage, a: (f32, f32), b: (f32, f32), r: f32) {
     }
 }
 
+/// Decoded-base LRU key: source path + requested preview edge + file mtime
+/// (an on-disk change or a different resolution simply misses).
+type BaseCacheKey = (PathBuf, u32, Option<std::time::SystemTime>);
+
+/// How many decoded preview bases to keep for instant photo revisits (~3.3 MB
+/// each at the default 1280 edge; culling flips between neighbours constantly).
+const BASE_CACHE_CAP: usize = 4;
+
+/// The photo's saved develop from ./out, if any: the app-internal
+/// `<stem>.recipe.json` first (lossless — bitmap masks, recolour gains, roles
+/// all round-trip), else the Lightroom-compatible `<stem>.xmp` re-imported
+/// through the reverse crs mapping (globals, curves, crop, parametric masks —
+/// everything classic XMP can carry). Returns the recipe plus the sidecar kind
+/// (a technical filename, shown untranslated in the status line). `None` when
+/// no sidecar exists, none parses, or the XMP holds no actual edits.
+fn read_saved_develop(src: &std::path::Path) -> Option<(EditRecipe, &'static str)> {
+    let rj = autoshop::pipeline::default_out(src, "recipe", "json");
+    if let Ok(text) = std::fs::read_to_string(&rj)
+        && let Ok(mut r) = serde_json::from_str::<EditRecipe>(&text)
+    {
+        r.clamp();
+        return Some((r, "recipe.json"));
+    }
+    if let Ok(text) = std::fs::read_to_string(autoshop::pipeline::xmp_target(src)) {
+        let mut r = autoshop::xmp::xmp_to_recipe(&text);
+        // A foreign / neutral sidecar parses to a no-op recipe — "restoring"
+        // it would only produce a misleading status line.
+        if !r.is_noop() {
+            r.clamp();
+            return Some((r, "XMP"));
+        }
+    }
+    None
+}
+
 impl AutoshopApp {
     fn open_path(&mut self, path: PathBuf) {
         if self.busy {
@@ -1082,6 +1123,14 @@ impl AutoshopApp {
         // sliders fluid; 2560/4096 trade tick latency for real 1:1 detail when
         // checking focus / noise.
         let edge = self.preview_edge.clamp(640, 8192);
+        // Decoded-base LRU: gallery culling flips between neighbours constantly,
+        // and a hit skips the multi-second full demosaic entirely. Delivered
+        // through the ordinary Msg::Opened channel so the handler stays the one
+        // place that resets per-photo state.
+        if let Some(hit) = self.cached_base(&path, edge) {
+            let _ = self.tx.send(Msg::Opened(Box::new(Ok(hit))));
+            return;
+        }
         self.spawn_worker(
             move || {
                 // Build a CLEAN preview base by developing the RAW sensor data
@@ -1103,6 +1152,33 @@ impl AutoshopApp {
             },
             |e| Msg::Opened(Box::new(Err(e))),
         );
+    }
+
+    /// Decoded-base LRU lookup (most-recent entry kept last). Missing metadata
+    /// (mtime `None`) matches itself, so the cache still works where mtime is
+    /// unavailable — it just loses the staleness guard there.
+    fn cached_base(&mut self, path: &std::path::Path, edge: u32) -> Option<Arc<image::DynamicImage>> {
+        let mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+        let pos = self
+            .base_cache
+            .iter()
+            .position(|((p, e, t), _)| p == path && *e == edge && *t == mtime)?;
+        let entry = self.base_cache.remove(pos);
+        let hit = entry.1.clone();
+        self.base_cache.push(entry);
+        Some(hit)
+    }
+
+    /// Remember a freshly decoded base. Called from the Opened handler — the px
+    /// combo is disabled while busy, so `preview_edge` still describes the
+    /// decode that just completed.
+    fn remember_base(&mut self, path: &std::path::Path, edge: u32, base: &Arc<image::DynamicImage>) {
+        let mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+        self.base_cache.retain(|((p, e, _), _)| !(p == path && *e == edge));
+        self.base_cache.push(((path.to_path_buf(), edge, mtime), base.clone()));
+        if self.base_cache.len() > BASE_CACHE_CAP {
+            self.base_cache.remove(0); // least-recent first
+        }
     }
 
     /// The active variant, if a photo is open.
@@ -1798,6 +1874,16 @@ impl AutoshopApp {
         // developed reference and its recipe-keyed cache.
         let reference: &image::DynamicImage = if mask.range.is_some() {
             if !matches!(&self.overlay_ref, Some((r, _)) if *r == pre) {
+                // Rebuilding the masks-cleared reference is a full develop on
+                // the UI thread — the 100-300 ms class (2560/4096) the async
+                // preview path exists to hide. Mid-gesture (global-slider
+                // drag), keep showing the previous coverage and re-arm the
+                // stale flag; the rebuild lands on the frame after the pointer
+                // settles. Geometry-only masks (the else arm) stay instant.
+                if ctx.input(|i| i.pointer.any_down()) {
+                    self.overlay_stale = true;
+                    return;
+                }
                 let img = autoshop::render::develop_preview(base, &pre);
                 self.overlay_ref = Some((pre, img));
             }
@@ -2407,9 +2493,15 @@ impl AutoshopApp {
             self.status = tr(lang, "XMP applies to RAW files only").into();
             return;
         }
-        match autoshop::pipeline::write_xmp(&path, &self.recipe) {
+        // The XMP alone is lossy (no bitmap masks / recolour gains), so persist
+        // the app-internal recipe.json alongside — reopening prefers it, which
+        // makes Ctrl+S → close → reopen lossless.
+        match autoshop::pipeline::write_xmp(&path, &self.recipe)
+            .and_then(|p| autoshop::pipeline::write_recipe(&path, &self.recipe, None).map(|_| p))
+        {
             Ok(p) => {
-                self.status = trf(lang, "XMP saved → {path}", &[("path", &p.display().to_string())])
+                self.edited_badge.clear(); // the open photo just gained its badge
+                self.status = trf(lang, "XMP + recipe saved → {path}", &[("path", &p.display().to_string())])
             }
             Err(e) => self.status = trf(lang, "XMP save failed: {err}", &[("err", &e.to_string())]),
         }
@@ -2524,6 +2616,10 @@ impl AutoshopApp {
                     match *boxed {
                     Ok(base) => {
                         self.busy = false;
+                        if let Some(p) = self.src_path.clone() {
+                            let edge = self.preview_edge.clamp(640, 8192);
+                            self.remember_base(&p, edge, &base);
+                        }
                         if keep {
                             // Preview-resolution re-decode: the SOURCE pixels just
                             // changed resolution — keep the whole variant set,
@@ -2555,8 +2651,11 @@ impl AutoshopApp {
                                 &[("px", &self.preview_edge.to_string())],
                             );
                         } else {
-                            // Fresh open: a single Original variant, neutral
-                            // recipe, all per-photo state reset.
+                            // Fresh open: a single Original variant, all
+                            // per-photo state reset. The recipe starts from the
+                            // photo's SAVED develop when a ./out sidecar exists
+                            // — the gallery badge already promises "● edited",
+                            // so opening must honour it — neutral otherwise.
                             let (mw, mh) = base.dimensions();
                             self.before_tex = Some(ctx.load_texture(
                                 "before",
@@ -2565,10 +2664,14 @@ impl AutoshopApp {
                             ));
                             self.source_preview = Some(base.clone());
                             self.base_preview = Some(base);
-                            self.recipe = EditRecipe::default();
+                            let saved = self.src_path.as_deref().and_then(read_saved_develop);
+                            let restored = saved.as_ref().map(|(_, kind)| *kind);
+                            let recipe = saved.map(|(r, _)| r).unwrap_or_default();
+                            self.recipe = recipe.clone();
+                            self.rationale = recipe.rationale.clone();
                             self.variants = vec![Variant {
                                 kind: VariantKind::Original,
-                                recipe: EditRecipe::default(),
+                                recipe,
                                 base: None,
                                 origin: None,
                                 thumb: None,
@@ -2599,10 +2702,17 @@ impl AutoshopApp {
                             self.clone_mode = false;
                             self.clone_src = None;
                             self.verdict = None;
-                            self.rationale.clear();
+                            // (rationale already restored alongside the recipe)
                             self.refresh_versions(); // version snapshots are per-photo
-                            self.dirty = true; // render the (neutral) after
-                            self.status = tr(lang, "ready — adjust sliders or run AI Analyze").into();
+                            self.dirty = true; // render the (restored or neutral) after
+                            self.status = match restored {
+                                Some(kind) => trf(
+                                    lang,
+                                    "ready — restored saved edits ({kind}); Reset returns to neutral",
+                                    &[("kind", kind)],
+                                ),
+                                None => tr(lang, "ready — adjust sliders or run AI Analyze").into(),
+                            };
                         }
                     }
                     Err(e) => {
@@ -2688,6 +2798,7 @@ impl AutoshopApp {
                         self.thumbs.clear();
                         self.thumb_requested.clear();
                         self.thumb_inflight = 0;
+                        self.edited_badge.clear(); // badge stats belong to the old folder
                         self.selected = None;
                         self.multi_sel.clear(); // indices belong to the old folder
                         self.busy = false;
@@ -2773,7 +2884,10 @@ impl AutoshopApp {
                     }
                 },
                 Msg::Fitted(boxed) => match *boxed {
+                    // Either way the worker may have persisted a recipe.json
+                    // (an Err can land after that write) — recompute badges.
                     Ok((recipe, note)) => {
+                        self.edited_badge.clear();
                         // The generated look, solved back into an editable recipe,
                         // becomes a NEW「反推」variant: base = the source neutral
                         // (same negative as Original), look carried by the recipe —
@@ -2792,6 +2906,7 @@ impl AutoshopApp {
                         self.done(note);
                     }
                     Err(e) => {
+                        self.edited_badge.clear();
                         self.fail(tr(lang, "Reverse-fit failed"), e);
                     }
                 },
@@ -2805,10 +2920,15 @@ impl AutoshopApp {
                         self.fail(tr(lang, "Style extraction failed"), e);
                     }
                 },
-                Msg::Pasted(res) => match res {
-                    Ok(s) => self.done(s),
-                    Err(e) => self.fail(tr(lang, "batch paste"), e),
-                },
+                Msg::Pasted(res) => {
+                    // Sidecars were written (possibly partially on error) —
+                    // recompute the gallery badges either way.
+                    self.edited_badge.clear();
+                    match res {
+                        Ok(s) => self.done(s),
+                        Err(e) => self.fail(tr(lang, "batch paste"), e),
+                    }
+                }
                 Msg::Models(res) => match res {
                     Ok(ids) => {
                         let chat: Vec<String> = ids
@@ -2938,6 +3058,7 @@ impl AutoshopApp {
         // Borrow only the fields the row closure reads; collect actions to apply
         // after (request_thumb / open_gallery_index both need &mut self).
         let thumbs = &self.thumbs;
+        let edited_badge = &mut self.edited_badge;
         let gallery = &self.gallery;
         let selected = self.selected;
         let multi_sel = &self.multi_sel;
@@ -2987,8 +3108,15 @@ impl AutoshopApp {
                                         name = name.strong().color(PILL);
                                     }
                                     ui.label(name);
-                                    let edited = autoshop::pipeline::default_out(path, "recipe", "json").exists()
-                                        || autoshop::pipeline::xmp_target(path).exists();
+                                    // Cached: 2 filesystem stats per visible row
+                                    // per repaint (continuous while thumbnails
+                                    // decode) added up to thousands of syscalls
+                                    // per second. Dropped whenever this app
+                                    // writes a sidecar or the folder changes.
+                                    let edited = *edited_badge.entry(i).or_insert_with(|| {
+                                        autoshop::pipeline::default_out(path, "recipe", "json").exists()
+                                            || autoshop::pipeline::xmp_target(path).exists()
+                                    });
                                     let baked = !autoshop::decode::is_raw(path);
                                     ui.horizontal(|ui| {
                                         if is_multi {
@@ -4424,7 +4552,17 @@ impl AutoshopApp {
                     [m.width() as usize, m.height() as usize],
                     m.as_raw(),
                 );
-                self.mask_tex = Some(ctx.load_texture("paintmask", ci, egui::TextureOptions::LINEAR));
+                // Update in place: brushing sets mask_dirty on every pointer
+                // move, and a fresh texture per frame is the allocate/free
+                // churn finish_redevelop documents avoiding. The handle is
+                // None-ed wherever the canvas is resized (open / re-decode /
+                // variant switch), so set() can never change dimensions.
+                if let Some(tex) = &mut self.mask_tex {
+                    tex.set(ci, egui::TextureOptions::LINEAR);
+                } else {
+                    self.mask_tex =
+                        Some(ctx.load_texture("paintmask", ci, egui::TextureOptions::LINEAR));
+                }
             }
             self.mask_dirty = false;
         }
@@ -4808,9 +4946,15 @@ impl AutoshopApp {
                             " · includes sky-zone correction (adjustable in the mask panel; XMP carries the global part only)",
                         ));
                     }
-                    if let Some(p) = src_path.filter(|p| autoshop::decode::is_raw(p)) {
-                        let x = autoshop::pipeline::write_xmp(&p, &rep.recipe)?;
-                        note.push_str(&format!(" · XMP → {}", x.display()));
+                    if let Some(p) = &src_path {
+                        // Persist the fit losslessly: recipe.json carries the
+                        // bitmap zone masks + recolour gains the XMP cannot,
+                        // so reopening the photo restores the whole fit.
+                        autoshop::pipeline::write_recipe(p, &rep.recipe, None)?;
+                        if autoshop::decode::is_raw(p) {
+                            let x = autoshop::pipeline::write_xmp(p, &rep.recipe)?;
+                            note.push_str(&format!(" · XMP → {}", x.display()));
+                        }
                     }
                     Ok((rep.recipe, note))
                 })();
@@ -6045,5 +6189,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn read_saved_develop_prefers_recipe_json_then_xmp() {
+        // The open-path restore contract: no sidecar → None; XMP-only → the
+        // reverse crs import; recipe.json present → preferred (lossless), even
+        // when an XMP sits beside it. Unique stem so parallel tests can't race.
+        let src = std::path::Path::new("D:/library/_sidecar_prio_test.ARW"); // never touched
+        std::fs::create_dir_all("out").unwrap();
+        let rj = autoshop::pipeline::default_out(src, "recipe", "json");
+        let xp = autoshop::pipeline::xmp_target(src);
+        let _ = std::fs::remove_file(&rj); // a crashed earlier run may have left files
+        let _ = std::fs::remove_file(&xp);
+
+        assert!(read_saved_develop(src).is_none(), "no sidecar → None");
+
+        // A NEUTRAL XMP (foreign file, or ours with nothing set) restores nothing.
+        std::fs::write(&xp, autoshop::xmp::recipe_to_xmp(&EditRecipe::default())).unwrap();
+        assert!(read_saved_develop(src).is_none(), "a no-op XMP must not claim a restore");
+
+        // XMP with real edits → imported through the reverse crs mapping.
+        let edited = EditRecipe { contrast: 22.0, ..Default::default() };
+        std::fs::write(&xp, autoshop::xmp::recipe_to_xmp(&edited)).unwrap();
+        let (r, kind) = read_saved_develop(src).expect("an edited XMP restores");
+        assert_eq!((r.contrast, kind), (22.0, "XMP"));
+
+        // recipe.json appears → preferred over the XMP.
+        let full = EditRecipe { exposure_ev: 0.5, ..Default::default() };
+        std::fs::write(&rj, serde_json::to_string(&full).unwrap()).unwrap();
+        let (r, kind) = read_saved_develop(src).expect("recipe.json restores");
+        assert_eq!((r.exposure_ev, kind), (0.5, "recipe.json"));
+
+        let _ = std::fs::remove_file(&rj);
+        let _ = std::fs::remove_file(&xp);
+    }
+
+    #[test]
+    fn decoded_base_lru_hits_by_key_and_evicts_least_recent() {
+        // Nonexistent paths give mtime None on both sides, which must match
+        // itself (the cache still works where metadata is unavailable).
+        let mut app = AutoshopApp::default();
+        let base = Arc::new(image::DynamicImage::new_rgb8(4, 3));
+        let p = std::path::Path::new("D:/__autoshop_nonexistent__/x.ARW");
+        app.remember_base(p, 1280, &base);
+        assert!(app.cached_base(p, 1280).is_some(), "same path+edge hits");
+        assert!(app.cached_base(p, 2560).is_none(), "edge is part of the key");
+        // Filling past the cap evicts the least-recently-used entry.
+        let others: Vec<std::path::PathBuf> = (0..BASE_CACHE_CAP)
+            .map(|i| std::path::PathBuf::from(format!("D:/__autoshop_nonexistent__/{i}.ARW")))
+            .collect();
+        for o in &others {
+            app.remember_base(o, 1280, &base);
+        }
+        assert!(app.cached_base(p, 1280).is_none(), "least-recent evicted at cap");
+        assert!(app.cached_base(&others[1], 1280).is_some(), "newer entries survive");
+        assert!(app.base_cache.len() <= BASE_CACHE_CAP, "cap holds");
     }
 }

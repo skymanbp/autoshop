@@ -212,12 +212,22 @@ pub fn stem(p: &Path) -> &str {
     p.file_stem().and_then(|s| s.to_str()).unwrap_or("out")
 }
 
+/// Whether a directory entry is a directory, WITHOUT an extra stat per file:
+/// `DirEntry::file_type()` comes free with the directory listing (measurable on
+/// large libraries / network shares), and only symlinks fall back to the
+/// following `Path::is_dir` so junction/symlink traversal behaves as before.
+fn entry_is_dir(entry: &std::fs::DirEntry) -> std::io::Result<bool> {
+    let ft = entry.file_type()?;
+    Ok(if ft.is_symlink() { entry.path().is_dir() } else { ft.is_dir() })
+}
+
 /// Recursively collect every `.arw` (case-insensitive) under `dir`, sorted.
 pub fn find_raws(dir: &Path) -> Result<Vec<PathBuf>> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         for entry in std::fs::read_dir(dir)? {
-            let p = entry?.path();
-            if p.is_dir() {
+            let entry = entry?;
+            let p = entry.path();
+            if entry_is_dir(&entry)? {
                 walk(&p, out)?;
             } else if p
                 .extension()
@@ -246,8 +256,9 @@ pub fn find_sources(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         for entry in std::fs::read_dir(dir)? {
-            let p = entry?.path();
-            if p.is_dir() {
+            let entry = entry?;
+            let p = entry.path();
+            if entry_is_dir(&entry)? {
                 walk(&p, out)?;
             } else if is_source(&p) {
                 out.push(p);

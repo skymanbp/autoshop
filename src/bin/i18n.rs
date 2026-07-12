@@ -444,6 +444,8 @@ static ZH_ENTRIES: &[(&str, &str)] = &[
     ("settings saved — applies to the next Analyze", "设置已保存 — 下次分析时生效"),
     ("preview develop failed", "预览显影失败"),
     ("ready — adjust sliders or run AI Analyze", "就绪 — 拉滑杆或运行 AI 分析"),
+    ("ready — restored saved edits ({kind}); Reset returns to neutral",
+        "就绪 — 已恢复保存的编辑（{kind}）；「重置」可回中性"),
     ("could not open", "打开失败"),
     ("1 photo — click a thumbnail to open", "1 张照片 — 点击缩略图打开"),
     ("{n} photos — click a thumbnail to open", "{n} 张照片 — 点击缩略图打开"),
@@ -481,7 +483,7 @@ static ZH_ENTRIES: &[(&str, &str)] = &[
     ("A generated variant's look lives in its pixels — there's no parametric recipe to export; run 「Reverse-fit」 first to get an exportable XMP",
         "生成变体的观感在像素里，没有参数配方可导；先「反推配方」得到可导出的 XMP"),
     ("XMP applies to RAW files only", "XMP 仅适用于 RAW 文件"),
-    ("XMP saved → {path}", "XMP 已保存 → {path}"),
+    ("XMP + recipe saved → {path}", "XMP + 配方已保存 → {path}"),
     ("XMP save failed: {err}", "XMP 保存失败: {err}"),
 
     // ── Status bar · WB / range pick + manual mask placement ─────────────────
