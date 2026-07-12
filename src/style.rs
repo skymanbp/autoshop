@@ -144,28 +144,63 @@ impl StyleIndex {
         let raws = pipeline::find_raws(dir)?;
         let pairs: Vec<_> = raws.iter().filter(|r| r.with_extension("xmp").exists()).collect();
         println!("building style index from {} RAW+.xmp pairs ...", pairs.len());
-        let mut exemplars = Vec::new();
-        for (i, raw) in pairs.iter().enumerate() {
-            let decoded = match decode::decode_raw(raw) {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("  skip {}: {e}", pipeline::stem(raw));
-                    continue;
-                }
-            };
-            let feat = feature_vector(&decoded.meta, &decoded.histogram);
-            let xmp = std::fs::read_to_string(raw.with_extension("xmp")).unwrap_or_default();
-            exemplars.push(StyleExemplar {
-                stem: pipeline::stem(raw).to_string(),
-                tag: derive_tag(&feat),
-                feat: feat.to_vec(),
-                settings: read_settings(&xmp),
-                curve: crate::eval::user_curve_shape(&xmp).map(|(b, s)| [b, s]),
-            });
-            if (i + 1) % 20 == 0 {
-                println!("  {} / {}", i + 1, pairs.len());
+        // Decode in parallel: each pair pays ~1s of full-res embedded-JPEG decode
+        // and the old serial scan left every other core idle (a 2000-pair library
+        // took the better part of an hour). A FIXED pool of at most 4 workers
+        // bounds peak memory (each in-flight decode can hold ~180 MB); an atomic
+        // counter hands out indices, and each result lands in its own slot so the
+        // exemplar ORDER stays identical to the serial version.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut slots: Vec<Option<StyleExemplar>> = Vec::new();
+        slots.resize_with(pairs.len(), || None);
+        let next = AtomicUsize::new(0);
+        let done = AtomicUsize::new(0);
+        let workers = pairs.len().clamp(1, 4);
+        std::thread::scope(|s| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            for _ in 0..workers {
+                let tx = tx.clone();
+                let (pairs, next, done) = (&pairs, &next, &done);
+                s.spawn(move || loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&raw) = pairs.get(i) else { break };
+                    let ex = match decode::decode_raw(raw) {
+                        Ok(d) => {
+                            let feat = feature_vector(&d.meta, &d.histogram);
+                            let xmp = std::fs::read_to_string(raw.with_extension("xmp"))
+                                .unwrap_or_default();
+                            Some(StyleExemplar {
+                                stem: pipeline::stem(raw).to_string(),
+                                tag: derive_tag(&feat),
+                                feat: feat.to_vec(),
+                                settings: read_settings(&xmp),
+                                curve: crate::eval::user_curve_shape(&xmp).map(|(b, s)| [b, s]),
+                            })
+                        }
+                        Err(e) => {
+                            // println!/eprintln! are line-atomic, so per-photo
+                            // prints stay whole across workers.
+                            eprintln!("  skip {}: {e}", pipeline::stem(raw));
+                            None
+                        }
+                    };
+                    // Progress counts COMPLETED photos (completion order differs
+                    // from index order under parallelism) so it stays monotonic.
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n % 20 == 0 {
+                        println!("  {} / {}", n, pairs.len());
+                    }
+                    let _ = tx.send((i, ex));
+                });
             }
-        }
+            drop(tx); // workers hold the remaining senders; rx ends when they exit
+            for (i, ex) in rx {
+                slots[i] = ex;
+            }
+        });
+        // Failed decodes left None slots — drop them in order, like the serial
+        // `continue` did.
+        let exemplars: Vec<StyleExemplar> = slots.into_iter().flatten().collect();
         let (mean, std) = compute_norm(&exemplars);
         // Record where this index was built from, for UI provenance / other users.
         let source_dir = std::path::absolute(dir).map(|p| p.display().to_string()).ok();

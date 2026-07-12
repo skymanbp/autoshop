@@ -567,22 +567,49 @@ fn batch_cmd(dir: &Path, render: bool, limit: usize) -> Result<()> {
         println!("  {} more remain — raise --limit to process them.", todo - n);
     }
 
-    let (mut ok, mut fail) = (0usize, 0usize);
-    for (i, raw) in pending.iter().take(n).enumerate() {
-        print!("[{}/{}] {} ... ", i + 1, n, stem(raw));
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        match process_one(raw, &cfg, render) {
-            Ok(v) => {
-                println!("{:?}", v.decision);
-                ok += 1;
-            }
-            Err(e) => {
-                println!("FAILED: {e}");
-                fail += 1;
-            }
+    // The work list is fixed up front — exactly the first `n` pending photos,
+    // the same set the old sequential `.take(n)` selected — then a small bounded
+    // pool works through it. Each photo is dominated by blocking network round
+    // trips (GPT propose + verify, plus revision rounds), so a few workers
+    // overlap network wait with CPU renders; 3 keeps API-rate pressure and peak
+    // memory modest. process_one already runs produce_recipe with verbose=false,
+    // so workers print nothing until their one completion line below.
+    let work: Vec<&Path> = pending.iter().take(n).map(|p| p.as_path()).collect();
+    let workers = work.len().min(3);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    // Per-index results (Some(true) = ok, Some(false) = failed): summary counts
+    // stay exact and deterministic regardless of completion order.
+    let results: std::sync::Mutex<Vec<Option<bool>>> = std::sync::Mutex::new(vec![None; n]);
+
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                loop {
+                    // Dequeue the next photo; the shared counter over the fixed
+                    // list preserves --limit semantics exactly.
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(raw) = work.get(i) else { break };
+                    // A failed photo reports its error and the batch continues
+                    // (same as the old sequential loop).
+                    let res = process_one(raw, &cfg, render);
+                    // One WHOLE line per photo, printed on completion; holding
+                    // the stdout lock keeps workers' lines from interleaving.
+                    use std::io::Write;
+                    let mut out = std::io::stdout().lock();
+                    let _ = match &res {
+                        Ok(v) => writeln!(out, "[{}/{n}] {} ... {:?}", i + 1, stem(raw), v.decision),
+                        Err(e) => writeln!(out, "[{}/{n}] {} ... FAILED: {e}", i + 1, stem(raw)),
+                    };
+                    drop(out);
+                    results.lock().unwrap()[i] = Some(res.is_ok());
+                }
+            });
         }
-    }
+    });
+
+    let results = results.into_inner().unwrap();
+    let ok = results.iter().filter(|r| **r == Some(true)).count();
+    let fail = results.iter().filter(|r| **r == Some(false)).count();
     println!("\nbatch done: {ok} ok, {fail} failed, {} still pending.", todo.saturating_sub(n));
     Ok(())
 }

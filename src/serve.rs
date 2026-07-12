@@ -29,6 +29,7 @@ use crate::render;
 
 const INDEX_HTML: &str = include_str!("web/index.html");
 const LIST_CAP: usize = 1000; // cap thumbnails shown
+const PREVIEW_EDGE: u32 = 1200; // max edge of the cached develop/preview base
 
 struct AppState {
     /// The working directory the gallery lists from. Behind a lock so the UI can
@@ -270,11 +271,52 @@ fn api_upload(mut request: Request, state: &AppState) -> Result<()> {
     )
 }
 
+/// Decode a source's embedded preview and resize it to the 1200px web base —
+/// through a process-wide (path, mtime)-keyed cache (same pattern as render.rs's
+/// bitmap-mask cache). The UI POSTs /api/develop on EVERY slider gesture, and
+/// `preview_only` decodes the FULL embedded JPEG (~60 MP on the user's bodies)
+/// each time — the per-gesture decode+resize dwarfed the develop itself. mtime in
+/// the key is the invalidation: an overwritten source misses and re-decodes.
+fn preview_base(raw: &Path) -> Result<Arc<DynamicImage>> {
+    use std::sync::{Mutex, OnceLock};
+    type Cache = Mutex<Vec<(PathBuf, std::time::SystemTime, Arc<DynamicImage>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let mtime = std::fs::metadata(raw).and_then(|m| m.modified()).ok();
+    if let Some(t) = mtime {
+        // No user code runs under the lock, so poisoning is not reachable —
+        // recover anyway rather than turning a past panic into a new one.
+        let list = cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, _, img)) = list.iter().find(|(p, ct, _)| *ct == t && p == raw) {
+            return Ok(img.clone());
+        }
+    }
+    let img = Arc::new(
+        decode::preview_only(raw)?
+            .resize(PREVIEW_EDGE, PREVIEW_EDGE, image::imageops::FilterType::Triangle),
+    );
+    if let Some(t) = mtime {
+        let mut list = cache.lock().unwrap_or_else(|p| p.into_inner());
+        list.retain(|(p, _, _)| p != raw); // a stale-mtime entry for this path is dead
+        if list.len() >= 8 {
+            list.remove(0); // small Vec in insertion order → evict the oldest insert
+        }
+        list.push((raw.to_path_buf(), t, img.clone()));
+    }
+    Ok(img)
+}
+
 fn api_image(request: Request, state: &AppState, max_edge: u32) -> Result<()> {
     let raw = raw_for(&request, state)?;
-    let preview = decode::preview_only(&raw)?;
-    let resized = preview.resize(max_edge, max_edge, image::imageops::FilterType::Triangle);
-    respond_jpeg(request, &resized)
+    let base = preview_base(&raw)?;
+    if max_edge >= PREVIEW_EDGE {
+        respond_jpeg(request, &base)
+    } else {
+        // Thumbnail: resize DOWN from the cached 1200px base instead of paying a
+        // second full decode of the same source.
+        let resized = base.resize(max_edge, max_edge, image::imageops::FilterType::Triangle);
+        respond_jpeg(request, &resized)
+    }
 }
 
 fn api_recipe(request: Request, state: &AppState) -> Result<()> {
@@ -454,8 +496,7 @@ fn api_analyze(mut request: Request, state: &AppState) -> Result<()> {
 fn api_develop(mut request: Request, state: &AppState) -> Result<()> {
     let req: DevelopReq = read_json(&mut request)?;
     let raw = state.at(req.id).ok_or_else(|| anyhow!("bad id"))?;
-    let preview =
-        decode::preview_only(&raw)?.resize(1200, 1200, image::imageops::FilterType::Triangle);
+    let preview = preview_base(&raw)?;
     let after = render::develop_preview(&preview, &req.recipe);
     respond_jpeg(request, &after)
 }
