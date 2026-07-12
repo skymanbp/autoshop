@@ -8,7 +8,7 @@
 //! `"x, y"` strings (see `docs/M1_PLAN.md` §5 and §9). We emit only the keys we
 //! set; Lightroom fills the rest from defaults.
 
-use crate::recipe::{EditRecipe, MaskGeometry, RangeMask};
+use crate::recipe::{ColorGrade, Crop, CurvePoint, EditRecipe, Hsl, LocalAdjustment, MaskGeometry, RangeMask};
 
 /// Format an integer-valued slider the way ACR writes it: explicit `+` for
 /// positives (`"+14"`, `"-12"`, `"0"`).
@@ -364,6 +364,272 @@ pub fn recipe_to_xmp(r: &EditRecipe) -> String {
     )
 }
 
+// ───────────────────────── XMP → EditRecipe (reader) ─────────────────────────
+//
+// The inverse of [`recipe_to_xmp`], so a sidecar written earlier (by us or by
+// Lightroom) can be loaded back into the editor. Scan-based like the eval
+// harness's parser: classic-ACR values are flat `crs:Key="value"` attributes,
+// verified against the user's real LR sidecars, so plain text scanning
+// round-trips everything the writer emits without an XML dependency. Fields
+// classic XMP cannot carry (bitmap masks, recolour gains, mask roles) simply
+// don't come back — the app-internal recipe.json is the lossless sidecar; this
+// reader is the recovery path when only an XMP exists.
+
+/// Raw string value of a `crs:<key>="…"` attribute (first occurrence). The
+/// `crs:` anchor makes prefixed cousins unambiguous (`crs:Tint` can never match
+/// inside `crs:LocalTint`).
+fn crs_str<'a>(xmp: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("crs:{key}=\"");
+    let start = xmp.find(&needle)? + needle.len();
+    let rest = &xmp[start..];
+    Some(&rest[..rest.find('"')?])
+}
+
+/// Numeric `crs:` attribute, tolerating ACR's explicit `+` (`"+22"`). `None` if
+/// the key is absent or unparsable. Shared with the eval harness + style index
+/// (re-exported through `eval`).
+pub(crate) fn crs_f32(xmp: &str, key: &str) -> Option<f32> {
+    crs_str(xmp, key)?.trim().trim_start_matches('+').parse::<f32>().ok()
+}
+
+/// Undo [`xml_escape`]. `&amp;` is decoded LAST so an escaped `&lt;` cannot
+/// cascade into a second decode.
+fn xml_unescape(s: &str) -> String {
+    s.replace("&quot;", "\"").replace("&gt;", ">").replace("&lt;", "<").replace("&amp;", "&")
+}
+
+/// The text between `open` and `close` (first occurrence of each, in order).
+fn block_between<'a>(xmp: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let start = xmp.find(open)? + open.len();
+    let rest = &xmp[start..];
+    Some(&rest[..rest.find(close)?])
+}
+
+/// Parse one `<crs:ToneCurvePV2012…>` `rdf:Seq` of `"x, y"` points back into
+/// curve control points. A 2-point identity (0,0 → 255,255) collapses to empty:
+/// Lightroom ALWAYS writes the master curve (even "Linear"), while our writer
+/// omits empty curves — collapsing keeps a re-import equal to a recipe that
+/// never touched the curve.
+fn parse_curve(xmp: &str, tag: &str) -> Vec<CurvePoint> {
+    let Some(body) = block_between(xmp, &format!("<crs:{tag}>"), &format!("</crs:{tag}>")) else {
+        return Vec::new();
+    };
+    let mut pts = Vec::new();
+    for chunk in body.split("<rdf:li>").skip(1) {
+        let Some(end) = chunk.find("</rdf:li>") else { continue };
+        let mut it = chunk[..end].split(',');
+        if let (Some(x), Some(y)) = (it.next(), it.next())
+            && let (Ok(x), Ok(y)) = (x.trim().parse::<f32>(), y.trim().parse::<f32>())
+        {
+            pts.push(CurvePoint {
+                input: x.clamp(0.0, 255.0).round() as u8,
+                output: y.clamp(0.0, 255.0).round() as u8,
+            });
+        }
+    }
+    let identity = [CurvePoint { input: 0, output: 0 }, CurvePoint { input: 255, output: 255 }];
+    if pts == identity { Vec::new() } else { pts }
+}
+
+/// Local-mask corrections back from `<crs:MaskGroupBasedCorrections>` —
+/// parametric geometries only, exactly what [`masks_xml`] can emit (LR brush /
+/// AI masks and our own Bitmap rasters have no classic-XMP encoding; those
+/// corrections are skipped, matching the writer's own skip rule).
+fn parse_masks(xmp: &str) -> Vec<LocalAdjustment> {
+    let Some(block) =
+        block_between(xmp, "<crs:MaskGroupBasedCorrections>", "</crs:MaskGroupBasedCorrections>")
+    else {
+        return Vec::new();
+    };
+    let starts: Vec<usize> =
+        block.match_indices("crs:What=\"Correction\"").map(|(i, _)| i).collect();
+    let mut out = Vec::new();
+    for (n, &s) in starts.iter().enumerate() {
+        let end = starts.get(n + 1).copied().unwrap_or(block.len());
+        if let Some(m) = parse_one_correction(&block[s..end]) {
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// One `crs:What="Correction"` segment → a [`LocalAdjustment`]. Slider scales
+/// invert the writer's: exposure ×4 (a power-of-two rescale, exact in binary
+/// FP), every other slider ×100 snapped to 4 decimals so `"0.3" → 30.0` lands
+/// back on the UI grid instead of 30.000002.
+fn parse_one_correction(seg: &str) -> Option<LocalAdjustment> {
+    let q100 =
+        |k: &str| crs_f32(seg, k).map_or(0.0, |v| (v * 100.0 * 10_000.0).round() / 10_000.0);
+    // The geometry component decides the mask shape; a correction with no
+    // parametric geometry is not representable here.
+    let (mask, geom_at) = if let Some(p) = seg.find("crs:What=\"Mask/Gradient\"") {
+        let g = &seg[p..];
+        (
+            MaskGeometry::Linear {
+                zero_x: crs_f32(g, "ZeroX")?,
+                zero_y: crs_f32(g, "ZeroY")?,
+                full_x: crs_f32(g, "FullX")?,
+                full_y: crs_f32(g, "FullY")?,
+            },
+            p,
+        )
+    } else if let Some(p) = seg.find("crs:What=\"Mask/CircularGradient\"") {
+        let g = &seg[p..];
+        (
+            MaskGeometry::Radial {
+                top: crs_f32(g, "Top")?,
+                left: crs_f32(g, "Left")?,
+                bottom: crs_f32(g, "Bottom")?,
+                right: crs_f32(g, "Right")?,
+                feather: crs_f32(g, "Feather")?,
+                roundness: crs_f32(g, "Roundness")?,
+                flipped: crs_str(g, "Flipped") == Some("true"),
+            },
+            p,
+        )
+    } else {
+        return None;
+    };
+    // Optional range component. Its head repeats `MaskInverted="true"` as part
+    // of the intersect ENCODING (see `range_mask_xml`), so user intent is read
+    // from the geometry component only — hence the `geom_at`-anchored scan.
+    let range = seg.find("crs:What=\"Mask/RangeMask\"").and_then(|p| {
+        let r = &seg[p..];
+        if let Some(lum) = crs_str(r, "LumRange") {
+            let v: Vec<f32> = lum.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+            (v.len() == 4).then(|| RangeMask::Luminance {
+                lo_outer: v[0],
+                lo: v[1],
+                hi: v[2],
+                hi_outer: v[3],
+            })
+        } else if let Some(amount) = crs_f32(r, "ColorAmount") {
+            // PointModels entry: "r g b px py 0" (writer + LR convention).
+            let li = block_between(r, "<rdf:li>", "</rdf:li>")?;
+            let v: Vec<f32> = li.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+            (v.len() >= 5)
+                .then(|| RangeMask::Color { r: v[0], g: v[1], b: v[2], amount, px: v[3], py: v[4] })
+        } else {
+            None
+        }
+    });
+    Some(LocalAdjustment {
+        mask,
+        range,
+        name: crs_str(seg, "CorrectionName").map(xml_unescape).unwrap_or_default(),
+        amount: crs_f32(seg, "CorrectionAmount").unwrap_or(1.0),
+        inverted: crs_str(&seg[geom_at..], "MaskInverted") == Some("true"),
+        exposure_ev: crs_f32(seg, "LocalExposure2012").unwrap_or(0.0) * 4.0,
+        contrast: q100("LocalContrast2012"),
+        highlights: q100("LocalHighlights2012"),
+        shadows: q100("LocalShadows2012"),
+        whites: q100("LocalWhites2012"),
+        blacks: q100("LocalBlacks2012"),
+        clarity: q100("LocalClarity2012"),
+        dehaze: q100("LocalDehaze"),
+        texture: q100("LocalTexture"),
+        saturation: q100("LocalSaturation"),
+        temperature: q100("LocalTemperature"),
+        tint: q100("LocalTint"),
+        noise_reduction: q100("LocalLuminanceNoise"),
+        // color_gains / role are engine-only and never reach a sidecar.
+        ..Default::default()
+    })
+}
+
+/// Parse an ACR / Lightroom `.xmp` sidecar into an [`EditRecipe`] — the inverse
+/// of [`recipe_to_xmp`] over every field classic XMP can carry. Absent keys stay
+/// neutral, so a foreign XML parses to (nearly) a default recipe rather than
+/// erroring. Two provenance rules keep a FOREIGN sidecar honest:
+///   * `Temperature` counts only under `WhiteBalance="Custom"` — an "As Shot"
+///     sidecar records the CAMERA's Kelvin, which is not an edit, and importing
+///     it would visibly shift the render.
+///   * Same for `Tint`, except sidecars we wrote ourselves (marked
+///     `x:xmptk="Autoshop"`), whose Tint is always a real edit.
+///
+/// Callers should [`EditRecipe::clamp`] the result before use, like any other
+/// untrusted recipe input.
+pub fn xmp_to_recipe(xmp: &str) -> EditRecipe {
+    let ours = xmp.contains("x:xmptk=\"Autoshop\"");
+    let custom_wb = crs_str(xmp, "WhiteBalance") == Some("Custom");
+    let f = |k: &str| crs_f32(xmp, k).unwrap_or(0.0);
+
+    let mut hsl = Hsl::default();
+    for (i, band) in crate::recipe::HSL_BANDS.iter().enumerate() {
+        hsl.hue[i] = f(&format!("HueAdjustment{band}"));
+        hsl.saturation[i] = f(&format!("SaturationAdjustment{band}"));
+        hsl.luminance[i] = f(&format!("LuminanceAdjustment{band}"));
+    }
+    let color_grade = ColorGrade {
+        shadow_hue: f("SplitToningShadowHue"),
+        shadow_sat: f("SplitToningShadowSaturation"),
+        shadow_lum: f("ColorGradeShadowLum"),
+        midtone_hue: f("ColorGradeMidtoneHue"),
+        midtone_sat: f("ColorGradeMidtoneSat"),
+        midtone_lum: f("ColorGradeMidtoneLum"),
+        highlight_hue: f("SplitToningHighlightHue"),
+        highlight_sat: f("SplitToningHighlightSaturation"),
+        highlight_lum: f("ColorGradeHighlightLum"),
+        global_hue: f("ColorGradeGlobalHue"),
+        global_sat: f("ColorGradeGlobalSat"),
+        global_lum: f("ColorGradeGlobalLum"),
+        blending: crs_f32(xmp, "ColorGradeBlending").unwrap_or(ColorGrade::default().blending),
+        balance: f("SplitToningBalance"),
+    };
+    // Our own comment header carries the AI provenance back (best-effort; the
+    // escaped rationale cannot contain a raw "-->", so the scan is unambiguous).
+    let (rationale, confidence) = block_between(xmp, "AI rationale: ", " -->")
+        .and_then(|body| {
+            let cut = body.rfind(" (confidence ")?;
+            let conf =
+                body[cut + " (confidence ".len()..].trim_end_matches(')').parse::<f32>().ok()?;
+            Some((xml_unescape(&body[..cut]), conf))
+        })
+        .unwrap_or_default();
+
+    EditRecipe {
+        temperature_k: custom_wb.then(|| crs_f32(xmp, "Temperature")).flatten(),
+        tint: if custom_wb || ours { f("Tint") } else { 0.0 },
+        exposure_ev: f("Exposure2012"),
+        contrast: f("Contrast2012"),
+        highlights: f("Highlights2012"),
+        shadows: f("Shadows2012"),
+        whites: f("Whites2012"),
+        blacks: f("Blacks2012"),
+        clarity: f("Clarity2012"),
+        dehaze: f("Dehaze"),
+        vibrance: f("Vibrance"),
+        saturation: f("Saturation"),
+        hsl,
+        color_grade,
+        // crs Sharpness is 0..100, recipe sharpening 0..150 (writer scales ×⅔).
+        sharpening: f("Sharpness") * 1.5,
+        noise_reduction: f("LuminanceSmoothing"),
+        lens_vignette: f("VignetteAmount"),
+        lens_vignette_mid: crs_f32(xmp, "VignetteMidpoint").unwrap_or(50.0),
+        lens_distortion: f("LensManualDistortionAmount"),
+        straighten_deg: f("CropAngle"),
+        crop: (crs_str(xmp, "HasCrop") == Some("True"))
+            .then(|| {
+                Some(Crop {
+                    left: crs_f32(xmp, "CropLeft")?,
+                    top: crs_f32(xmp, "CropTop")?,
+                    right: crs_f32(xmp, "CropRight")?,
+                    bottom: crs_f32(xmp, "CropBottom")?,
+                })
+            })
+            .flatten(),
+        tone_curve: parse_curve(xmp, "ToneCurvePV2012"),
+        red_curve: parse_curve(xmp, "ToneCurvePV2012Red"),
+        green_curve: parse_curve(xmp, "ToneCurvePV2012Green"),
+        blue_curve: parse_curve(xmp, "ToneCurvePV2012Blue"),
+        masks: parse_masks(xmp),
+        rationale,
+        confidence,
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,5 +875,178 @@ mod tests {
         assert!(!xmp.contains("ToneCurvePV2012Green"));
         // A neutral recipe emits no per-channel curves at all.
         assert!(!recipe_to_xmp(&EditRecipe::default()).contains("ToneCurvePV2012Red"));
+    }
+
+    // ── reader (xmp_to_recipe) ───────────────────────────────────────────────
+
+    #[test]
+    fn globals_round_trip_through_xmp() {
+        // Values are chosen to survive the writer's documented rounding: integer
+        // sliders (`signed()`), 2-decimal exposure, integer Kelvin, 1-decimal
+        // straighten, %.6f crop — so the reader must land EXACTLY back.
+        let r = EditRecipe {
+            exposure_ev: 0.32,
+            contrast: 14.0,
+            highlights: -12.0,
+            shadows: 25.0,
+            whites: 8.0,
+            blacks: -6.0,
+            temperature_k: Some(5600.0),
+            tint: 3.0,
+            vibrance: 18.0,
+            saturation: -5.0,
+            clarity: 10.0,
+            dehaze: 7.0,
+            hsl: crate::recipe::Hsl {
+                hue: [0.0, 15.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                saturation: [0.0, 0.0, 0.0, -40.0, 0.0, 0.0, 0.0, 0.0],
+                ..Default::default()
+            },
+            color_grade: crate::recipe::ColorGrade {
+                shadow_hue: 220.0,
+                shadow_sat: 30.0,
+                highlight_hue: 45.0,
+                highlight_sat: 20.0,
+                midtone_lum: -10.0,
+                balance: 15.0,
+                ..Default::default()
+            },
+            sharpening: 45.0, // → crs 30 → ×1.5 → 45 exactly
+            noise_reduction: 20.0,
+            lens_vignette: 35.0,
+            lens_vignette_mid: 60.0,
+            lens_distortion: -24.0,
+            straighten_deg: 1.5,
+            crop: Some(Crop { left: 0.05, top: 0.0, right: 0.95, bottom: 1.0 }),
+            tone_curve: vec![
+                CurvePoint { input: 0, output: 8 },
+                CurvePoint { input: 255, output: 247 },
+            ],
+            red_curve: vec![
+                CurvePoint { input: 0, output: 10 },
+                CurvePoint { input: 255, output: 250 },
+            ],
+            rationale: "warm & contrasty <test> & \"q\"".into(),
+            confidence: 0.82,
+            ..Default::default()
+        };
+        let back = xmp_to_recipe(&recipe_to_xmp(&r));
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn as_shot_tint_round_trips_only_for_our_own_sidecars() {
+        // Our writer emits a non-neutral Tint even under "As Shot"; the Autoshop
+        // marker tells the reader it is a real edit.
+        let r = EditRecipe { tint: 3.0, ..Default::default() };
+        assert_eq!(xmp_to_recipe(&recipe_to_xmp(&r)).tint, 3.0);
+    }
+
+    #[test]
+    fn parametric_masks_round_trip_through_xmp() {
+        let r = EditRecipe {
+            masks: vec![
+                LocalAdjustment {
+                    mask: MaskGeometry::Linear { zero_x: 0.5, zero_y: 0.35, full_x: 0.5, full_y: 0.0 },
+                    range: Some(RangeMask::Luminance { lo_outer: 0.4, lo: 0.5, hi: 1.0, hi_outer: 1.0 }),
+                    name: "sky & sea".into(),
+                    amount: 0.75,
+                    inverted: true,
+                    exposure_ev: -0.4, // ÷4 → ×4 is a power-of-two rescale: exact
+                    contrast: 30.0,    // "0.3" ×100 needs the 4-decimal snap: exact
+                    highlights: -50.0,
+                    shadows: 60.0,
+                    whites: 10.0,
+                    blacks: -20.0,
+                    clarity: 40.0,
+                    dehaze: 5.0,
+                    texture: 15.0,
+                    saturation: 20.0,
+                    temperature: 25.0,
+                    tint: -10.0,
+                    noise_reduction: 30.0,
+                    ..Default::default()
+                },
+                LocalAdjustment {
+                    mask: MaskGeometry::Radial {
+                        top: 0.3, left: 0.35, bottom: 0.7, right: 0.65,
+                        feather: 0.5, roundness: 0.0, flipped: true,
+                    },
+                    range: Some(RangeMask::Color { r: 0.9, g: 0.6, b: 0.2, amount: 0.5, px: 0.4, py: 0.7 }),
+                    name: "subject".into(),
+                    shadows: 20.0,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let back = xmp_to_recipe(&recipe_to_xmp(&r));
+        assert_eq!(back.masks, r.masks);
+    }
+
+    #[test]
+    fn bitmap_masks_do_not_come_back_from_xmp() {
+        // The writer skips raster corrections (no classic-XMP encoding), so the
+        // reader must return only the parametric mask — never a phantom.
+        let mixed = EditRecipe {
+            masks: vec![
+                LocalAdjustment {
+                    mask: MaskGeometry::Linear { zero_x: 0.5, zero_y: 0.35, full_x: 0.5, full_y: 0.0 },
+                    exposure_ev: -1.0,
+                    ..Default::default()
+                },
+                LocalAdjustment {
+                    mask: MaskGeometry::Bitmap { path: "out/subject.png".into() },
+                    exposure_ev: 0.6,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let back = xmp_to_recipe(&recipe_to_xmp(&mixed));
+        assert_eq!(back.masks.len(), 1);
+        assert_eq!(back.masks[0].mask, mixed.masks[0].mask);
+        assert_eq!(back.masks[0].exposure_ev, -1.0);
+    }
+
+    #[test]
+    fn foreign_as_shot_sidecar_imports_no_wb_and_drops_identity_curves() {
+        // A Lightroom-style sidecar (no Autoshop marker): "As Shot" Temperature
+        // and Tint are the CAMERA's values, not edits — they must NOT import.
+        // LR also always writes the master curve; the 2-point identity means
+        // "no curve" and must collapse to empty.
+        let lr = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 7.0-c000">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+    crs:WhiteBalance="As Shot"
+    crs:Temperature="5150"
+    crs:Tint="+10"
+    crs:Exposure2012="+0.65"
+    crs:Contrast2012="+22"
+    crs:Sharpness="40"
+    crs:HasSettings="True">
+   <crs:ToneCurvePV2012>
+    <rdf:Seq>
+     <rdf:li>0, 0</rdf:li>
+     <rdf:li>255, 255</rdf:li>
+    </rdf:Seq>
+   </crs:ToneCurvePV2012>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+"#;
+        let r = xmp_to_recipe(lr);
+        assert_eq!(r.temperature_k, None, "as-shot Kelvin is not an edit");
+        assert_eq!(r.tint, 0.0, "as-shot tint is not an edit");
+        assert_eq!(r.exposure_ev, 0.65);
+        assert_eq!(r.contrast, 22.0);
+        assert_eq!(r.sharpening, 60.0); // crs 40 × 1.5
+        assert!(r.tone_curve.is_empty(), "identity curve must collapse");
+        // A Custom-WB foreign sidecar DOES import its Kelvin + tint.
+        let custom = lr.replace("As Shot", "Custom");
+        let rc = xmp_to_recipe(&custom);
+        assert_eq!(rc.temperature_k, Some(5150.0));
+        assert_eq!(rc.tint, 10.0);
     }
 }

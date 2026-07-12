@@ -19,15 +19,10 @@ use crate::config::Config;
 use crate::pipeline;
 use crate::recipe::EditRecipe;
 
-/// Read a single `crs:<key>="<value>"` numeric attribute, tolerating a leading
-/// `+` (ACR writes `"+22"`). `None` if the key is absent or unparizable.
-pub(crate) fn crs_f32(xmp: &str, key: &str) -> Option<f32> {
-    let needle = format!("crs:{key}=\"");
-    let start = xmp.find(&needle)? + needle.len();
-    let rest = &xmp[start..];
-    let end = rest.find('"')?;
-    rest[..end].trim().trim_start_matches('+').parse::<f32>().ok()
-}
+// The `crs:` attribute scanner lives beside the XMP writer it inverts (xmp.rs,
+// where the sidecar READER also uses it); re-exported so this module's tests
+// and `style.rs` keep their `eval::crs_f32` path.
+pub(crate) use crate::xmp::crs_f32;
 
 /// Comparable global develop values from a user XMP, mapped into our recipe's
 /// units (e.g. crs Sharpness 0..100 → recipe sharpening 0..150).
