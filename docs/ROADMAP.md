@@ -1,17 +1,83 @@
 # ROADMAP — “一定程度直接取代 Photoshop” 路线（v0.5.0 之后 · UX 阶段）
 
 > 交接文档：每项都附实现要点与 `file:line` 锚点，供新会话不重读全库即可
-> 开工。更新于 2026-07-11（**v0.9.0 已发布**：tag `v0.9.0` → `ca6f73e`，
-> "v0.9.0 — GUI multi-language (English skeleton + Chinese overlay)"，
-> 双 exe 资产字节核对 gui 33451827 / cli 25974719，标记 Latest；GUI i18n
-> （`cad6c68` feat + bump `ca6f73e`）——新增用户可见功能故 minor 而非 patch。
-> 前一版 v0.8.1 → `ce69f27`（preview lag root-fix：LUT colour gains + async
-> latest-wins，双 exe gui 33344521 / cli 25945946）；再前 v0.8.0 → `1c1ea36`
-> （zoned reverse-fit + engine local WB）。反馈驱动阶段——用户试用 → 报障/
-> 提需 → 修复/打磨 → 发布）。
+> 开工。更新于 2026-07-12（**v0.10.0 已发布**：tag `v0.10.0` → `c312a9f`，
+> "v0.10.0 — restore saved edits on open (recipe.json/XMP import) +
+> responsiveness quick-wins"，双 exe 资产字节核对 gui 33510426 /
+> cli 25964746，标记 Latest；`6957897` lib XMP 读取器 + `3124596` gui
+> 打开即恢复/无损保存/性能快赢 + bump `c312a9f`——新增用户可见功能故
+> minor。前版 v0.9.0 → `ca6f73e`（GUI i18n 英文骨架+中文覆盖，gui
+> 33451827 / cli 25974719）；v0.8.1 → `ce69f27`（preview lag root-fix：
+> LUT colour gains + async latest-wins）；v0.8.0 → `1c1ea36`（zoned
+> reverse-fit + engine local WB）。反馈驱动阶段——用户试用 → 报障/提需 →
+> 修复/打磨 → 发布）。
 
 ## 当前状态（已完成，勿重做）
 
+- **边车恢复 + 响应性快赢（2026-07-12，已随 v0.10.0 发布 → `c312a9f`）**——用户报
+  "图库显示 ● edited 但打开后不加载 XMP"。根因：徽标查 ./out 边车
+  （recipe.json‖xmp，gui.rs `gallery_panel`），而打开路径从不读它们
+  （`Msg::Opened` 新开分支一律 `EditRecipe::default()`）；且 GUI 自己的两条
+  保存路径（Save XMP 按钮、反推 worker）只写 XMP——位图蒙版/重着色增益
+  根本进不了经典 XMP，反推结果关掉即丢。三层根修（`6957897` lib + `3124596` gui）：
+  1. **XMP 读取器 `xmp::xmp_to_recipe`（xmp.rs，与写入器同文件）**：逐字段反演
+     `recipe_to_xmp`——全局滑杆/HSL/分级/曲线/裁剪拉直/暗角畸变/参数化蒙版
+     （线性+径向，含范围蒙版；位图蒙版与写入器同规则跳过）。**溯源规则**：
+     As-Shot 的 Temperature/Tint 是相机值不是编辑，仅 `WhiteBalance="Custom"`
+     才导入（Tint 另认我们自己的 `x:xmptk="Autoshop"` 标记）；LR 恒写的
+     2 点恒等主曲线折叠为空。局部滑杆刻度精确反演（曝光 /4→×4 二的幂无损；
+     ×100 后 4 位小数吸附回 UI 网格）。round-trip 性质测试钉死：
+     recipe→XMP→recipe 对写入器舍入安全值全等。`crs_f32` 迁至 xmp.rs
+     （eval.rs `pub(crate) use` 转出，style.rs 路径不变）。
+  2. **打开即恢复（gui.rs `read_saved_develop`）**：新开分支优先
+     `<stem>.recipe.json`（无损：位图蒙版/color_gains/role 全回）、缺则 XMP
+     反演；无效/中性边车恢复无物（`is_noop` 门）。undo 基线=恢复后配方，
+     「重置」可回中性；状态栏 "ready — restored saved edits ({kind})…"。
+  3. **保存改无损**：Save XMP (Ctrl+S) 同时写 recipe.json；反推 worker 对
+     **任意**源持久化 recipe.json（RAW 另写 XMP 不变）——反推结果首次可
+     关闭→重开完整还原。
+  **响应性快赢（同批 `3124596`，源自 63-agent 对抗验证审计的 29 项确证）**：
+  ① "● edited" 徽标每可见行每帧 2 次文件 stat → 按索引缓存
+  （`edited_badge`，换目录/本 app 写边车时失效）；② 解码底图 LRU
+  （`base_cache` 4 项，path+edge+mtime 键）——图库来回挑片二次打开跳过
+  整幅 demosaic；③ 范围蒙版 overlay 的 masks-cleared 参考重建（UI 线程整幅
+  显影，2560/4096 达 100-300ms）在指针按住期间挂起、松手后一帧内补建
+  （几何蒙版不受影响）；④ 涂抹蒙版纹理改 `TextureHandle::set` 原地更新
+  （原每笔一帧新建纹理）；⑤ `build_preview` `into_rgb8` 移动缓冲
+  （原 to_rgb8 每 tick 深拷贝 ~3.3MB）；⑥ 目录扫描 `DirEntry::file_type()`
+  免每文件二次 stat（符号链接回退 `Path::is_dir` 保持行为）。
+  基线 **102 lib + 9 gui** 全绿（+5 xmp round-trip、+1 边车优先级、
+  +1 LRU）、clippy(gui) 零警告。待用户真机验收：打开带 ● edited 的照片应
+  直接回到保存的编辑；反推→关→重开应完整还原（含分区蒙版）。
+  **未做——引擎性能批次 #3-B backlog（审计确证、按影响排序，勿凭印象重推导）**：
+  - HIGH `render.rs:485` 整个 develop 管线单线程（rawler demosaic 内部已
+    rayon 并行，尾部全串行）——加 rayon `par_chunks_mut` 按行并行各逐像素
+    段（逐像素独立，逐字节不变；dehaze 直方图需每线程直方图合并）。
+  - HIGH `render.rs:637` apply_dehaze 每像素 6 次 powf（sRGB↔线性×3×2）
+    ——复用 v0.8.1 色偏增益同款 4096 项 LUT 机制（参数无关可 OnceLock）。
+  - HIGH `render.rs:570` apply_vignette 每像素 7 次 powf——增益 LUT(rn)
+    + 共享 sRGB↔线性 LUT 对。
+  - MEDIUM `render.rs:313` convert_export_color_space 每像素 6 powf
+    （P3/AdobeRGB 导出多秒纯数学）——u16 输入可用 65536 项精确解码表。
+  - MEDIUM `render.rs:1035` box_blur_v 列主序访存（clarity/NR 每显影至多
+    4 次调用）→ 行主序 + 每列 running-sum，结果逐位不变。
+  - MEDIUM `render.rs:1660` orient_f32 三次整幅拷贝（61MP 各 ~732MB）→
+    bytemuck cast_vec 零拷贝；LOW `render.rs:1703` rotate/distort/export
+    对已是 Rgb16 的 to_rgb16() 克隆 → as_rgb16 借用。
+  - MEDIUM gui 打开路径整幅显影后才缩略（`gui.rs open_path`：60MP 全解
+    喂 ≤1280 预览）——`render_to_image` 加 max_edge 于 orient 后先降采样
+    （预览像素轻微变化：线性光 vs 伽马域缩放，需目视验收）；或最小改
+    默认配方恒等 tone-pass 短路。
+  - MEDIUM `decode.rs:239` 烘焙图缩略图全幅解码（60MP TIFF ~360MB/张 ×6
+    并发）；`gui.rs` thumbs 纹理无上限（5k 图 ~350MB）+ 无磁盘缩略图缓存
+    （每次启动全量重解）→ %LOCALAPPDATA% JPEG 缓存 + LRU 逐出。
+  - MEDIUM `serve.rs:457` Web /api/develop 每请求重解全幅嵌入 JPEG →
+    (path,mtime) 键 Arc 缓存（同 load_mask_bitmap 先例 render.rs:815）。
+  - MEDIUM `main.rs:571` CLI 批量严格串行（网络等待与 CPU 渲染不重叠）→
+    2-4 线程有界池；`style.rs:148` 建风格索引串行全库解码 → scope 池 ~4。
+  - LOW `gui.rs:1964` 削波开关 J 触发整幅重显影 → 保留上帧 RgbImage 直接
+    重建 overlay；LOW `gui.rs:1716` finish_redevelop UI 线程 RGB→RGBA 扩展
+    → 移入 build_preview。
 - **GUI 多语言 i18n：英文骨架 + 中文切换（2026-07-11，已随 v0.9.0 发布 → `ca6f73e`）**
   ——把原生 GUI ~430 条中英混排硬编码文案统一到零依赖、英文即键的翻译层。
   发布前 4 路对抗审计（密钥/范围/键覆盖/MaskRole）0 blocker，键覆盖审计报出
