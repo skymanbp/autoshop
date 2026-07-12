@@ -160,7 +160,13 @@ type RetouchDone = anyhow::Result<(image::DynamicImage, String, PathBuf, Retouch
 struct PreviewDone {
     base: Arc<image::DynamicImage>,
     recipe: EditRecipe,
+    /// Kept AFTER display too (as `last_rgb`) so toggling the clipping layer
+    /// can rebuild its overlay without a full redevelop.
     rgb: image::RgbImage,
+    /// The texture-ready conversion of `rgb`, built worker-side — the UI
+    /// thread's only job is `tex.set` (the RGB→RGBA expansion of a 4-11 MP
+    /// frame at 2560/4096 was a 5-15 ms stall per accepted frame).
+    after: egui::ColorImage,
     histogram: Vec<[f32; 4]>,
     clipping: Option<egui::ColorImage>,
     thumb: egui::ColorImage,
@@ -638,6 +644,7 @@ struct AutoshopApp {
     overlay_ref: Option<(EditRecipe, image::DynamicImage)>,
     overlay_build_count: u64,              // actual coverage rebuilds (tests/diagnostics)
     show_clipping: bool,                   // clipping warnings: red blown / blue crushed (J)
+    last_rgb: Option<image::RgbImage>,     // last accepted frame's pixels (instant clip toggle)
     clip_tex: Option<egui::TextureHandle>,
     // --- zoom / pan (per-photo, reset on open) ---
     zoom: f32,                             // 1.0 = fit; up to 12×
@@ -874,6 +881,7 @@ impl Default for AutoshopApp {
             hover_mask: None,
             batch_progress: None,
             show_clipping: false,
+            last_rgb: None,
             clip_tex: None,
         }
     }
@@ -1043,7 +1051,8 @@ fn build_preview(
     let clipping = show_clipping.then(|| clipping_overlay_rgb(&rgb));
     let thumb_rgb = image::imageops::thumbnail(&rgb, 96, 96);
     let thumb = rgb_to_color_image(&thumb_rgb);
-    PreviewDone { base, recipe, rgb, histogram, clipping, thumb }
+    let after = rgb_to_color_image(&rgb);
+    PreviewDone { base, recipe, rgb, after, histogram, clipping, thumb }
 }
 
 /// Stamp a filled brush dot into the paint mask (painted = translucent red).
@@ -1073,6 +1082,66 @@ fn stamp_line(m: &mut image::RgbaImage, a: (f32, f32), b: (f32, f32), r: f32) {
         let t = i as f32 / steps as f32;
         stamp_dot(m, (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t), r);
     }
+}
+
+/// One process-wide permit serialising >24 MP baked-raster thumbnail decodes
+/// (see request_thumb). RAW thumbs never take it.
+fn big_decode_gate() -> &'static std::sync::Mutex<()> {
+    static GATE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    GATE.get_or_init(Default::default)
+}
+
+/// Where the persistent 160px thumbnail for `src` lives, or `None` when the
+/// source can't be stat'ed (no stable key → no caching). The directory is
+/// derived at runtime (%LOCALAPPDATA%, else the system temp dir) and the key
+/// hashes absolute path + mtime + size, so an edited/replaced source misses.
+fn thumb_cache_file(src: &std::path::Path) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let meta = std::fs::metadata(src).ok()?;
+    let dir = std::env::var_os("LOCALAPPDATA")
+        .map(|d| PathBuf::from(d).join("autoshop").join("thumbs"))
+        .unwrap_or_else(|| std::env::temp_dir().join("autoshop-thumbs"));
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::path::absolute(src).unwrap_or_else(|_| src.to_path_buf()).hash(&mut h);
+    meta.modified().ok().hash(&mut h);
+    meta.len().hash(&mut h);
+    Some(dir.join(format!("{:016x}.jpg", h.finish())))
+}
+
+/// Write-through for the thumbnail disk cache — best effort: a failed write
+/// only costs a re-decode next session, so it warns rather than failing the
+/// thumb. Once per session, an oversized cache dir (>10k files) is pruned by
+/// age on a background thread.
+fn save_thumb_cache(cache: &std::path::Path, thumb: &image::DynamicImage) {
+    let Some(dir) = cache.parent() else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    if let Err(e) = thumb.to_rgb8().save_with_format(cache, image::ImageFormat::Jpeg) {
+        eprintln!("⚠ thumb cache write failed ({e}) — will re-decode next session");
+        return;
+    }
+    static PRUNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    let dir = dir.to_path_buf();
+    PRUNED.get_or_init(|| {
+        std::thread::spawn(move || {
+            let Ok(rd) = std::fs::read_dir(&dir) else { return };
+            let mut files: Vec<(std::time::SystemTime, PathBuf)> = rd
+                .flatten()
+                .filter_map(|e| {
+                    let p = e.path();
+                    let t = e.metadata().and_then(|m| m.modified()).ok()?;
+                    Some((t, p))
+                })
+                .collect();
+            if files.len() > 10_000 {
+                files.sort_by_key(|(t, _)| *t);
+                for (_, p) in files.iter().take(files.len() - 10_000) {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        });
+    });
 }
 
 /// Decoded-base LRU key: source path + requested preview edge + file mtime
@@ -1250,6 +1319,7 @@ impl AutoshopApp {
         self.sel_mask = None;
         self.overlay_ref = None;
         self.overlay_stale = true;
+        self.last_rgb = None; // the retained frame belongs to the OLD variant
         self.placing_mask = None;
         self.place_start = None;
         self.paint_mode = false;
@@ -1718,6 +1788,9 @@ impl AutoshopApp {
     /// Queue a thumbnail decode for `idx` if it isn't cached/queued and we're
     /// under the concurrency cap. Uses the camera's embedded preview (fast) — the
     /// double-processing concern only applies to the develop base, not a 56px chip.
+    /// A persistent disk cache (keyed on path+mtime+size) makes every later
+    /// session — and every scroll-back after texture eviction — a ~1 ms JPEG
+    /// read instead of a full decode.
     fn request_thumb(&mut self, idx: usize) {
         if self.thumbs.contains_key(&idx) || self.thumb_requested.contains(&idx) {
             return;
@@ -1732,7 +1805,32 @@ impl AutoshopApp {
         self.spawn_worker(
             move || {
                 let res = (|| -> anyhow::Result<image::DynamicImage> {
-                    Ok(autoshop::decode::preview_only(&path)?.thumbnail(THUMB_EDGE, THUMB_EDGE))
+                    let cache = thumb_cache_file(&path);
+                    if let Some(p) = &cache
+                        && let Ok(img) = image::open(p)
+                    {
+                        return Ok(img);
+                    }
+                    // Large baked rasters (the app's own 60 MP TIFF/PNG exports)
+                    // decode whole before the 160px shrink — ~360 MB each, and
+                    // MAX_THUMB_INFLIGHT of them at once spiked to ~2 GB. Gate
+                    // decodes above 24 MP behind one permit; the header read is
+                    // cheap and RAWs (embedded-JPEG previews) stay concurrent.
+                    let _big_permit = if !autoshop::decode::is_raw(&path)
+                        && image::ImageReader::open(&path)
+                            .and_then(|r| r.into_dimensions().map_err(std::io::Error::other))
+                            .is_ok_and(|(w, h)| w as u64 * h as u64 > 24_000_000)
+                    {
+                        Some(big_decode_gate().lock().unwrap_or_else(|p| p.into_inner()))
+                    } else {
+                        None
+                    };
+                    let thumb =
+                        autoshop::decode::preview_only(&path)?.thumbnail(THUMB_EDGE, THUMB_EDGE);
+                    if let Some(p) = &cache {
+                        save_thumb_cache(p, &thumb); // best-effort write-through
+                    }
+                    Ok(thumb)
                 })();
                 Msg::Thumb { generation, idx, img: Box::new(res) }
             },
@@ -1789,12 +1887,16 @@ impl AutoshopApp {
         self.develop_count += 1;
         self.histogram = Some(frame.histogram);
 
-        let after = rgb_to_color_image(&frame.rgb);
+        // The ColorImage arrives worker-built (see PreviewDone.after) — the UI
+        // thread only uploads. The raw RGB is retained so the clipping toggle
+        // can rebuild its overlay later without a redevelop.
         if let Some(tex) = &mut self.after_tex {
-            tex.set(after, egui::TextureOptions::LINEAR);
+            tex.set(frame.after, egui::TextureOptions::LINEAR);
         } else {
-            self.after_tex = Some(ctx.load_texture("after", after, egui::TextureOptions::LINEAR));
+            self.after_tex =
+                Some(ctx.load_texture("after", frame.after, egui::TextureOptions::LINEAR));
         }
+        self.last_rgb = Some(frame.rgb);
         match frame.clipping {
             Some(clip) => {
                 if let Some(tex) = &mut self.clip_tex {
@@ -1818,6 +1920,31 @@ impl AutoshopApp {
         // sliders, whose coverage is independent of their pixel adjustment.
         self.overlay_stale = true;
         ctx.request_repaint();
+    }
+
+    /// Toggle the clipping layer WITHOUT a full redevelop: the overlay is a
+    /// pure function of the last developed pixels (retained from the last
+    /// accepted frame), so the J key / ▲ button / histogram triangles respond
+    /// instantly instead of paying a whole develop (100-300 ms at 2560/4096).
+    /// Falls back to a redevelop only when no frame is retained yet.
+    fn toggle_clipping(&mut self, ctx: &egui::Context) {
+        self.show_clipping = !self.show_clipping;
+        if !self.show_clipping {
+            self.clip_tex = None; // OFF is just dropping the layer
+            return;
+        }
+        match &self.last_rgb {
+            Some(rgb) => {
+                let clip = clipping_overlay_rgb(rgb);
+                if let Some(tex) = &mut self.clip_tex {
+                    tex.set(clip, egui::TextureOptions::NEAREST);
+                } else {
+                    self.clip_tex =
+                        Some(ctx.load_texture("clip", clip, egui::TextureOptions::NEAREST));
+                }
+            }
+            None => self.dirty = true, // nothing retained (fresh open) — worker builds it
+        }
     }
 
     /// (Re)build the translucent red coverage layer for the active mask. A
@@ -1891,7 +2018,19 @@ impl AutoshopApp {
         } else {
             base.as_ref()
         };
-        let mut cov = image::DynamicImage::ImageLuma8(autoshop::render::mask_coverage(&mask, reference));
+        // Coverage is a display-only translucent layer (LINEAR-filtered when
+        // painted), so it never needs more than ~1k resolution — at 2560/4096
+        // preview edges the full-frame raster + RGBA pass dominated the
+        // rebuild. Range weights are judged on the downscaled reference: the
+        // same pixels box-filtered, indistinguishable for an overlay.
+        let small;
+        let cov_ref: &image::DynamicImage = if reference.width().max(reference.height()) > 1024 {
+            small = reference.thumbnail(1024, 1024);
+            &small
+        } else {
+            reference
+        };
+        let mut cov = image::DynamicImage::ImageLuma8(autoshop::render::mask_coverage(&mask, cov_ref));
         if self.recipe.lens_distortion != 0.0 {
             cov = autoshop::render::apply_lens_distortion(&cov, self.recipe.lens_distortion);
         }
@@ -2046,8 +2185,8 @@ impl AutoshopApp {
             }
         }
         if toggle {
-            self.show_clipping = !self.show_clipping;
-            self.dirty = true; // the on-image layer is rebuilt inside redevelop
+            let ctx = ui.ctx().clone();
+            self.toggle_clipping(&ctx); // instant — rebuilt from the retained frame
         }
     }
 
@@ -2644,6 +2783,7 @@ impl AutoshopApp {
                                 self.paint_last = None;
                                 self.base_preview = Some(base);
                             }
+                            self.last_rgb = None; // resolution changed under the frame
                             self.dirty = true;
                             self.status = trf(
                                 lang,
@@ -2683,6 +2823,7 @@ impl AutoshopApp {
                             self.mask_dirty = false;
                             self.paint_last = None;
                             self.paint_mode = false;
+                            self.last_rgb = None; // retained frame was the old photo's
                             self.reset_history(); // a new photo starts a fresh undo history
                             self.region = None; // and a fresh local-edit selection
                             self.region_drag = None;
@@ -3065,10 +3206,12 @@ impl AutoshopApp {
         let mut to_open: Option<usize> = None;
         let mut to_toggle: Option<usize> = None;
         let mut to_request: Vec<usize> = Vec::new();
+        let mut visible: std::ops::Range<usize> = 0..0;
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_rows(ui, GALLERY_ROW_H, count, |ui, range| {
+                visible = range.clone();
                 for i in range {
                     let path = &gallery[i];
                     let is_sel = selected == Some(i);
@@ -3150,6 +3293,17 @@ impl AutoshopApp {
 
         for i in to_request {
             self.request_thumb(i);
+        }
+        // Texture LRU (bounded GPU memory): every scrolled-past row otherwise
+        // pins its 160px texture until the folder changes (~68 KB each — a
+        // 10k-photo folder reached ~0.7 GB). Keep a generous window around the
+        // viewport; evicted indices drop their `requested` marker so a
+        // scroll-back re-materialises from the disk cache in ~1 ms.
+        const THUMB_TEX_CAP: usize = 1500;
+        if self.thumbs.len() > THUMB_TEX_CAP {
+            let keep = visible.start.saturating_sub(600)..visible.end + 600;
+            self.thumbs.retain(|i, _| keep.contains(i));
+            self.thumb_requested.retain(|i| keep.contains(i));
         }
         if let Some(i) = to_toggle
             && !self.multi_sel.remove(&i)
@@ -3841,8 +3995,8 @@ impl AutoshopApp {
                     .on_hover_text(tr(lang, "Clipping warning (J): red = highlight clip, blue = shadow crush (judged on export pixels)"))
                     .clicked()
                 {
-                    self.show_clipping = !self.show_clipping;
-                    self.dirty = true; // the layer is rebuilt inside redevelop
+                    let ctx = ui.ctx().clone();
+                    self.toggle_clipping(&ctx); // instant — no redevelop
                 }
                 ui.label(egui::RichText::new(format!("{:.0}%", scale * 100.0)).weak().small());
                 // --- preview resolution (gap batch E): 1:1 that actually
@@ -5347,8 +5501,8 @@ impl eframe::App for AutoshopApp {
                 self.overlay_stale = true;
             }
             if do_clip {
-                self.show_clipping = !self.show_clipping;
-                self.dirty = true; // the layer is rebuilt inside redevelop
+                // Instant: rebuilt from the retained frame, no redevelop (J).
+                self.toggle_clipping(ctx);
             }
             if do_open && !self.busy
                 && let Some(path) = photo_file_dialog()
