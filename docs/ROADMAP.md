@@ -1,18 +1,34 @@
 # ROADMAP — “一定程度直接取代 Photoshop” 路线（v0.5.0 之后 · UX 阶段）
 
 > 交接文档：每项都附实现要点与 `file:line` 锚点，供新会话不重读全库即可
-> 开工。更新于 2026-07-12（**v0.11.0 已发布**：tag `v0.11.0` → `e3a4096`，
-> "v0.11.0 — engine parallelism + LUT hot loops + caches (perf batch
-> #3-B complete)"，双 exe 资产字节核对 gui 34424518 / cli 26489314，
-> 标记 Latest；`b15996c` 引擎 + `e2b4b6b` GUI + `73b4f43` CLI/Web/Style
-> + bump `e3a4096`——29 项审计 backlog 全清，探针 81→44.7ms/149→34.5ms
-> 校验和不变。同日前版 v0.10.0 → `c312a9f`（打开即恢复边车 + XMP 导入 +
-> 快赢，gui 33510426 / cli 25964746）；v0.9.0 → `ca6f73e`（GUI i18n）；
-> v0.8.1 → `ce69f27`（preview lag root-fix）；v0.8.0 → `1c1ea36`（zoned
-> reverse-fit + engine local WB）。反馈驱动阶段——用户试用 → 报障/提需 →
-> 修复/打磨 → 发布）。
+> 开工。更新于 2026-07-14（**v0.11.1 已发布**：AI 分析修复——`claude`
+> 验证子进程改从中性 cwd（temp dir）启动，根治"claude exited Some(1):
+> Ignoring N permissions.allow entries … workspace has not been trusted"
+> ——headless `claude` 把 cwd 当工作区，任何带 `.claude/settings.json`
+> 且未交互信任过的目录都会触发；见 `src/advisor/claude.rs`。前版
+> v0.11.0 → `e3a4096`（2026-07-12，"engine parallelism + LUT hot loops
+> + caches (perf batch #3-B complete)"，双 exe 字节核对 gui 34424518 /
+> cli 26489314；`b15996c` 引擎 + `e2b4b6b` GUI + `73b4f43` CLI/Web/Style
+> ——29 项审计 backlog 全清，探针 81→44.7ms/149→34.5ms 校验和不变）。
+> 同日前版 v0.10.0 → `c312a9f`（打开即恢复边车 + XMP 导入 + 快赢）；
+> v0.9.0 → `ca6f73e`（GUI i18n）；v0.8.1 → `ce69f27`（preview lag
+> root-fix）；v0.8.0 → `1c1ea36`（zoned reverse-fit + engine local WB）。
+> 反馈驱动阶段——用户试用 → 报障/提需 → 修复/打磨 → 发布）。
 
 ## 当前状态（已完成，勿重做）
+
+- **AI 分析信任门修复（2026-07-14，已随 v0.11.1 发布）**——用户报
+  "分析失败: claude exited Some(1): Ignoring 3 permissions.allow entries
+  from .claude/settings.json: this workspace has not been trusted"。
+  根因：`ClaudeProvider::verify` 直接 `Command::output()`，子进程继承
+  GUI/CLI 的 cwd；headless `claude` 把 cwd 当工作区，若该目录带
+  `.claude/settings.json` 且从未交互接受过信任对话，CLI 报错并退出 1。
+  实测复现（2026-07-14）：同一调用在 `D:/Projects/Autoshop` 下 stderr
+  逐字节出现该信任报错、在全新 temp 目录下无报错。修复：spawn 前
+  `cmd.current_dir(std::env::temp_dir())`（验证器纯 stdin/stdout，
+  不触碰文件，temp 目录恒存在且无工作区设置）。全库唯一 `claude`
+  spawn 点即此处（`src/advisor/claude.rs`；`denoise.rs`/`segment.rs`
+  的 spawn 是 Python sidecar，无关）。
 
 - **性能批次 #3-B：引擎并行化 + 全量 backlog 清零（2026-07-12，已随 v0.11.0 发布 → `e3a4096`）**
   ——把 v0.10.0 记录的 29 项审计 backlog **全部**落地（`b15996c` 引擎 +

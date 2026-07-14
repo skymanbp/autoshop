@@ -53,6 +53,16 @@ impl Advisor for ClaudeProvider {
             "json",
         ])
         .arg(&prompt);
+        // Run the child from a neutral cwd. Headless `claude` treats its cwd as
+        // the workspace: if that directory carries a `.claude/settings.json`
+        // (any project checkout) and the workspace was never trusted
+        // interactively, the CLI errors out — "Ignoring N permissions.allow
+        // entries … this workspace has not been trusted" + exit 1 — and the
+        // whole analysis fails. Verified live 2026-07-14: identical invocation
+        // from `D:/Projects/Autoshop` prints the trust error, from a fresh temp
+        // dir it does not. The verifier is a pure stdin/stdout call that never
+        // touches files, so the temp dir (always present) is a safe workspace.
+        cmd.current_dir(std::env::temp_dir());
         // Don't flash a console window when the windowed GUI spawns this CLI child.
         crate::hide_child_console(&mut cmd);
         let output = cmd.output()?;
