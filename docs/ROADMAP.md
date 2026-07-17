@@ -1,21 +1,46 @@
 # ROADMAP — “一定程度直接取代 Photoshop” 路线（v0.5.0 之后 · UX 阶段）
 
 > 交接文档：每项都附实现要点与 `file:line` 锚点，供新会话不重读全库即可
-> 开工。更新于 2026-07-14（**v0.11.1 已发布**：AI 分析修复——`claude`
-> 验证子进程改从中性 cwd（temp dir）启动，根治"claude exited Some(1):
-> Ignoring N permissions.allow entries … workspace has not been trusted"
-> ——headless `claude` 把 cwd 当工作区，任何带 `.claude/settings.json`
-> 且未交互信任过的目录都会触发；见 `src/advisor/claude.rs`。前版
-> v0.11.0 → `e3a4096`（2026-07-12，"engine parallelism + LUT hot loops
-> + caches (perf batch #3-B complete)"，双 exe 字节核对 gui 34424518 /
-> cli 26489314；`b15996c` 引擎 + `e2b4b6b` GUI + `73b4f43` CLI/Web/Style
-> ——29 项审计 backlog 全清，探针 81→44.7ms/149→34.5ms 校验和不变）。
+> 开工。更新于 2026-07-17（**v0.11.2 已发布**：AI 分析认证修复——
+> `claude` CLI ≥2.1.210 的 `--bare` 设计上永不读已存 OAuth（其 --help
+> 明文 "OAuth and keychain are never read"），验证器改用
+> `--setting-sources "" --strict-mcp-config --disable-slash-commands`
+> 三旗标替代 + 子进程剔除 `ANTHROPIC_API_KEY` + 失败时透出 stdout
+> JSON 信封里的真实错误；见 `src/advisor/claude.rs`。前版 v0.11.1
+> （2026-07-14，中性 cwd 根治信任门报错）；v0.11.0 → `e3a4096`
+> （2026-07-12，perf 批次 #3-B 全清，探针 81→44.7ms/149→34.5ms）。
 > 同日前版 v0.10.0 → `c312a9f`（打开即恢复边车 + XMP 导入 + 快赢）；
 > v0.9.0 → `ca6f73e`（GUI i18n）；v0.8.1 → `ce69f27`（preview lag
 > root-fix）；v0.8.0 → `1c1ea36`（zoned reverse-fit + engine local WB）。
 > 反馈驱动阶段——用户试用 → 报障/提需 → 修复/打磨 → 发布）。
 
 ## 当前状态（已完成，勿重做）
+
+- **AI 分析认证修复（2026-07-17，已随 v0.11.2 发布）**——v0.11.1 过了
+  信任门后用户再报 "分析失败: claude exited Some(1): "（冒号后空白）。
+  三层根因（全部当日实测复现，`src/advisor/claude.rs`）：
+  1. **`--bare` 语义变化**：本机 `claude` CLI 已自动升级 2.1.158→2.1.210，
+     新版 `--bare` 的 --help 明文 "Anthropic auth is strictly
+     ANTHROPIC_API_KEY or apiKeyHelper via --settings (OAuth and keychain
+     are never read)"——即 `--bare` 下验证器**永远不可能**走用户订阅
+     OAuth（OAuth 凭据本身健康且自动刷新正常）。A/B 实测：同一调用
+     带 `--bare` 报 "Not logged in"（无 key）或 400（有 key）；去掉
+     `--bare` 即成功。修复：换成 `--setting-sources "" --strict-mcp-config
+     --disable-slash-commands` 三旗标——实测 0 插件启用、0 hook 注册、
+     无用户技能、stderr 干净（保住当年 `--bare` 的隔离目的），OAuth 可用。
+  2. **环境里的 `ANTHROPIC_API_KEY` 抢占计费**：Windows 用户级环境变量
+     里的 key 被 headless claude 优先采用（即使不带 `--bare`、即使用户
+     在交互模式里拒绝过该 key），把计费导向余额为空的 API console →
+     400 "Credit balance is too low"。修复：spawn 前
+     `cmd.env_remove("ANTHROPIC_API_KEY")`（该 provider 设计即 OAuth）。
+  3. **错误吞没**：headless claude 失败时通常 stderr 为空、真实错误在
+     stdout JSON 信封（`is_error:true, result:"…"`），而 CliFailed 只带
+     stderr → 用户只看到 "claude exited Some(1): " 空白。修复：失败路径
+     先解析 stdout 信封透出 `result`；解析不出且 stderr 为空时带上
+     stdout 前 300 字符。
+  注意：此修复要求 `claude` CLI 支持这三个旗标（≥2.1.x；CLI 默认自动
+  更新）。机器侧删除用户级 `ANTHROPIC_API_KEY` **救不了** v0.11.1 及更早
+  的 exe（`--bare` 下会变成 "Not logged in"）——唯一根治在代码侧。
 
 - **AI 分析信任门修复（2026-07-14，已随 v0.11.1 发布）**——用户报
   "分析失败: claude exited Some(1): Ignoring 3 permissions.allow entries

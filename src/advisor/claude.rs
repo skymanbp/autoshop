@@ -2,11 +2,18 @@
 //!
 //! Shells out to the local `claude` CLI in print mode, reusing the user's
 //! Claude Code OAuth (no API key). Invocation and envelope shape were verified
-//! live against `claude` 2.1.158 on this machine:
-//!   `claude -p --bare --model <m> --output-format json "<prompt>"`
+//! live against `claude` 2.1.210 on this machine:
+//!   `claude -p --setting-sources "" --strict-mcp-config
+//!    --disable-slash-commands --model <m> --output-format json "<prompt>"`
 //!   → `{"type":"result","is_error":false,"result":"<model text>", ...}`
-//! `--bare` is mandatory: without it the session's plugins/skills auto-load and
-//! pollute `result` (and cost ~16×).
+//! Isolation flags instead of `--bare`: since at least 2.1.210, `--bare`
+//! documents "Anthropic auth is strictly ANTHROPIC_API_KEY or apiKeyHelper via
+//! --settings (OAuth and keychain are never read)" — under `--bare` this
+//! provider can never bill the user's subscription (it fails "Not logged in",
+//! or worse, silently bills a stray API key). The three flags above reproduce
+//! what `--bare` protected against — plugins/skills/hooks auto-loading into
+//! the session (0 plugins enabled, 0 hooks registered, no user skills, clean
+//! stderr; measured 2026-07-17) — while keeping the stored OAuth usable.
 
 use std::process::Command;
 
@@ -46,13 +53,27 @@ impl Advisor for ClaudeProvider {
         let mut cmd = Command::new(&self.bin);
         cmd.args([
             "-p",
-            "--bare",
+            // NOT `--bare`: it never reads the stored OAuth login (see the
+            // module docs) — these three flags give the same isolation while
+            // keeping the subscription auth.
+            "--setting-sources",
+            "",
+            "--strict-mcp-config",
+            "--disable-slash-commands",
             "--model",
             &self.model,
             "--output-format",
             "json",
         ])
         .arg(&prompt);
+        // This provider bills the user's Claude subscription via the stored
+        // OAuth login by design. A stray ANTHROPIC_API_KEY in the inherited
+        // environment (e.g. a machine-wide env var meant for other tools)
+        // takes precedence over that login and silently re-routes billing to
+        // metered API credits — measured live 2026-07-17: with the key present
+        // the identical invocation fails 400 "Credit balance is too low";
+        // without it, the subscription answers. Strip it from the child.
+        cmd.env_remove("ANTHROPIC_API_KEY");
         // Run the child from a neutral cwd. Headless `claude` treats its cwd as
         // the workspace: if that directory carries a `.claude/settings.json`
         // (any project checkout) and the workspace was never trusted
@@ -67,19 +88,34 @@ impl Advisor for ClaudeProvider {
         crate::hide_child_console(&mut cmd);
         let output = cmd.output()?;
 
-        if !output.status.success() {
-            return Err(AdvisorError::CliFailed {
-                bin: self.bin.clone(),
-                code: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            });
-        }
-
         // The CLI envelope; we only need these fields (serde ignores the rest).
         #[derive(serde::Deserialize)]
         struct Envelope {
             is_error: bool,
             result: String,
+        }
+
+        if !output.status.success() {
+            // A failed headless run usually exits 1 with an EMPTY stderr and
+            // the real reason inside the stdout JSON envelope ("Credit balance
+            // is too low", "Not logged in · Please run /login", …) — measured
+            // 2026-07-17. Surface that text instead of a blank CliFailed.
+            if let Ok(env) = serde_json::from_slice::<Envelope>(&output.stdout)
+                && env.is_error
+            {
+                return Err(AdvisorError::ClaudeError(env.result));
+            }
+            let mut stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.is_empty() {
+                let head: String =
+                    String::from_utf8_lossy(&output.stdout).chars().take(300).collect();
+                stderr = format!("(empty stderr) stdout: {head}");
+            }
+            return Err(AdvisorError::CliFailed {
+                bin: self.bin.clone(),
+                code: output.status.code(),
+                stderr,
+            });
         }
         let env: Envelope =
             serde_json::from_slice(&output.stdout).map_err(|source| AdvisorError::BadEnvelope {
